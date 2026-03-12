@@ -178,8 +178,7 @@ defmodule Group.Replica.Data do
 
     :ets.select(table, [
       {{{cluster, :"$1"}, :"$2", :"$3", :_, :_},
-       [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}],
-       [{{:"$2", :"$3"}}]}
+       [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}], [{{:"$2", :"$3"}}]}
     ])
   end
 
@@ -241,8 +240,7 @@ defmodule Group.Replica.Data do
 
     :ets.select(table, [
       {{{cluster, :"$1", :"$2"}, :"$3", :_, :_},
-       [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}],
-       [{{:"$2", :"$3"}}]}
+       [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}], [{{:"$2", :"$3"}}]}
     ])
   end
 

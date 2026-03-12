@@ -313,22 +313,26 @@ defmodule GroupTest do
 
       test_pid = self()
 
-      for {key, meta} <- [{key1, %{name: "alice"}}, {key2, %{name: "bob"}}, {other_key, %{name: "other"}}] do
-          pid =
-            spawn(fn ->
-              :ok = Group.register(name, key, meta)
-              send(test_pid, {:registered, self()})
-              Process.sleep(:infinity)
-            end)
+      for {key, meta} <- [
+            {key1, %{name: "alice"}},
+            {key2, %{name: "bob"}},
+            {other_key, %{name: "other"}}
+          ] do
+        pid =
+          spawn(fn ->
+            :ok = Group.register(name, key, meta)
+            send(test_pid, {:registered, self()})
+            Process.sleep(:infinity)
+          end)
 
-          receive do
-            {:registered, ^pid} -> pid
-          after
-            1000 -> flunk("register timed out")
-          end
-
-          pid
+        receive do
+          {:registered, ^pid} -> pid
+        after
+          1000 -> flunk("register timed out")
         end
+
+        pid
+      end
 
       members = Group.members(name, prefix)
       assert length(members) == 2
@@ -480,6 +484,22 @@ defmodule GroupTest do
 
       # Should only receive one event (not duplicated)
       assert_receive {:group, [%Group.Event{type: :joined, pid: ^pid}], _}, 1000
+      refute_receive {:group, _, _}, 100
+    end
+
+    test "overlapping subscriptions still deliver one event", %{name: name} do
+      scope = "sprite_channels/#{System.unique_integer([:positive])}"
+      key = "#{scope}/state"
+
+      :ok = Group.monitor(name, :all)
+      :ok = Group.monitor(name, key)
+      :ok = Group.monitor(name, "sprite_channels/")
+      :ok = Group.monitor(name, "#{scope}/")
+
+      :ok = Group.join(name, key, %{v: 1})
+
+      assert_receive {:group, [%Group.Event{type: :joined, key: ^key} = event], _}, 1000
+      assert event.pid == self()
       refute_receive {:group, _, _}, 100
     end
 

@@ -3170,6 +3170,7 @@ defmodule Group.DistributedTest do
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_a, Group, :lookup, [name, "svc/alpha"]) != nil
       end)
+
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_a, Group, :members, [name, "svc/beta"]) != []
       end)
