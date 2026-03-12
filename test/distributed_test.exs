@@ -3078,7 +3078,7 @@ defmodule Group.DistributedTest do
   end
 
   describe "prefix members across nodes" do
-    test "prefix query finds registrations from all nodes" do
+    test "prefix query excludes registrations from all nodes" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -3093,8 +3093,8 @@ defmodule Group.DistributedTest do
       end)
 
       # Each node registers under a different "regional_index/<region>" key
-      pid_a = TestCluster.spawn_register(node_a, name, "regional_index/iad", %{region: "iad"})
-      pid_b = TestCluster.spawn_register(node_b, name, "regional_index/ord", %{region: "ord"})
+      TestCluster.spawn_register(node_a, name, "regional_index/iad", %{region: "iad"})
+      TestCluster.spawn_register(node_b, name, "regional_index/ord", %{region: "ord"})
 
       # Wait for replication — exact lookups work on both nodes
       for node <- [node_a, node_b], key <- ["regional_index/iad", "regional_index/ord"] do
@@ -3103,17 +3103,13 @@ defmodule Group.DistributedTest do
         end)
       end
 
-      # Prefix query from node_a should find BOTH registrations
+      # Prefix query from node_a should ignore registrations
       members_a = TestCluster.rpc!(node_a, Group, :members, [name, "regional_index/"])
-      assert length(members_a) == 2
-      pids = Enum.map(members_a, &elem(&1, 0)) |> Enum.sort()
-      assert Enum.sort([pid_a, pid_b]) == pids
-      regions = Enum.map(members_a, fn {_, meta} -> meta.region end) |> Enum.sort()
-      assert regions == ["iad", "ord"]
+      assert members_a == []
 
-      # Prefix query from node_b should also find both
+      # Prefix query from node_b should also ignore registrations
       members_b = TestCluster.rpc!(node_b, Group, :members, [name, "regional_index/"])
-      assert length(members_b) == 2
+      assert members_b == []
     end
 
     test "prefix query finds PG joins from all nodes" do
@@ -3148,7 +3144,7 @@ defmodule Group.DistributedTest do
       assert Enum.sort([pid_a, pid_b]) == pids
     end
 
-    test "prefix query finds mixed registrations and joins from all nodes" do
+    test "prefix query finds only joins in mixed registration/join data" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -3175,11 +3171,9 @@ defmodule Group.DistributedTest do
         TestCluster.rpc!(node_a, Group, :members, [name, "svc/beta"]) != []
       end)
 
-      # Prefix query should find both
+      # Prefix query should find only the join
       members = TestCluster.rpc!(node_a, Group, :members, [name, "svc/"])
-      assert length(members) == 2
-      types = Enum.map(members, fn {_, meta} -> meta.type end) |> Enum.sort()
-      assert types == [:pg, :reg]
+      assert [{_, %{type: :pg}}] = members
     end
   end
 

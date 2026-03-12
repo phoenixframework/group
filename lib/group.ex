@@ -132,9 +132,9 @@ defmodule Group do
       # Join a key to be discoverable by other processes
       :ok = Group.join(MySup, "game/room/42", %{role: :spectator})
 
-      # Query all members of a key (DurableServers + joined processes)
+      # Query all members of a key (joined processes only)
       members = Group.members(MySup, "game/room/42")
-      # => [{#PID<0.150.0>, %{module: GameRoom, ...}}, {#PID<0.200.0>, %{role: :spectator}}]
+      # => [{#PID<0.200.0>, %{role: :spectator}}]
 
       # Leave when done
       :ok = Group.leave(MySup, "game/room/42")
@@ -585,14 +585,14 @@ defmodule Group do
   # ===========================================================================
 
   @doc """
-  List all members of a group.
+  List all members of a group (process group entries only).
 
-  Returns both registered processes (via `register/5`) and
-  joined processes (via `join/5`).
+  Returns processes that have joined via `join/3`. Registry entries
+  (via `register/3`) are not included — use `lookup/3` for those.
 
-  If `group` ends with `"/"`, performs a prefix query — returns all members
-  whose key starts with the given prefix. This scans all shards and is more
-  expensive than an exact key lookup.
+  Supports prefix matching: if `group` ends with `"/"`, returns all
+  members whose group key starts with that prefix. Prefix queries scan
+  all shards. Exact queries hit a single shard.
 
   ## Parameters
 
@@ -627,32 +627,14 @@ defmodule Group do
   defp members_exact(name, num_shards, cluster, group, extract_meta_fn) do
     shard = Replica.shard_index_for(cluster, group, num_shards)
 
-    # DurableServer from registry (one or none)
-    registry_result =
-      case Data.registry_lookup(name, shard, cluster, group) do
-        {pid, meta, _time, _node} -> [{pid, extract_meta_fn.(meta)}]
-        nil -> []
-      end
-
-    # Joined pids from process group (zero or more)
-    group_members =
-      Data.pg_members(name, shard, cluster, group)
-      |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
-
-    registry_result ++ group_members
+    Data.pg_members(name, shard, cluster, group)
+    |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
   end
 
   defp members_by_prefix(name, num_shards, cluster, prefix, extract_meta_fn) do
-    Enum.reduce(0..(num_shards - 1), [], fn shard, acc ->
-      reg =
-        Data.registry_lookup_by_prefix(name, shard, cluster, prefix)
-        |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
-
-      pg =
-        Data.pg_members_by_prefix(name, shard, cluster, prefix)
-        |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
-
-      reg ++ pg ++ acc
+    Enum.flat_map(0..(num_shards - 1), fn shard ->
+      Data.pg_members_by_prefix(name, shard, cluster, prefix)
+      |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
     end)
   end
 

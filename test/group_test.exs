@@ -261,7 +261,17 @@ defmodule GroupTest do
       assert Group.members(name, "nonexistent/key") == []
     end
 
-    test "returns both registered and joined processes", %{name: name} do
+    test "does not return registered processes", %{name: name} do
+      key = "registered/#{System.unique_integer([:positive])}"
+
+      :ok = Group.register(name, key, %{type: :server})
+
+      assert Group.members(name, key) == []
+    end
+
+    test "returns only joined processes when both registered and joined entries exist", %{
+      name: name
+    } do
       key = "both/#{System.unique_integer([:positive])}"
 
       :ok = Group.register(name, key, %{type: :server})
@@ -282,9 +292,7 @@ defmodule GroupTest do
       end
 
       members = Group.members(name, key)
-      assert length(members) == 2
-      assert {^test_pid, %{type: :server}} = Enum.find(members, fn {p, _} -> p == test_pid end)
-      assert {^joiner, %{type: :client}} = Enum.find(members, fn {p, _} -> p == joiner end)
+      assert [{^joiner, %{type: :client}}] = members
     end
   end
 
@@ -305,7 +313,7 @@ defmodule GroupTest do
       assert metas == [%{id: 1}, %{id: 2}]
     end
 
-    test "returns registered processes matching prefix", %{name: name} do
+    test "does not return registered processes matching prefix", %{name: name} do
       prefix = "user/#{System.unique_integer([:positive])}/"
       key1 = prefix <> "alice"
       key2 = prefix <> "bob"
@@ -334,13 +342,10 @@ defmodule GroupTest do
         pid
       end
 
-      members = Group.members(name, prefix)
-      assert length(members) == 2
-      names = Enum.map(members, fn {_pid, meta} -> meta.name end) |> Enum.sort()
-      assert names == ["alice", "bob"]
+      assert Group.members(name, prefix) == []
     end
 
-    test "returns both registered and joined processes matching prefix", %{name: name} do
+    test "returns only joined processes matching prefix", %{name: name} do
       prefix = "mixed/#{System.unique_integer([:positive])}/"
       reg_key = prefix <> "server"
       join_key = prefix <> "client"
@@ -363,9 +368,7 @@ defmodule GroupTest do
       :ok = Group.join(name, join_key, %{type: :client})
 
       members = Group.members(name, prefix)
-      assert length(members) == 2
-      types = Enum.map(members, fn {_pid, meta} -> meta.type end) |> Enum.sort()
-      assert types == [:client, :server]
+      assert [{_, %{type: :client}}] = members
     end
 
     test "returns empty list for prefix with no matches", %{name: name} do
