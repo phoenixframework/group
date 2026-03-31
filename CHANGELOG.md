@@ -1,3 +1,8 @@
+## 0.1.3 (2026-03-31)
+- Add configurable timeouts to the public register/unregister/join/leave/connect/disconnect APIs
+- Add `Group.local_entries/1` for local tagged registry and process-group entries
+- Buffer replicated PG join/leave receives with configurable receiver-side flush settings and bulk ETS application
+
 ## 0.1.2 (2026-03-30)
 - Optimize pg ops
 
