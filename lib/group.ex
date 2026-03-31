@@ -26,6 +26,14 @@ defmodule Group do
 
   Named clusters use string names (e.g., `"game_servers"`).
 
+  `connect/3` supports `ttl: milliseconds` for named clusters. This is useful
+  when a node only needs a cluster while it has local interest in that cluster.
+  The initial connect still does the normal ETS-first membership check, so
+  repeated `connect/3` calls while already connected stay a cheap noop and do
+  not refresh the TTL. When a lease expires, Group only disconnects if the
+  local node has no cluster-scoped monitors, no local registrations, and no
+  local group memberships in that named cluster.
+
   ### Important: DurableServer Registration
 
   DurableServers always register in the **default cluster** to ensure global uniqueness
@@ -144,6 +152,9 @@ defmodule Group do
       # Connect this node to a named cluster
       :ok = Group.connect(MySup, "game_servers")
 
+      # Or lease it while this node still has local interest
+      :ok = Group.connect(MySup, "game_servers", ttl: 30_000)
+
       # Join a group in the named cluster
       :ok = Group.join(MySup, "room/123", %{role: :member}, cluster: "game_servers")
 
@@ -225,6 +236,12 @@ defmodule Group do
   ## Options
 
   - `:timeout` - timeout passed to `GenServer.call/3` (default: `60_000`)
+  - `:ttl` - for named clusters, keep the local connection leased for this many
+    milliseconds. The lease is only created on a new connect; repeated
+    `connect/3` calls while already connected stay a cheap noop and do not
+    refresh the TTL. Expired leases only disconnect if the local node has no
+    cluster-scoped monitors, no local registrations, and no local group
+    memberships in that cluster.
 
   ## Returns
 
@@ -234,20 +251,21 @@ defmodule Group do
       when is_atom(name) and is_list(opts) do
     clusters = List.wrap(cluster_or_clusters)
     local = node()
+    ttl_ms = cluster_ttl(opts)
     new_clusters = Enum.reject(clusters, fn c -> local in Data.cluster_nodes(name, c) end)
 
     if new_clusters != [] do
-      for cluster <- new_clusters do
-        Data.add_cluster_node(name, cluster, local)
+      connect_clusters(name, new_clusters, cluster_call_timeout(opts))
+
+      if ttl_ms do
+        expires_at = System.monotonic_time(:millisecond) + ttl_ms
+
+        for cluster <- new_clusters do
+          Data.put_cluster_lease(name, cluster, ttl_ms, expires_at)
+        end
+
+        Group.ClusterLease.reschedule(name)
       end
-
-      notify_shard = :rand.uniform(get_config(name).num_shards) - 1
-
-      GenServer.call(
-        Replica.shard_name(name, notify_shard),
-        {:cluster_connect, new_clusters},
-        cluster_call_timeout(opts)
-      )
     end
 
     :ok
@@ -271,19 +289,15 @@ defmodule Group do
   def disconnect(name, cluster_or_clusters, opts \\ [])
       when is_atom(name) and is_list(opts) do
     clusters = List.wrap(cluster_or_clusters)
+    timeout = cluster_call_timeout(opts)
 
-    for cluster <- clusters do
-      Data.remove_cluster_node(name, cluster, node())
-    end
+    if clusters != [] do
+      for cluster <- clusters do
+        Data.delete_cluster_lease(name, cluster)
+      end
 
-    num_shards = get_config(name).num_shards
-
-    for i <- 0..(num_shards - 1) do
-      GenServer.call(
-        Replica.shard_name(name, i),
-        {:cluster_disconnect, clusters},
-        cluster_call_timeout(opts)
-      )
+      Group.ClusterLease.reschedule(name)
+      disconnect_clusters(name, clusters, timeout)
     end
 
     :ok
@@ -976,6 +990,44 @@ defmodule Group do
     :persistent_term.get({__MODULE__, name}, nil)
   end
 
+  @doc false
+  def connect_clusters(name, clusters, timeout)
+      when is_atom(name) and is_list(clusters) and is_integer(timeout) do
+    local = node()
+
+    for cluster <- clusters do
+      Data.add_cluster_node(name, cluster, local)
+    end
+
+    notify_shard = :rand.uniform(get_config(name).num_shards) - 1
+
+    GenServer.call(
+      Replica.shard_name(name, notify_shard),
+      {:cluster_connect, clusters},
+      timeout
+    )
+  end
+
+  @doc false
+  def disconnect_clusters(name, clusters, timeout)
+      when is_atom(name) and is_list(clusters) and is_integer(timeout) do
+    for cluster <- clusters do
+      Data.remove_cluster_node(name, cluster, node())
+    end
+
+    num_shards = get_config(name).num_shards
+
+    for i <- 0..(num_shards - 1) do
+      GenServer.call(
+        Replica.shard_name(name, i),
+        {:cluster_disconnect, clusters},
+        timeout
+      )
+    end
+
+    :ok
+  end
+
   # ===========================================================================
   # Internal
   # ===========================================================================
@@ -989,6 +1041,7 @@ defmodule Group do
 
   defp call_timeout(opts), do: Keyword.get(opts, :timeout, @default_call_timeout)
   defp cluster_call_timeout(opts), do: Keyword.get(opts, :timeout, @default_cluster_call_timeout)
+  defp cluster_ttl(opts), do: Keyword.get(opts, :ttl) |> validate_cluster_ttl!()
 
   defp validate_cluster_connected!(_name, nil), do: :ok
 
@@ -1001,6 +1054,13 @@ defmodule Group do
 
   @doc false
   def registry_name(name) when is_atom(name), do: :"#{name}_group_registry"
+
+  defp validate_cluster_ttl!(nil), do: nil
+  defp validate_cluster_ttl!(ttl_ms) when is_integer(ttl_ms) and ttl_ms > 0, do: ttl_ms
+
+  defp validate_cluster_ttl!(ttl_ms) do
+    raise ArgumentError, "expected :ttl to be a positive integer, got: #{inspect(ttl_ms)}"
+  end
 
   defp parse_pattern(:all), do: :all
 

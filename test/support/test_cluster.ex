@@ -380,6 +380,28 @@ defmodule Group.TestCluster do
     end)
   end
 
+  @doc "Expires a named-cluster ttl lease on a remote node and forces an immediate sweep."
+  def expire_cluster_lease_and_force_sweep(node, name, cluster) do
+    :erpc.call(node, __MODULE__, :do_expire_cluster_lease_and_force_sweep, [name, cluster])
+  end
+
+  @doc false
+  def do_expire_cluster_lease_and_force_sweep(name, cluster) do
+    {ttl_ms, _expires_at} = Group.Replica.Data.cluster_lease(name, cluster)
+
+    Group.Replica.Data.put_cluster_lease(
+      name,
+      cluster,
+      ttl_ms,
+      System.monotonic_time(:millisecond) - 1
+    )
+
+    lease_manager = Group.ClusterLease.lease_name(name)
+    send(lease_manager, :force_sweep)
+    :sys.get_state(lease_manager)
+    :ok
+  end
+
   @doc """
   Asserts that all ETS dual-index tables are in sync for a Group instance.
 

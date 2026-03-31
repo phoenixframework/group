@@ -43,7 +43,8 @@ defmodule Group.Supervisor do
     children = [
       {Group.Replica.Data, name: name, num_shards: num_shards},
       {Group.Replica.Supervisor, name: name, num_shards: num_shards},
-      {Registry, keys: :duplicate, name: Group.registry_name(name)}
+      {Registry, keys: :duplicate, name: Group.registry_name(name)},
+      {Group.ClusterLease, name: name, num_shards: num_shards}
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

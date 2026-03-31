@@ -10,7 +10,8 @@ defmodule Group.Replica.Data do
 
   ## ETS Table Layout
 
-  Each shard owns 4 tables. There are also 2 shared cluster membership tables per Group instance.
+  Each shard owns 4 tables. There are also 3 shared tables per Group instance:
+  2 for cluster membership and 1 for local named-cluster TTL leases.
 
   ### reg_by_key — `:set`, keyed by `{cluster, key}`
 
@@ -74,6 +75,22 @@ defmodule Group.Replica.Data do
   peer discovery and removed on nodedown/shard death. `Group.nodes/1` reads nil cluster
   from cluster_nodes.
 
+  ### cluster_leases — `:set`, keyed by cluster name
+
+      {cluster, ttl_ms, expires_at}
+
+  Local-only policy table for `Group.connect(..., ttl: ms)` named-cluster leases.
+  This table does not affect replication membership directly — `cluster_nodes` /
+  `node_clusters` remain the source of truth for who is connected. Instead, the
+  `Group.ClusterLease` sweeper reads these rows and, when a lease expires, either:
+
+  - extends `expires_at` by one TTL if the local node still has cluster-scoped
+    monitors, local registry entries, or local PG memberships in that cluster
+  - or calls the normal disconnect path and deletes the lease row
+
+  Keeping leases separate avoids adding policy state to the hot cluster-membership
+  lookups used by `Group.connect/3`, peer discovery, and replication fanout.
+
   ## Match Spec Patterns
 
   All match specs use `{:==, :"$N", value}` guards to filter on runtime values (e.g. node
@@ -90,8 +107,9 @@ defmodule Group.Replica.Data do
     grouped by cluster. Only runs during discovery/sync protocol.
 
   - `registry_count`, `pg_count`, `pg_count_by_prefix`, `local_registry_count`,
-    `local_pg_count`: Uses `ets.select_count`. Full scan but returns only the
-    count without materializing results.
+    `local_pg_count`, `local_registry_present?`, `local_pg_present?`: Uses
+    `ets.select_count`. Full scan but returns only a count/existence signal
+    without materializing matching rows.
 
   - `entries_by_pid/3`: Range scan on the by_pid ordered_set tables. O(entries for that pid).
 
@@ -616,6 +634,18 @@ defmodule Group.Replica.Data do
     end)
   end
 
+  def local_registry_present?(name, num_shards, cluster) do
+    local_node = node()
+
+    Enum.any?(0..(num_shards - 1), fn shard ->
+      table = reg_by_key_table(name, shard)
+
+      :ets.select_count(table, [
+        {{{cluster, :_}, :_, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
+      ]) > 0
+    end)
+  end
+
   def local_pg_count(name, num_shards, cluster, key) do
     local_node = node()
 
@@ -628,6 +658,18 @@ defmodule Group.Replica.Data do
         ])
 
       acc + count
+    end)
+  end
+
+  def local_pg_present?(name, num_shards, cluster) do
+    local_node = node()
+
+    Enum.any?(0..(num_shards - 1), fn shard ->
+      table = pg_by_key_table(name, shard)
+
+      :ets.select_count(table, [
+        {{{cluster, :_, :_}, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
+      ]) > 0
     end)
   end
 
@@ -695,6 +737,31 @@ defmodule Group.Replica.Data do
   end
 
   # =====================================================================
+  # Local cluster TTL leases
+  # =====================================================================
+
+  def put_cluster_lease(name, cluster, ttl_ms, expires_at) do
+    :ets.insert(cluster_leases_table(name), {cluster, ttl_ms, expires_at})
+    :ok
+  end
+
+  def delete_cluster_lease(name, cluster) do
+    :ets.delete(cluster_leases_table(name), cluster)
+    :ok
+  end
+
+  def cluster_lease(name, cluster) do
+    case :ets.lookup(cluster_leases_table(name), cluster) do
+      [{^cluster, ttl_ms, expires_at}] -> {ttl_ms, expires_at}
+      [] -> nil
+    end
+  end
+
+  def cluster_leases(name) do
+    :ets.tab2list(cluster_leases_table(name))
+  end
+
+  # =====================================================================
   # Helpers
   # =====================================================================
 
@@ -714,6 +781,7 @@ defmodule Group.Replica.Data do
   def pg_by_pid_table(name, shard), do: :"#{name}_s#{shard}_pg_by_pid"
   def cluster_nodes_table(name), do: :"#{name}_cluster_nodes"
   def node_clusters_table(name), do: :"#{name}_node_clusters"
+  def cluster_leases_table(name), do: :"#{name}_cluster_leases"
 
   # =====================================================================
   # GenServer callbacks
@@ -760,6 +828,7 @@ defmodule Group.Replica.Data do
 
     :ets.new(cluster_nodes_table(name), bag_opts)
     :ets.new(node_clusters_table(name), bag_opts)
+    :ets.new(cluster_leases_table(name), set_opts)
 
     {:ok, %{name: name, num_shards: num_shards}}
   end

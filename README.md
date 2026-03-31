@@ -126,11 +126,25 @@ called `connect/2` for a cluster participate in that cluster's replication.
 # Connect this node to a named cluster
 :ok = Group.connect(:my_app, "game_servers_123")
 
+# Or lease the connection while this node still has local interest in it
+:ok = Group.connect(:my_app, "game_servers_123", ttl: 30_000)
+
 # All operations accept a :cluster option
 :ok = Group.join(:my_app, "room/1", %{}, cluster: "game_servers_123")
 members = Group.members(:my_app, "room/1", cluster: "game_servers_123")
 :ok = Group.monitor(:my_app, :all, cluster: "game_servers_123")
 ```
+
+TTL leases are local policy only:
+
+- `Group.connect(..., ttl: ms)` still does the normal ETS membership check first,
+  so repeated connects while already connected stay a cheap noop and do not
+  refresh the TTL.
+- When a TTL expires, Group only disconnects that named cluster if the local
+  node has no cluster-scoped monitors, no local registrations, and no local
+  group memberships in that cluster.
+- If local interest still exists, the next sweep extends the lease by one TTL
+  interval and checks again later.
 
 ### Nodes
 
@@ -241,7 +255,8 @@ Group.Supervisor (:"my_app_group_sup")
 │   ├── Group.Replica (shard 0)
 │   ├── Group.Replica (shard 1)
 │   └── ...
-└── Registry                  — local monitor subscriptions (:"my_app_group_registry")
+├── Registry                  — local monitor subscriptions (:"my_app_group_registry")
+└── Group.ClusterLease        — local named-cluster TTL sweeper
 ```
 
 ### Sharding
@@ -268,9 +283,15 @@ Each shard owns 4 ETS tables:
 | `pg_by_key` | `:ordered_set` | `{cluster, key, pid}` | Group membership lookup |
 | `pg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | Reverse index for death cleanup |
 
-Plus 2 shared tables: `cluster_nodes` (`:bag`, cluster→nodes) and
-`node_clusters` (`:bag`, node→clusters) providing dual-index cluster membership
-lookups.
+Plus 3 shared tables:
+
+- `cluster_nodes` (`:bag`, cluster→nodes)
+- `node_clusters` (`:bag`, node→clusters)
+- `cluster_leases` (`:set`, cluster→`{ttl_ms, expires_at}`) for local
+  `connect(..., ttl: ms)` policy
+
+`cluster_nodes` / `node_clusters` remain the authoritative cluster-membership
+tables. `cluster_leases` is only local lease metadata used by the sweeper.
 
 `Group.Replica.Data` owns all tables and is supervised with `rest_for_one` so
 tables survive shard crashes.
@@ -293,6 +314,21 @@ This is how a new node catches up to the existing cluster state.
 After the initial sync, steady-state changes propagate via broadcast messages
 (`replicate_register`, `replicate_join`, etc.) sent from the writing shard to
 the corresponding shard on all peer nodes in the relevant cluster.
+
+### Named Cluster TTL Leases
+
+Named-cluster TTLs are a local way to reduce replication fanout to nodes that
+no longer care about a cluster.
+
+- `connect(..., ttl: ms)` writes a lease row only when the cluster is newly
+  connected.
+- A dedicated `Group.ClusterLease` process sweeps the local lease rows by
+  nearest expiry.
+- On expiry, the sweeper extends the lease if the local node still has
+  cluster-scoped monitors, local registry entries, or local PG memberships in
+  that cluster.
+- Otherwise it runs the normal disconnect path, which removes the node from the
+  named cluster and stops future replication for that cluster.
 
 ### Process Death Cleanup
 

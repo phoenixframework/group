@@ -10,7 +10,8 @@ Distributed process registry + process groups + lifecycle monitoring + isolated 
 lib/
   group.ex              — Public API: register, join, members, monitor, dispatch, connect/disconnect
   group/event.ex        — %Group.Event{} struct
-  group/supervisor.ex   — Top-level supervisor (rest_for_one: Data → Replica.Supervisor → Registry)
+  group/supervisor.ex   — Top-level supervisor (rest_for_one: Data → Replica.Supervisor → Registry → ClusterLease)
+  group/cluster_lease.ex — Local named-cluster TTL sweeper
   group/replica/
     data.ex             — GenServer that owns ETS tables. Pure function API for all ETS ops.
     supervisor.ex       — one_for_one supervisor for Replica shards
@@ -54,7 +55,8 @@ Group.Supervisor (rest_for_one)
 │   ├── Replica shard 0
 │   ├── Replica shard 1
 │   └── ...
-└── Registry (Elixir)         — :duplicate, for monitor subscriptions
+├── Registry (Elixir)         — :duplicate, for monitor subscriptions
+└── Group.ClusterLease        — local named-cluster TTL sweeper
 ```
 
 `rest_for_one` means: if Data dies, Replica.Supervisor restarts (rebuilds monitors from surviving ETS). If Replica.Supervisor dies, Registry restarts (monitors re-subscribe).
@@ -63,7 +65,7 @@ Group.Supervisor (rest_for_one)
 
 `phash2({cluster, key}, num_shards)` routes to shard. Default 8 shards. Must match across all nodes (validated on peer_connect). Including cluster in hash avoids false contention between default and named cluster operations.
 
-### ETS Tables (per shard × 4 + 2 shared)
+### ETS Tables (per shard × 4 + 3 shared)
 
 | Table | Type | Key | Tuple |
 |-------|------|-----|-------|
@@ -73,6 +75,7 @@ Group.Supervisor (rest_for_one)
 | `pg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | `{{pid, cluster, key}, meta, time, node}` |
 | `cluster_nodes` | `:bag` | cluster | `{cluster, node}` |
 | `node_clusters` | `:bag` | node | `{node, cluster}` |
+| `cluster_leases` | `:set` | cluster | `{cluster, ttl_ms, expires_at}` |
 
 **Why ordered_set for by_pid tables**: Contiguous range scans for `entries_by_pid` and `delete_all_for_pid` (process death cleanup). Also enables efficient existence checks with `select(..., 1)`.
 
@@ -122,6 +125,13 @@ After discovery, writes broadcast to cluster members:
 
 - `connect/2`: adds to ETS, picks random shard S, S notifies remote S, remote acks with bundled data + fans out to siblings
 - `disconnect/2`: removes from ETS, calls ALL local shards to purge, shard 0 broadcasts to remotes
+- `connect(..., ttl: ms)`: still checks `cluster_nodes` first, so an already-connected
+  cluster stays an ETS-fast noop and does not refresh the TTL
+- TTL rows are local policy only; they do not change `cluster_nodes` /
+  `node_clusters` semantics
+- On TTL expiry, `Group.ClusterLease` disconnects only if the local node has no
+  cluster-scoped monitors, no local registrations, and no local PG memberships
+  in that cluster. Otherwise it extends the lease by one TTL interval.
 
 ### Nodedown / Process Death
 
@@ -166,7 +176,7 @@ Keys ending with `"/"` are rejected by `validate_key!/1` in register/unregister/
 - All helpers (`spawn_register`, `spawn_join`, `spawn_monitor_forwarder`) use `:erpc.call` with compiled modules from `test/support/`
 - `Node.spawn` with anonymous functions won't work — remote node needs the defining module's beam file
 - `assert_eventually/2` polls with retries for async replication
-- `flush_shards/2` does `:sys.get_state` on all shards to drain message queues
+- `flush_shards/2` sends a mailbox barrier through each shard so buffered replicated PG ops are flushed too
 - `assert_ets_consistent/1` verifies dual-index tables match
 - Partition tests use 3 nodes (isolate 1 from other 2). 2-node partitions are unreliable because the test node bridges them.
 - `Supervisor.start_link` links to caller — in RPC context, must `Process.unlink(pid)` or supervisor dies on RPC return

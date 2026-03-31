@@ -566,6 +566,134 @@ defmodule GroupTest do
       assert :ok = Group.disconnect(name, cluster)
     end
 
+    test "connect with ttl creates a lease only on first connect", %{name: name} do
+      cluster = "ttl/#{System.unique_integer([:positive])}"
+
+      assert :ok = Group.connect(name, cluster, ttl: 50)
+      assert Group.connected?(name, cluster)
+      assert {50, expires_at} = Group.Replica.Data.cluster_lease(name, cluster)
+      assert is_integer(expires_at)
+
+      assert :ok = Group.connect(name, cluster, ttl: 5_000)
+      assert Group.Replica.Data.cluster_lease(name, cluster) == {50, expires_at}
+
+      assert :ok = Group.disconnect(name, cluster)
+      assert Group.Replica.Data.cluster_lease(name, cluster) == nil
+    end
+
+    test "plain connect does not create a ttl lease", %{name: name} do
+      cluster = "plain/#{System.unique_integer([:positive])}"
+
+      assert :ok = Group.connect(name, cluster)
+      assert Group.connected?(name, cluster)
+      assert Group.Replica.Data.cluster_lease(name, cluster) == nil
+    end
+
+    test "expired inactive ttl lease disconnects on sweep", %{name: name} do
+      cluster = "inactive/#{System.unique_integer([:positive])}"
+
+      assert :ok = Group.connect(name, cluster, ttl: 50)
+      expire_cluster_lease(name, cluster)
+      force_cluster_lease_sweep(name)
+
+      refute Group.connected?(name, cluster)
+      assert Group.Replica.Data.cluster_lease(name, cluster) == nil
+    end
+
+    test "expired ttl lease with local registry activity extends instead of disconnecting", %{
+      name: name
+    } do
+      cluster = "registry/#{System.unique_integer([:positive])}"
+      key = "players/#{System.unique_integer([:positive])}"
+
+      assert :ok = Group.connect(name, cluster, ttl: 50)
+      assert :ok = Group.register(name, key, %{kind: :registry}, cluster: cluster)
+
+      expire_cluster_lease(name, cluster)
+      force_cluster_lease_sweep(name)
+
+      assert Group.connected?(name, cluster)
+      assert {50, expires_at} = Group.Replica.Data.cluster_lease(name, cluster)
+      assert expires_at > System.monotonic_time(:millisecond)
+
+      assert :ok = Group.unregister(name, key, cluster: cluster)
+      expire_cluster_lease(name, cluster)
+      force_cluster_lease_sweep(name)
+
+      refute Group.connected?(name, cluster)
+    end
+
+    test "expired ttl lease with local pg activity extends instead of disconnecting", %{
+      name: name
+    } do
+      cluster = "pg/#{System.unique_integer([:positive])}"
+      key = "rooms/#{System.unique_integer([:positive])}"
+
+      assert :ok = Group.connect(name, cluster, ttl: 50)
+      assert :ok = Group.join(name, key, %{kind: :pg}, cluster: cluster)
+
+      expire_cluster_lease(name, cluster)
+      force_cluster_lease_sweep(name)
+
+      assert Group.connected?(name, cluster)
+      assert {50, expires_at} = Group.Replica.Data.cluster_lease(name, cluster)
+      assert expires_at > System.monotonic_time(:millisecond)
+
+      assert :ok = Group.leave(name, key, cluster: cluster)
+      expire_cluster_lease(name, cluster)
+      force_cluster_lease_sweep(name)
+
+      refute Group.connected?(name, cluster)
+    end
+
+    test "expired ttl lease with cluster-scoped monitor activity extends instead of disconnecting",
+         %{name: name} do
+      cluster = "monitor/#{System.unique_integer([:positive])}"
+      key = "watch/#{System.unique_integer([:positive])}"
+
+      assert :ok = Group.connect(name, cluster, ttl: 50)
+      assert :ok = Group.monitor(name, key, cluster: cluster)
+
+      expire_cluster_lease(name, cluster)
+      force_cluster_lease_sweep(name)
+
+      assert Group.connected?(name, cluster)
+      assert {50, expires_at} = Group.Replica.Data.cluster_lease(name, cluster)
+      assert expires_at > System.monotonic_time(:millisecond)
+
+      assert :ok = Group.demonitor(name, key, cluster: cluster)
+      expire_cluster_lease(name, cluster)
+      force_cluster_lease_sweep(name)
+
+      refute Group.connected?(name, cluster)
+    end
+
+    test "lease manager restart preserves leases and resumes sweeping", %{name: name} do
+      cluster = "restart/#{System.unique_integer([:positive])}"
+      lease_manager = Group.ClusterLease.lease_name(name)
+      manager_pid = Process.whereis(lease_manager)
+
+      assert :ok = Group.connect(name, cluster, ttl: 50)
+      assert {50, _expires_at} = Group.Replica.Data.cluster_lease(name, cluster)
+
+      ref = Process.monitor(manager_pid)
+      :ok = GenServer.stop(manager_pid, :shutdown)
+      assert_receive {:DOWN, ^ref, :process, ^manager_pid, :shutdown}, 1000
+
+      wait_until(fn ->
+        case Process.whereis(lease_manager) do
+          nil -> false
+          new_pid -> new_pid != manager_pid
+        end
+      end)
+
+      expire_cluster_lease(name, cluster)
+      force_cluster_lease_sweep(name)
+
+      refute Group.connected?(name, cluster)
+      assert Group.Replica.Data.cluster_lease(name, cluster) == nil
+    end
+
     test "join/leave work with cluster: option", %{name: name} do
       cluster = "game_cluster"
       key = "room/#{System.unique_integer([:positive])}"
@@ -1501,6 +1629,26 @@ defmodule GroupTest do
 
   defp flush_replicated_pg_barrier(shard) do
     send(shard, {:group_dispatch, [self()], {:replicated_pg_buffer_flushed, shard}})
+  end
+
+  defp force_cluster_lease_sweep(name) do
+    lease_manager = Group.ClusterLease.lease_name(name)
+    send(lease_manager, :force_sweep)
+    :sys.get_state(lease_manager)
+    :ok
+  end
+
+  defp expire_cluster_lease(name, cluster) do
+    {ttl_ms, _expires_at} = Group.Replica.Data.cluster_lease(name, cluster)
+
+    Group.Replica.Data.put_cluster_lease(
+      name,
+      cluster,
+      ttl_ms,
+      System.monotonic_time(:millisecond) - 1
+    )
+
+    ttl_ms
   end
 
   defp spawn_forever do

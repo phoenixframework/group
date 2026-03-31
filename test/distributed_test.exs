@@ -101,6 +101,46 @@ defmodule Group.DistributedTest do
     end
   end
 
+  describe "named cluster ttl" do
+    test "expired inactive ttl lease disconnects a node and stops further replication" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_ttl_#{System.unique_integer([:positive])}"
+      cluster = "ttl_cluster"
+      opts = [name: name, shards: 2]
+
+      start_group_on_peers(peers, opts)
+
+      assert :ok = TestCluster.rpc!(node_a, Group, :connect, [name, cluster])
+      assert :ok = TestCluster.rpc!(node_b, Group, :connect, [name, cluster, [ttl: 5_000]])
+
+      TestCluster.spawn_register_in_cluster(node_a, name, "ttl/key/1", %{v: 1}, cluster)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, "ttl/key/1", [cluster: cluster]]) != nil
+      end)
+
+      TestCluster.expire_cluster_lease_and_force_sweep(node_b, name, cluster)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :connected?, [name, cluster]) == false
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        node_b not in TestCluster.rpc!(node_a, Group, :nodes, [name, cluster])
+      end)
+
+      TestCluster.spawn_register_in_cluster(node_a, name, "ttl/key/2", %{v: 2}, cluster)
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, "ttl/key/2", [cluster: cluster]]) ==
+               nil
+    end
+  end
+
   describe "node discovery (late joiner)" do
     test "late joiner receives existing data" do
       peers = TestCluster.start_peers(2)
