@@ -451,6 +451,33 @@ defmodule Group.Replica.Data do
     reg_entries ++ pg_entries
   end
 
+  def local_entries(name, shard) do
+    local_node = node()
+    reg_table = reg_by_key_table(name, shard)
+
+    reg_entries =
+      :ets.select(reg_table, [
+        {{{:"$1", :"$2"}, :"$3", :"$4", :_, :"$5"}, [{:==, :"$5", local_node}],
+         [{{:"$1", :"$2", :"$3", :"$4"}}]}
+      ])
+      |> Enum.map(fn {cluster, key, pid, meta} ->
+        {:registry, cluster, key, pid, meta}
+      end)
+
+    pg_table = pg_by_key_table(name, shard)
+
+    pg_entries =
+      :ets.select(pg_table, [
+        {{{:"$1", :"$2", :"$3"}, :"$4", :_, :"$5"}, [{:==, :"$5", local_node}],
+         [{{:"$1", :"$2", :"$3", :"$4"}}]}
+      ])
+      |> Enum.map(fn {cluster, key, pid, meta} ->
+        {:pg, cluster, key, pid, meta}
+      end)
+
+    reg_entries ++ pg_entries
+  end
+
   defp select_entries_for_pids(table, pids) do
     :ets.select(
       table,

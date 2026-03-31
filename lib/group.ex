@@ -796,6 +796,38 @@ defmodule Group do
     end
   end
 
+  @doc """
+  List all entries owned by the local node across all shards.
+
+  Returns a flat tagged list containing both registry and process-group entries:
+
+      {:registry, cluster, key, pid, meta}
+      {:pg, cluster, key, pid, meta}
+
+  This includes only entries whose owner node is the local node, not the full
+  replicated cluster view. Metadata is passed through the configured
+  `extract_meta` callback, if any.
+
+  ## Parameters
+
+  - `name` - The Group name
+
+  ## Returns
+
+  - List of `{:registry | :pg, cluster, key, pid, meta}` tuples
+  """
+  def local_entries(name) when is_atom(name) do
+    extract_meta_fn = resolve_extract_meta(name, [])
+    num_shards = get_config(name).num_shards
+
+    Enum.flat_map(0..(num_shards - 1), fn shard ->
+      Data.local_entries(name, shard)
+      |> Enum.map(fn {type, cluster, key, pid, meta} ->
+        {type, cluster, key, pid, extract_meta_fn.(meta)}
+      end)
+    end)
+  end
+
   # ===========================================================================
   # Dispatch
   # ===========================================================================

@@ -1,3 +1,7 @@
+defmodule GroupTest.ExtractMeta do
+  def strip(meta), do: Map.take(meta, [:public])
+end
+
 defmodule GroupTest do
   use ExUnit.Case, async: true
 
@@ -1093,6 +1097,65 @@ defmodule GroupTest do
 
       assert Group.local_member_count(name, prefix) == 2
       assert Group.local_member_count(name, other) == 1
+    end
+  end
+
+  describe "local_entries/1" do
+    test "returns local registry and pg entries across clusters", %{name: name} do
+      :ok = Group.connect(name, "game")
+
+      :ok = Group.register(name, "users/self", %{kind: :reg_self})
+      :ok = Group.join(name, "rooms/self", %{kind: :pg_self})
+
+      test_pid = self()
+
+      pid =
+        spawn(fn ->
+          :ok = Group.register(name, "users/other", %{kind: :reg_other}, cluster: "game")
+          :ok = Group.join(name, "rooms/other", %{kind: :pg_other}, cluster: "game")
+          send(test_pid, {:ready, self()})
+          Process.sleep(:infinity)
+        end)
+
+      on_exit(fn ->
+        if Process.alive?(pid), do: Process.exit(pid, :kill)
+      end)
+
+      assert_receive {:ready, ^pid}, 1000
+
+      entries =
+        Group.local_entries(name)
+        |> Enum.sort_by(fn {type, cluster, key, entry_pid, _meta} ->
+          {type, cluster || "", key, inspect(entry_pid)}
+        end)
+
+      assert entries == [
+               {:pg, nil, "rooms/self", self(), %{kind: :pg_self}},
+               {:pg, "game", "rooms/other", pid, %{kind: :pg_other}},
+               {:registry, nil, "users/self", self(), %{kind: :reg_self}},
+               {:registry, "game", "users/other", pid, %{kind: :reg_other}}
+             ]
+    end
+
+    test "applies configured extract_meta callback" do
+      name = :"test_group_extract_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {Group,
+         name: name, shards: 1, log: false, extract_meta: {GroupTest.ExtractMeta, :strip, []}}
+      )
+
+      :ok = Group.register(name, "users/self", %{public: :keep, private: :drop})
+      :ok = Group.join(name, "rooms/self", %{public: :keep_pg, private: :drop_pg})
+
+      entries =
+        Group.local_entries(name)
+        |> Enum.sort_by(fn {type, _cluster, key, _pid, _meta} -> {type, key} end)
+
+      assert entries == [
+               {:pg, nil, "rooms/self", self(), %{public: :keep_pg}},
+               {:registry, nil, "users/self", self(), %{public: :keep}}
+             ]
     end
   end
 
