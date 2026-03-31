@@ -4,6 +4,7 @@ defmodule Group.Replica do
   use GenServer
 
   @process_down_batch_size 32
+  @replicated_pg_receiver_flush_timer :flush_replicated_pg_receiver_buffer
 
   _archdoc = ~S"""
   Sharded GenServer: peer discovery, replication, monitoring, conflict resolution.
@@ -320,8 +321,12 @@ defmodule Group.Replica do
   to `Group.monitor/3` subscribers in a batched diff of `{:group, events, info}` tuples.
   Each GenServer handler invocation is a natural batch boundary:
 
-  - **Single operations** (register, join, leave, unregister, replicate_*): build one
-    event, deliver one tuple with one event per matching subscriber.
+  - **Single operations** (register, join, leave, unregister, replicate_register,
+    replicate_unregister): build one event, deliver one tuple with one event per
+    matching subscriber.
+  - **Buffered replicated PG operations** (`replicate_join`, `replicate_leave`):
+    receiver shards may accumulate several ops before flushing, then deliver one
+    tuple per subscriber containing the ordered events from that flush.
   - **Bulk operations** (nodedown, process DOWN, cluster_disconnect, cluster_state
     merge): accumulate events into a local variable, then deliver one tuple per
     subscriber containing all matching events from that handler turn.
@@ -350,6 +355,12 @@ defmodule Group.Replica do
     :name,
     :shard_index,
     :num_shards,
+    :replicated_pg_receiver_buffer_size,
+    :replicated_pg_receiver_flush_interval,
+    :pending_replicated_pg_started_at,
+    :pending_replicated_pg_flush_ref,
+    pending_replicated_pg_len: 0,
+    pending_replicated_pg_ops: [],
     remote_shards: %{},
     monitors: %{}
   ]
@@ -381,7 +392,9 @@ defmodule Group.Replica do
     name = Keyword.fetch!(opts, :name)
     shard_index = Keyword.fetch!(opts, :shard_index)
     num_shards = Keyword.fetch!(opts, :num_shards)
+    config = Group.get_config(name)
 
+    Process.flag(:trap_exit, true)
     :net_kernel.monitor_nodes(true)
 
     # Register self as nil cluster member
@@ -390,7 +403,9 @@ defmodule Group.Replica do
     state = %__MODULE__{
       name: name,
       shard_index: shard_index,
-      num_shards: num_shards
+      num_shards: num_shards,
+      replicated_pg_receiver_buffer_size: config.replicated_pg_receiver_buffer_size,
+      replicated_pg_receiver_flush_interval: config.replicated_pg_receiver_flush_interval
     }
 
     # Rebuild monitors from any surviving ETS data (after shard crash/restart)
@@ -411,12 +426,19 @@ defmodule Group.Replica do
     {:ok, state}
   end
 
+  @impl true
+  def terminate(_reason, state) do
+    _state = flush_pending_replicated_pg(state)
+    :ok
+  end
+
   # =====================================================================
   # Registration calls
   # =====================================================================
 
   @impl true
   def handle_call({:register, cluster, key, pid, meta}, _from, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
 
     case Data.registry_lookup(name, shard, cluster, key) do
@@ -477,6 +499,7 @@ defmodule Group.Replica do
   end
 
   def handle_call({:unregister, cluster, key}, _from, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
 
     case Data.registry_lookup(name, shard, cluster, key) do
@@ -516,6 +539,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_call({:join, cluster, key, pid, meta}, _from, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
 
     case Data.pg_lookup(name, shard, cluster, key, pid) do
@@ -570,6 +594,7 @@ defmodule Group.Replica do
   end
 
   def handle_call({:leave, cluster, key, pid}, _from, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
 
     case Data.pg_lookup(name, shard, cluster, key, pid) do
@@ -601,6 +626,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_call({:cluster_connect, clusters}, _from, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name} = state
 
     log(state, fn ->
@@ -623,6 +649,7 @@ defmodule Group.Replica do
   end
 
   def handle_call({:cluster_disconnect, clusters}, _from, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
 
     log_once(state, fn ->
@@ -649,6 +676,7 @@ defmodule Group.Replica do
 
   @impl true
   def handle_info({:replicate_register, cluster, key, pid, meta, time, _reason}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
 
     log_verbose(state, fn ->
@@ -708,6 +736,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:replicate_unregister, cluster, key, pid, meta, reason}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
 
     log_verbose(state, fn ->
@@ -731,50 +760,15 @@ defmodule Group.Replica do
   end
 
   def handle_info({:replicate_join, cluster, key, pid, meta, time, reason}, state) do
-    %{name: name, shard_index: shard} = state
+    state =
+      enqueue_replicated_pg_op(state, {:join, cluster, key, pid, meta, time, reason, node(pid)})
 
-    log_verbose(state, fn ->
-      "#{log_prefix_shard(state)} replicate_join key=#{inspect(key)} pid=#{inspect(pid)} from #{node(pid)}"
-    end)
-
-    event =
-      case Data.pg_lookup(name, shard, cluster, key, pid) do
-        nil ->
-          Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-          build_event(name, :joined, key, pid, meta, %{previous_meta: nil, cluster: cluster})
-
-        {old_meta, _old_time, _node} ->
-          Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-          previous_meta = if reason == :update, do: old_meta, else: nil
-
-          build_event(name, :joined, key, pid, meta, %{
-            previous_meta: previous_meta,
-            cluster: cluster
-          })
-      end
-
-    notify_monitors(name, [event])
     {:noreply, state}
   end
 
   def handle_info({:replicate_leave, cluster, key, pid, meta, reason}, state) do
-    %{name: name, shard_index: shard} = state
-
-    log_verbose(state, fn ->
-      "#{log_prefix_shard(state)} replicate_leave key=#{inspect(key)}"
-    end)
-
-    case Data.pg_lookup(name, shard, cluster, key, pid) do
-      nil ->
-        {:noreply, state}
-
-      {_meta, _time, _node} ->
-        Data.pg_delete(name, shard, cluster, key, pid)
-
-        event = build_event(name, :left, key, pid, meta, %{reason: reason, cluster: cluster})
-        notify_monitors(name, [event])
-        {:noreply, state}
-    end
+    state = enqueue_replicated_pg_op(state, {:leave, cluster, key, pid, meta, reason})
+    {:noreply, state}
   end
 
   # =====================================================================
@@ -786,6 +780,8 @@ defmodule Group.Replica do
         state
       )
       when remote_shard_index == state.shard_index do
+    state = flush_pending_replicated_pg_barrier(state)
+
     if remote_num_shards != state.num_shards do
       raise "Group shard count mismatch: local=#{state.num_shards} remote=#{remote_num_shards} from #{node(remote_pid)}"
     end
@@ -834,6 +830,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:peer_connect, _remote_pid, _other_shard, _num_shards, _clusters}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     # Wrong shard index, ignore
     {:noreply, state}
   end
@@ -843,6 +840,8 @@ defmodule Group.Replica do
         state
       )
       when remote_shard_index == state.shard_index do
+    state = flush_pending_replicated_pg_barrier(state)
+
     if remote_num_shards != state.num_shards do
       raise "Group shard count mismatch: local=#{state.num_shards} remote=#{remote_num_shards} from #{node(remote_pid)}"
     end
@@ -883,6 +882,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:peer_connect_ack, _remote_pid, _other_shard, _num_shards, _clusters}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     {:noreply, state}
   end
 
@@ -891,6 +891,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info({:cluster_state, cluster, reg_data, pg_data}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name} = state
 
     # Guard: skip merge for named clusters we're not a member of
@@ -916,6 +917,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info({:cluster_connect, clusters, remote_pid}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name} = state
     remote_node = node(remote_pid)
 
@@ -953,6 +955,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:cluster_connect_ack, clusters, remote_pid, cluster_data}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name} = state
     remote_node = node(remote_pid)
 
@@ -994,6 +997,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:cluster_disconnect, clusters, remote_pid}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
     remote_node = node(remote_pid)
 
@@ -1024,6 +1028,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info({:nodeup, remote_node}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{shard_index: shard, name: name} = state
     shard_registered_name = shard_name(name, shard)
 
@@ -1036,6 +1041,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:nodedown, dead_node}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
 
     # Remove cluster memberships from shared tables. Every shard calls this
@@ -1063,6 +1069,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info({:DOWN, _mref, :process, pid, reason}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
 
     remote_node = node(pid)
@@ -1111,6 +1118,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:replicate_process_down_batch, reg_entries, pg_entries}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name, shard_index: shard} = state
 
     log_verbose(state, fn ->
@@ -1125,6 +1133,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:send_cluster_data, clusters, target_node}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     %{name: name} = state
 
     active = Enum.filter(clusters, fn c -> node() in Data.cluster_nodes(name, c) end)
@@ -1137,17 +1146,198 @@ defmodule Group.Replica do
   end
 
   def handle_info({:group_dispatch, pids, message}, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     for pid <- pids, do: send(pid, message)
     {:noreply, state}
   end
 
+  def handle_info({@replicated_pg_receiver_flush_timer, flush_ref}, state) do
+    state =
+      if state.pending_replicated_pg_flush_ref == flush_ref do
+        flush_pending_replicated_pg(state)
+      else
+        state
+      end
+
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state) do
+    state = flush_pending_replicated_pg_barrier(state)
     {:noreply, state}
   end
 
   # =====================================================================
   # Internal helpers
   # =====================================================================
+
+  defp flush_pending_replicated_pg_barrier(%{pending_replicated_pg_len: 0} = state), do: state
+  defp flush_pending_replicated_pg_barrier(state), do: flush_pending_replicated_pg(state)
+
+  defp enqueue_replicated_pg_op(state, op) do
+    log_replicated_pg_op(state, op)
+
+    now = System.monotonic_time(:millisecond)
+
+    state =
+      case state.pending_replicated_pg_len do
+        0 ->
+          %{state | pending_replicated_pg_started_at: now}
+          |> schedule_replicated_pg_flush()
+          |> Map.put(:pending_replicated_pg_ops, [op])
+          |> Map.put(:pending_replicated_pg_len, 1)
+
+        len ->
+          %{
+            state
+            | pending_replicated_pg_ops: [op | state.pending_replicated_pg_ops],
+              pending_replicated_pg_len: len + 1
+          }
+      end
+
+    if state.pending_replicated_pg_len >= state.replicated_pg_receiver_buffer_size or
+         pending_replicated_pg_due?(state, now) do
+      flush_pending_replicated_pg(state)
+    else
+      state
+    end
+  end
+
+  defp schedule_replicated_pg_flush(%{replicated_pg_receiver_flush_interval: 0} = state) do
+    %{state | pending_replicated_pg_flush_ref: nil}
+  end
+
+  defp schedule_replicated_pg_flush(state) do
+    flush_ref = make_ref()
+
+    Process.send_after(
+      self(),
+      {@replicated_pg_receiver_flush_timer, flush_ref},
+      state.replicated_pg_receiver_flush_interval
+    )
+
+    %{state | pending_replicated_pg_flush_ref: flush_ref}
+  end
+
+  defp pending_replicated_pg_due?(%{pending_replicated_pg_len: 0}, _now), do: false
+
+  defp pending_replicated_pg_due?(state, now) do
+    state.replicated_pg_receiver_flush_interval == 0 or
+      now - state.pending_replicated_pg_started_at >= state.replicated_pg_receiver_flush_interval
+  end
+
+  defp flush_pending_replicated_pg(%{pending_replicated_pg_len: 0} = state), do: state
+
+  defp flush_pending_replicated_pg(state) do
+    %{name: name, shard_index: shard} = state
+    ops = Enum.reverse(state.pending_replicated_pg_ops)
+
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} flush_replicated_pg_receiver_buffer ops=#{length(ops)}"
+    end)
+
+    {insert_entries, delete_entries, events} = apply_replicated_pg_ops(name, shard, ops)
+
+    Data.pg_delete_many(name, shard, delete_entries)
+    Data.pg_insert_many(name, shard, insert_entries)
+    notify_monitors(name, events)
+
+    %{
+      state
+      | pending_replicated_pg_ops: [],
+        pending_replicated_pg_len: 0,
+        pending_replicated_pg_started_at: nil,
+        pending_replicated_pg_flush_ref: nil
+    }
+  end
+
+  defp apply_replicated_pg_ops(name, shard, ops) do
+    {entries, events} =
+      Enum.reduce(ops, {%{}, []}, fn
+        {:join, cluster, key, pid, meta, time, reason, entry_node}, {entries, events} ->
+          member = {cluster, key, pid}
+          {initial, current} = replicated_pg_entry(entries, name, shard, member)
+
+          previous_meta =
+            case {current, reason} do
+              {{old_meta, _old_time, _old_node}, :update} -> old_meta
+              _ -> nil
+            end
+
+          event =
+            build_event(name, :joined, key, pid, meta, %{
+              previous_meta: previous_meta,
+              cluster: cluster
+            })
+
+          updated_entries =
+            Map.put(entries, member, {initial, {meta, time, entry_node}})
+
+          {updated_entries, [event | events]}
+
+        {:leave, cluster, key, pid, meta, reason}, {entries, events} ->
+          member = {cluster, key, pid}
+          {initial, current} = replicated_pg_entry(entries, name, shard, member)
+
+          case current do
+            nil ->
+              {entries, events}
+
+            {_current_meta, _current_time, _current_node} ->
+              event =
+                build_event(name, :left, key, pid, meta, %{reason: reason, cluster: cluster})
+
+              updated_entries = Map.put(entries, member, {initial, nil})
+              {updated_entries, [event | events]}
+          end
+      end)
+
+    {insert_entries, delete_entries} =
+      Enum.reduce(entries, {[], []}, fn
+        {{_cluster, _key, _pid}, {initial, current}}, {insert_entries, delete_entries}
+        when current == initial ->
+          {insert_entries, delete_entries}
+
+        {{cluster, key, pid}, {_initial, nil}}, {insert_entries, delete_entries} ->
+          {insert_entries, [{cluster, key, pid} | delete_entries]}
+
+        {{cluster, key, pid}, {_initial, {meta, time, entry_node}}},
+        {insert_entries, delete_entries} ->
+          {[{cluster, key, pid, meta, time, entry_node} | insert_entries], delete_entries}
+      end)
+
+    {Enum.reverse(insert_entries), Enum.reverse(delete_entries), events}
+  end
+
+  defp replicated_pg_entry(entries, name, shard, member) do
+    case Map.fetch(entries, member) do
+      {:ok, {initial, current}} ->
+        {initial, current}
+
+      :error ->
+        {cluster, key, pid} = member
+
+        current =
+          case Data.pg_lookup(name, shard, cluster, key, pid) do
+            nil -> nil
+            {meta, time, entry_node} -> {meta, time, entry_node}
+          end
+
+        {current, current}
+    end
+  end
+
+  defp log_replicated_pg_op(state, {:join, cluster, key, pid, _meta, _time, _reason, _entry_node}) do
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} replicate_join key=#{inspect(key)} pid=#{inspect(pid)} from #{node(pid)} cluster=#{inspect(cluster)}"
+    end)
+  end
+
+  defp log_replicated_pg_op(state, {:leave, cluster, key, pid, _meta, _reason}) do
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} replicate_leave key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+    end)
+  end
 
   defp send_to_peer(state, target_node, message) do
     shard_name = shard_name(state.name, state.shard_index)

@@ -803,6 +803,93 @@ defmodule GroupTest do
     end
   end
 
+  describe "call timeout option" do
+    test "register honors timeout option" do
+      name = start_single_shard_group()
+      key = "timeout/register/#{System.unique_integer([:positive])}"
+      shard = suspend_only_shard(name)
+
+      try do
+        assert_genserver_call_timeout(fn ->
+          Group.register(name, key, %{}, timeout: 10)
+        end)
+      after
+        resume_shard_if_alive(shard)
+      end
+    end
+
+    test "unregister honors timeout option" do
+      name = start_single_shard_group()
+      key = "timeout/unregister/#{System.unique_integer([:positive])}"
+      :ok = Group.register(name, key, %{})
+      shard = suspend_only_shard(name)
+
+      try do
+        assert_genserver_call_timeout(fn ->
+          Group.unregister(name, key, timeout: 10)
+        end)
+      after
+        resume_shard_if_alive(shard)
+      end
+    end
+
+    test "join honors timeout option" do
+      name = start_single_shard_group()
+      key = "timeout/join/#{System.unique_integer([:positive])}"
+      shard = suspend_only_shard(name)
+
+      try do
+        assert_genserver_call_timeout(fn ->
+          Group.join(name, key, %{}, timeout: 10)
+        end)
+      after
+        resume_shard_if_alive(shard)
+      end
+    end
+
+    test "leave honors timeout option" do
+      name = start_single_shard_group()
+      key = "timeout/leave/#{System.unique_integer([:positive])}"
+      :ok = Group.join(name, key, %{})
+      shard = suspend_only_shard(name)
+
+      try do
+        assert_genserver_call_timeout(fn ->
+          Group.leave(name, key, timeout: 10)
+        end)
+      after
+        resume_shard_if_alive(shard)
+      end
+    end
+
+    test "connect honors timeout option" do
+      name = start_single_shard_group()
+      shard = suspend_only_shard(name)
+
+      try do
+        assert_genserver_call_timeout(fn ->
+          Group.connect(name, "timeout_cluster", timeout: 10)
+        end)
+      after
+        resume_shard_if_alive(shard)
+      end
+    end
+
+    test "disconnect honors timeout option" do
+      name = start_single_shard_group()
+      :ok = Group.connect(name, "timeout_cluster")
+      shard = suspend_only_shard(name)
+
+      try do
+        assert_genserver_call_timeout(fn ->
+          Group.disconnect(name, "timeout_cluster", timeout: 10)
+        end)
+      after
+        resume_shard_if_alive(shard)
+      end
+    end
+  end
+
   describe "ETS table consistency" do
     test "tables are consistent after register + unregister", %{name: name} do
       :ok = Group.register(name, "ets/reg1", %{v: 1})
@@ -1155,6 +1242,233 @@ defmodule GroupTest do
 
       assert_receive {:group, events, _}, 1000
       assert [%Group.Event{type: :unregistered}] = events
+    end
+  end
+
+  describe "replicated PG receiver buffering" do
+    test "flushes buffered replicated joins when buffer size is reached" do
+      name =
+        start_single_shard_group(
+          replicated_pg_receiver_buffer_size: 2,
+          replicated_pg_receiver_flush_interval: 60_000
+        )
+
+      shard = Group.Replica.shard_name(name, 0)
+      key1 = "replicated/size/#{System.unique_integer([:positive])}/1"
+      key2 = "replicated/size/#{System.unique_integer([:positive])}/2"
+      pid1 = spawn_forever()
+      pid2 = spawn_forever()
+
+      on_exit(fn ->
+        kill_if_alive(pid1)
+        kill_if_alive(pid2)
+      end)
+
+      :ok = Group.monitor(name, :all)
+
+      send(shard, replicated_pg_join(nil, key1, pid1, %{v: 1}, :join))
+
+      assert Group.members(name, key1) == []
+      refute_receive {:group, _events, _info}, 50
+
+      send(shard, replicated_pg_join(nil, key2, pid2, %{v: 2}, :join))
+
+      assert_receive {:group, events, _}, 1000
+      assert Enum.map(events, & &1.key) == [key1, key2]
+      assert Enum.map(events, & &1.type) == [:joined, :joined]
+      assert Group.members(name, key1) == [{pid1, %{v: 1}}]
+      assert Group.members(name, key2) == [{pid2, %{v: 2}}]
+    end
+
+    test "barrier messages flush buffered replicated ops in order" do
+      name =
+        start_single_shard_group(
+          replicated_pg_receiver_buffer_size: 32,
+          replicated_pg_receiver_flush_interval: 60_000
+        )
+
+      shard = Group.Replica.shard_name(name, 0)
+      key = "replicated/barrier/#{System.unique_integer([:positive])}"
+      pid = spawn_forever()
+
+      on_exit(fn -> kill_if_alive(pid) end)
+
+      :ok = Group.monitor(name, :all)
+
+      send(shard, replicated_pg_join(nil, key, pid, %{v: 1}, :join))
+      send(shard, replicated_pg_join(nil, key, pid, %{v: 2}, :update))
+      send(shard, replicated_pg_leave(nil, key, pid, %{v: 2}, :leave))
+
+      assert Group.members(name, key) == []
+      flush_replicated_pg_barrier(shard)
+
+      assert_receive {:group, events, _}, 1000
+
+      assert [
+               %Group.Event{
+                 type: :joined,
+                 key: ^key,
+                 pid: ^pid,
+                 meta: %{v: 1},
+                 previous_meta: nil
+               },
+               %Group.Event{
+                 type: :joined,
+                 key: ^key,
+                 pid: ^pid,
+                 meta: %{v: 2},
+                 previous_meta: %{v: 1}
+               },
+               %Group.Event{type: :left, key: ^key, pid: ^pid, meta: %{v: 2}, reason: :leave}
+             ] = events
+
+      assert_receive {:replicated_pg_buffer_flushed, ^shard}, 1000
+      assert Group.members(name, key) == []
+    end
+
+    test "batchable traffic can flush an overdue buffer without relying on the timer" do
+      name =
+        start_single_shard_group(
+          replicated_pg_receiver_buffer_size: 32,
+          replicated_pg_receiver_flush_interval: 1_000
+        )
+
+      shard = Group.Replica.shard_name(name, 0)
+      key1 = "replicated/due/#{System.unique_integer([:positive])}/1"
+      key2 = "replicated/due/#{System.unique_integer([:positive])}/2"
+      pid1 = spawn_forever()
+      pid2 = spawn_forever()
+
+      on_exit(fn ->
+        kill_if_alive(pid1)
+        kill_if_alive(pid2)
+      end)
+
+      :ok = Group.monitor(name, :all)
+
+      send(shard, replicated_pg_join(nil, key1, pid1, %{v: 1}, :join))
+      Process.sleep(10)
+
+      :sys.replace_state(shard, fn state ->
+        %{
+          state
+          | pending_replicated_pg_started_at: System.monotonic_time(:millisecond) - 5_000,
+            pending_replicated_pg_flush_ref: nil
+        }
+      end)
+
+      send(shard, replicated_pg_join(nil, key2, pid2, %{v: 2}, :join))
+
+      assert_receive {:group, events, _}, 1000
+      assert Enum.map(events, & &1.key) == [key1, key2]
+
+      state = :sys.get_state(shard)
+      assert state.pending_replicated_pg_len == 0
+      assert Group.members(name, key1) == [{pid1, %{v: 1}}]
+      assert Group.members(name, key2) == [{pid2, %{v: 2}}]
+    end
+
+    test "terminate flushes buffered replicated ops before shard restart" do
+      name =
+        start_single_shard_group(
+          replicated_pg_receiver_buffer_size: 32,
+          replicated_pg_receiver_flush_interval: 60_000
+        )
+
+      shard = Group.Replica.shard_name(name, 0)
+      shard_pid = Process.whereis(shard)
+      key = "replicated/terminate/#{System.unique_integer([:positive])}"
+      pid = spawn_forever()
+
+      on_exit(fn -> kill_if_alive(pid) end)
+
+      :ok = Group.monitor(name, :all)
+
+      send(shard, replicated_pg_join(nil, key, pid, %{v: 1}, :join))
+      assert Group.members(name, key) == []
+
+      ref = Process.monitor(shard_pid)
+      :ok = GenServer.stop(shard_pid, :shutdown)
+      assert_receive {:DOWN, ^ref, :process, ^shard_pid, :shutdown}, 1000
+      assert_receive {:group, [%Group.Event{type: :joined, key: ^key, pid: ^pid}], _}, 1000
+
+      wait_until(fn ->
+        case Process.whereis(shard) do
+          nil -> false
+          new_pid -> new_pid != shard_pid
+        end
+      end)
+
+      assert Group.members(name, key) == [{pid, %{v: 1}}]
+    end
+  end
+
+  defp start_single_shard_group(opts \\ []) do
+    name = :"test_timeout_group_#{System.unique_integer([:positive])}"
+    opts = Keyword.merge([name: name, shards: 1, log: false], opts)
+    start_supervised!({Group, opts})
+    name
+  end
+
+  defp suspend_only_shard(name) do
+    shard = Group.Replica.shard_name(name, 0)
+    :ok = :sys.suspend(shard)
+    shard
+  end
+
+  defp resume_shard_if_alive(shard) do
+    if Process.whereis(shard) do
+      :ok = :sys.resume(shard)
+    end
+
+    :ok
+  end
+
+  defp assert_genserver_call_timeout(fun) do
+    assert {:timeout, {GenServer, :call, _}} = catch_exit(fun.())
+  end
+
+  defp replicated_pg_join(cluster, key, pid, meta, reason) do
+    {:replicate_join, cluster, key, pid, meta, System.system_time(), reason}
+  end
+
+  defp replicated_pg_leave(cluster, key, pid, meta, reason) do
+    {:replicate_leave, cluster, key, pid, meta, reason}
+  end
+
+  defp flush_replicated_pg_barrier(shard) do
+    send(shard, {:group_dispatch, [self()], {:replicated_pg_buffer_flushed, shard}})
+  end
+
+  defp spawn_forever do
+    spawn(fn -> Process.sleep(:infinity) end)
+  end
+
+  defp kill_if_alive(pid) do
+    if Process.alive?(pid) do
+      Process.exit(pid, :kill)
+    end
+
+    :ok
+  end
+
+  defp wait_until(fun, timeout \\ 1_000)
+
+  defp wait_until(fun, timeout) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    do_wait_until(fun, deadline)
+  end
+
+  defp do_wait_until(fun, deadline) do
+    if fun.() do
+      :ok
+    else
+      if System.monotonic_time(:millisecond) >= deadline do
+        flunk("condition did not become true")
+      end
+
+      Process.sleep(10)
+      do_wait_until(fun, deadline)
     end
   end
 end

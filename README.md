@@ -152,6 +152,9 @@ Group.log_level(:my_app, :info)     # back to normal
 Group.log_level(:my_app, false)     # silence all Group logs
 ```
 
+`Group.log_level/2` updates `:persistent_term`, so it should be used as an
+occasional admin control, not from a hot path.
+
 ## Events
 
 Events are delivered as `{:group, events, %{name: name}}` tuples containing
@@ -200,7 +203,9 @@ All operations are **eventually consistent**:
   shards: 8,                                   # number of write shards (default)
   log: :info,                                  # :info | :verbose | false
   resolve_registry_conflict: {MyResolver, :resolve, []},  # partition conflict resolver
-  extract_meta: {MyApp, :extract_meta, []}     # transform meta on read
+  extract_meta: {MyApp, :extract_meta, []},    # transform meta on read
+  replicated_pg_receiver_buffer_size: 64,      # buffered remote PG join/leave ops per shard
+  replicated_pg_receiver_flush_interval: 5     # max buffer age in ms before flush
 }
 ```
 
@@ -222,6 +227,10 @@ All operations are **eventually consistent**:
   inside the shard GenServer — must return quickly and never block.
 - **`extract_meta`** — `{module, function, args}` or `fun(meta)` applied to
   metadata on reads (`lookup`, `members`). Useful for stripping internal fields.
+- **`replicated_pg_receiver_buffer_size`** — max buffered replicated PG
+  join/leave ops per shard before the receiver flushes immediately. Defaults to 64.
+- **`replicated_pg_receiver_flush_interval`** — max time in milliseconds a shard
+  will buffer replicated PG join/leave ops before flushing. Defaults to 5.
 
 ## Architecture
 

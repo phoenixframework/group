@@ -16,8 +16,21 @@ defmodule Group.Supervisor do
     resolve_registry_conflict = Keyword.get(opts, :resolve_registry_conflict)
     log = Keyword.get(opts, :log, :info)
 
+    replicated_pg_receiver_buffer_size =
+      positive_integer_opt(opts, :replicated_pg_receiver_buffer_size, 64)
+
+    replicated_pg_receiver_flush_interval =
+      non_negative_integer_opt(opts, :replicated_pg_receiver_flush_interval, 5)
+
     # persistent_term config — must be set before children start (Replica reads it)
-    config = %{callbacks: callbacks, num_shards: num_shards, log: log}
+    config = %{
+      callbacks: callbacks,
+      num_shards: num_shards,
+      log: log,
+      replicated_pg_receiver_buffer_size: replicated_pg_receiver_buffer_size,
+      replicated_pg_receiver_flush_interval: replicated_pg_receiver_flush_interval
+    }
+
     config = if extract_meta, do: Map.put(config, :extract_meta, extract_meta), else: config
 
     config =
@@ -34,5 +47,27 @@ defmodule Group.Supervisor do
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)
+  end
+
+  defp positive_integer_opt(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value > 0 ->
+        value
+
+      value ->
+        raise ArgumentError,
+              "expected #{inspect(key)} to be a positive integer, got: #{inspect(value)}"
+    end
+  end
+
+  defp non_negative_integer_opt(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value >= 0 ->
+        value
+
+      value ->
+        raise ArgumentError,
+              "expected #{inspect(key)} to be a non-negative integer, got: #{inspect(value)}"
+    end
   end
 end

@@ -355,18 +355,29 @@ defmodule Group.TestCluster do
   @doc """
   Synchronously flushes all shard GenServers on a remote node.
 
-  Issues `:sys.get_state` on each shard, which processes all messages
-  queued before the call. Use after `assert_eventually` to drain any
-  remaining async fan-out or cleanup messages before checking ETS state.
+  Sends a barrier through each shard's normal mailbox so any buffered replicated
+  PG joins/leaves are flushed before the call returns. Use after
+  `assert_eventually` to drain any remaining async fan-out or cleanup messages
+  before checking ETS state.
   """
   def flush_shards(node, name) do
-    num_shards = rpc!(node, Group, :get_config, [name]).num_shards
+    :erpc.call(node, fn ->
+      num_shards = Group.get_config(name).num_shards
 
-    for shard <- 0..(num_shards - 1) do
-      rpc!(node, :sys, :get_state, [:"#{name}_replica_#{shard}"])
-    end
+      for shard <- 0..(num_shards - 1) do
+        shard_name = :"#{name}_replica_#{shard}"
+        ref = make_ref()
+        send(shard_name, {:group_dispatch, [self()], {:test_cluster_flush_ack, ref}})
 
-    :ok
+        receive do
+          {:test_cluster_flush_ack, ^ref} -> :ok
+        after
+          5_000 -> raise "flush_shards timed out for #{inspect(shard_name)}"
+        end
+      end
+
+      :ok
+    end)
   end
 
   @doc """
