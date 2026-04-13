@@ -1022,6 +1022,156 @@ defmodule GroupTest do
     end
   end
 
+  describe "local request fairness" do
+    test "local join gets a turn ahead of replicated PG backlog" do
+      name =
+        start_single_shard_group(
+          replicated_pg_receiver_buffer_size: 1,
+          replicated_pg_receiver_flush_interval: 60_000
+        )
+
+      shard = suspend_only_shard(name)
+      remote_pid = spawn_forever()
+      local_key = "fair/join/local/#{System.unique_integer([:positive])}"
+      backlog_prefix = "fair/join/backlog/#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        kill_if_alive(remote_pid)
+      end)
+
+      enqueue_replicated_pg_backlog(shard, backlog_prefix, remote_pid, 1_000)
+
+      caller =
+        spawn_requester(
+          fn ->
+            Group.join(name, local_key, %{local: true})
+          end,
+          :local_join_result
+        )
+
+      on_exit(fn -> kill_if_alive(caller) end)
+      Process.sleep(20)
+      :ok = :sys.resume(shard)
+
+      assert_receive {:local_join_result, ^caller, :ok}, 1_000
+      assert shard_message_queue_len(shard) > 0
+      assert Group.members(name, local_key) == [{caller, %{local: true}}]
+      wait_until(fn -> shard_message_queue_len(shard) == 0 end, 5_000)
+    end
+
+    test "local connect and disconnect each get a turn ahead of replicated PG backlog" do
+      name =
+        start_single_shard_group(
+          replicated_pg_receiver_buffer_size: 1,
+          replicated_pg_receiver_flush_interval: 60_000
+        )
+
+      shard = suspend_only_shard(name)
+      remote_pid = spawn_forever()
+      cluster = "fair/connect/#{System.unique_integer([:positive])}"
+      connect_prefix = "fair/connect/backlog/#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        kill_if_alive(remote_pid)
+      end)
+
+      enqueue_replicated_pg_backlog(shard, connect_prefix, remote_pid, 1_000)
+
+      connect_caller =
+        spawn_requester(
+          fn ->
+            Group.connect(name, cluster)
+          end,
+          :local_connect_result
+        )
+
+      on_exit(fn -> kill_if_alive(connect_caller) end)
+      Process.sleep(20)
+      :ok = :sys.resume(shard)
+
+      assert_receive {:local_connect_result, ^connect_caller, :ok}, 1_000
+      assert shard_message_queue_len(shard) > 0
+      assert Group.connected?(name, cluster)
+      wait_until(fn -> shard_message_queue_len(shard) == 0 end, 5_000)
+
+      :ok = :sys.suspend(shard)
+
+      disconnect_prefix = "fair/disconnect/backlog/#{System.unique_integer([:positive])}"
+
+      enqueue_replicated_pg_backlog(shard, disconnect_prefix, remote_pid, 1_000)
+
+      disconnect_caller =
+        spawn_requester(
+          fn ->
+            Group.disconnect(name, cluster)
+          end,
+          :local_disconnect_result
+        )
+
+      on_exit(fn -> kill_if_alive(disconnect_caller) end)
+      Process.sleep(20)
+      :ok = :sys.resume(shard)
+
+      assert_receive {:local_disconnect_result, ^disconnect_caller, :ok}, 1_000
+      assert shard_message_queue_len(shard) > 0
+      refute Group.connected?(name, cluster)
+      wait_until(fn -> shard_message_queue_len(shard) == 0 end, 5_000)
+    end
+
+    test "fairness preserves FIFO within the local request lane" do
+      name =
+        start_single_shard_group(
+          replicated_pg_receiver_buffer_size: 1,
+          replicated_pg_receiver_flush_interval: 60_000
+        )
+
+      shard = suspend_only_shard(name)
+      remote_pid = spawn_forever()
+      backlog_prefix = "fair/fifo/backlog/#{System.unique_integer([:positive])}"
+      key1 = "fair/fifo/local/#{System.unique_integer([:positive])}/1"
+      key2 = "fair/fifo/local/#{System.unique_integer([:positive])}/2"
+
+      on_exit(fn ->
+        kill_if_alive(remote_pid)
+      end)
+
+      enqueue_replicated_pg_backlog(shard, backlog_prefix, remote_pid, 1_000)
+
+      caller1 =
+        spawn_requester(
+          fn ->
+            Group.join(name, key1, %{order: 1})
+          end,
+          :fifo_result
+        )
+
+      Process.sleep(20)
+
+      caller2 =
+        spawn_requester(
+          fn ->
+            Group.join(name, key2, %{order: 2})
+          end,
+          :fifo_result
+        )
+
+      on_exit(fn ->
+        kill_if_alive(caller1)
+        kill_if_alive(caller2)
+      end)
+
+      Process.sleep(20)
+      :ok = :sys.resume(shard)
+
+      assert_receive {:fifo_result, ^caller1, :ok}, 1_000
+      assert_receive {:fifo_result, ^caller2, :ok}, 1_000
+      assert shard_message_queue_len(shard) > 0
+      assert Group.members(name, key1) == [{caller1, %{order: 1}}]
+      assert Group.members(name, key2) == [{caller2, %{order: 2}}]
+      wait_until(fn -> shard_message_queue_len(shard) == 0 end, 5_000)
+    end
+  end
+
   describe "ETS table consistency" do
     test "tables are consistent after register + unregister", %{name: name} do
       :ok = Group.register(name, "ets/reg1", %{v: 1})
@@ -1625,6 +1775,31 @@ defmodule GroupTest do
 
   defp replicated_pg_leave(cluster, key, pid, meta, reason) do
     {:replicate_leave, cluster, key, pid, meta, reason}
+  end
+
+  defp enqueue_replicated_pg_backlog(shard, key_prefix, pid, count) do
+    for i <- 1..count do
+      send(shard, replicated_pg_join(nil, "#{key_prefix}/#{i}", pid, %{}, :join))
+    end
+
+    :ok
+  end
+
+  defp spawn_requester(fun, tag) do
+    parent = self()
+
+    spawn(fn ->
+      result = fun.()
+      send(parent, {tag, self(), result})
+      Process.sleep(:infinity)
+    end)
+  end
+
+  defp shard_message_queue_len(shard) do
+    case Process.info(Process.whereis(shard), :message_queue_len) do
+      {:message_queue_len, len} -> len
+      nil -> 0
+    end
   end
 
   defp flush_replicated_pg_barrier(shard) do

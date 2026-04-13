@@ -1005,6 +1005,67 @@ defmodule Group.DistributedTest do
       assert TestCluster.rpc!(node_a, Group, :lookup, [name, "new_key", [cluster: "game"]]) == nil
     end
 
+    test "local join does not overtake an earlier remote cluster_disconnect after replicated PG flush" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"disc_order_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replicated_pg_receiver_buffer_size: 1,
+        replicated_pg_receiver_flush_interval: 60_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        nodes_a = TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])
+        nodes_b = TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+        node_b in nodes_a and node_a in nodes_b
+      end)
+
+      shard_a = Group.Replica.shard_name(name, 0)
+      assert :ok = TestCluster.rpc!(node_a, :sys, :suspend, [shard_a])
+
+      spam_pid = TestCluster.spawn_join(node_b, name, "game/hot", %{seq: 1}, cluster: "game")
+      assert :ok = TestCluster.rpc!(node_b, Group, :disconnect, [name, "game"])
+      refute TestCluster.rpc!(node_b, Group, :connected?, [name, "game"])
+
+      test_pid = self()
+      local_key = "game/local_after_remote_disconnect"
+
+      requester_pid =
+        TestCluster.spawn_join_reporter(
+          node_a,
+          name,
+          local_key,
+          %{local: true},
+          test_pid,
+          cluster: "game"
+        )
+
+      assert :ok = TestCluster.rpc!(node_a, :sys, :resume, [shard_a])
+      assert_receive {:join_result, ^requester_pid, :ok}, 5_000
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :members, [name, local_key, [cluster: "game"]]) != []
+      end)
+
+      assert TestCluster.rpc!(node_b, Group, :members, [name, local_key, [cluster: "game"]]) == []
+
+      TestCluster.rpc!(node_a, Process, :exit, [requester_pid, :kill])
+      Process.exit(spam_pid, :kill)
+    end
+
     test "fires events with reason :cluster_disconnect" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)

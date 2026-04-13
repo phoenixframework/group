@@ -32,6 +32,7 @@ defmodule GroupBench.Distributed do
     bench_join_death_cleanup(@replicas)
     bench_many_clusters(@replicas)
     bench_busy_app(@replicas)
+    bench_local_requests_under_replicated_pg_pressure(@replicas)
 
     IO.puts("\n  Done.\n")
   end
@@ -640,5 +641,98 @@ defmodule GroupBench.Distributed do
     end
 
     stop_groups(replicas)
+  end
+
+  # ── 10. Local request latency under replicated PG pressure ──────────
+
+  defp bench_local_requests_under_replicated_pg_pressure([r1, r2] = replicas) do
+    header("10. Local Request Latency Under Replicated PG Pressure")
+
+    sample_count = 250
+    spam_workers = 32
+    hot_shard = 0
+
+    IO.puts("  setup:       1 shard, #{spam_workers} remote PG update spammers")
+    IO.puts("  samples/op:  #{sample_count}")
+    IO.puts("  hot shard:   #{hot_shard}")
+
+    start_group_on(r1, shards: 1)
+    start_group_on(r2, shards: 1)
+    wait_for_peer_discovery(replicas)
+
+    spammers =
+      :erpc.call(
+        r1,
+        GroupBench.Replica,
+        :start_pg_update_spammers,
+        [@name, spam_workers, "pressure/spam/"],
+        60_000
+      )
+
+    poll_until(
+      fn ->
+        case :erpc.call(r2, GroupBench.Replica, :replicated_pg_pressure, [@name, hot_shard]) do
+          %{message_queue_len: queue_len, pending_replicated_pg_len: pending_len} ->
+            queue_len > 0 or pending_len > 0
+        end
+      end,
+      10_000
+    )
+
+    try do
+      {register_samples, register_pids} =
+        :erpc.call(
+          r2,
+          GroupBench.Replica,
+          :local_register_samples,
+          [@name, sample_count, "pressure/register/"],
+          60_000
+        )
+
+      try do
+        report_latency("local Group.register/4 on receiver", register_samples)
+      after
+        :erpc.call(r2, GroupBench.Replica, :kill_processes, [register_pids], 60_000)
+      end
+
+      {join_samples, join_pids} =
+        :erpc.call(
+          r2,
+          GroupBench.Replica,
+          :local_join_samples,
+          [@name, sample_count, "pressure/join/"],
+          60_000
+        )
+
+      try do
+        report_latency("local Group.join/4 on receiver", join_samples)
+      after
+        :erpc.call(r2, GroupBench.Replica, :kill_processes, [join_pids], 60_000)
+      end
+
+      connect_prefix = "pressure/connect/"
+
+      :erpc.call(
+        r1,
+        GroupBench.Replica,
+        :bulk_connect,
+        [@name, sample_count, connect_prefix],
+        120_000
+      )
+
+      connect_samples =
+        :erpc.call(
+          r2,
+          GroupBench.Replica,
+          :local_connect_samples,
+          [@name, sample_count, connect_prefix],
+          120_000
+        )
+
+      report_latency("local Group.connect/3 on receiver", connect_samples)
+    after
+      :erpc.call(r1, GroupBench.Replica, :kill_processes, [spammers], 60_000)
+      stop_groups(replicas)
+    end
   end
 end

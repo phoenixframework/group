@@ -5,6 +5,8 @@ defmodule Group.Replica do
 
   @process_down_batch_size 32
   @replicated_pg_receiver_flush_timer :flush_replicated_pg_receiver_buffer
+  @local_request_tag :group_local_request
+  @local_reply_tag :group_local_reply
 
   _archdoc = ~S"""
   Sharded GenServer: peer discovery, replication, monitoring, conflict resolution.
@@ -345,6 +347,35 @@ defmodule Group.Replica do
   partition heal, `Group.connect`) produce batched diffs with all new entries.
   `build_purged_events/5` takes an events accumulator and prepends purged-entry
   events to it.
+
+  ## Replicated PG Receiver Fairness
+
+  Receiver-side replicated PG batching solves the apply-cost problem, but a hot
+  stream of `replicate_join` / `replicate_leave` can still monopolize the shard
+  if every completed replication turn is immediately followed by another one.
+
+  To keep local latency-sensitive writes from sitting behind an unbounded remote
+  backlog, the shard gives one queued local request a turn after each completed
+  replicated PG apply turn:
+
+  - one bounded replicated PG turn (the current buffered flush)
+  - then drain any already-waiting cluster/protocol messages
+  - then at most one local `connect` / `disconnect` / `register` /
+    `unregister` / `join` / `leave` request
+  - then yield back to the GenServer loop
+
+  Local callers use an explicit request/reply lane (`send` + monitor + tagged
+  reply) rather than `GenServer.call/3`, so the replica can selectively receive
+  one local request turn without reaching into `'$gen_call'` internals.
+
+  This is intentionally narrower than EKV's fairness model:
+
+  - all public local shard calls get protection from replicated PG backlog
+  - earlier cluster/protocol messages still run first,
+    avoiding stale ordering around disconnect, peer discovery, and cluster sync
+  - FIFO is preserved within the local lane because the selective receive matches
+    a single broad `@local_request_tag` shape and therefore takes the oldest
+    queued local request in the mailbox
   """
 
   require Logger
@@ -381,6 +412,19 @@ defmodule Group.Replica do
 
   def shard_index_for(cluster, key, num_shards) do
     :erlang.phash2({cluster, key}, num_shards)
+  end
+
+  @doc false
+  def local_request(shard_name, request, timeout)
+      when (is_atom(shard_name) or is_pid(shard_name)) and
+             (is_integer(timeout) or timeout == :infinity) do
+    case GenServer.whereis(shard_name) do
+      nil ->
+        exit({:noproc, {GenServer, :call, [shard_name, request, timeout]}})
+
+      pid ->
+        do_local_request(pid, shard_name, request, timeout)
+    end
   end
 
   # =====================================================================
@@ -437,237 +481,42 @@ defmodule Group.Replica do
   # =====================================================================
 
   @impl true
-  def handle_call({:register, cluster, key, pid, meta}, _from, state) do
-    state = flush_pending_replicated_pg_barrier(state)
-    %{name: name, shard_index: shard} = state
-
-    case Data.registry_lookup(name, shard, cluster, key) do
-      nil ->
-        time = System.system_time()
-        mref = monitor_pid(state, pid)
-        Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-
-        log_verbose(state, fn ->
-          "#{log_prefix_shard(state)} register key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
-        end)
-
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_register, cluster, key, pid, meta, time, :register}
-        )
-
-        state = put_monitor(state, pid, mref)
-
-        event =
-          build_event(name, :registered, key, pid, meta, %{previous_meta: nil, cluster: cluster})
-
-        notify_monitors(name, [event])
-        {:reply, :ok, state}
-
-      {^pid, old_meta, _time, _node} when old_meta == meta ->
-        # Same pid, same metadata — noop
-        {:reply, :ok, state}
-
-      {^pid, old_meta, _time, _node} ->
-        # Same pid re-registering — update metadata
-        time = System.system_time()
-        Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-
-        log_verbose(state, fn ->
-          "#{log_prefix_shard(state)} re-register key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
-        end)
-
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_register, cluster, key, pid, meta, time, :update}
-        )
-
-        event =
-          build_event(name, :registered, key, pid, meta, %{
-            previous_meta: old_meta,
-            cluster: cluster
-          })
-
-        notify_monitors(name, [event])
-        {:reply, :ok, state}
-
-      _other ->
-        {:reply, {:error, :taken}, state}
-    end
+  def handle_call({:register, _, _, _, _} = request, _from, state) do
+    {reply, state} = process_local_request(state, request)
+    {:reply, reply, state}
   end
 
-  def handle_call({:unregister, cluster, key}, _from, state) do
-    state = flush_pending_replicated_pg_barrier(state)
-    %{name: name, shard_index: shard} = state
-
-    case Data.registry_lookup(name, shard, cluster, key) do
-      {pid, meta, _time, entry_node} when entry_node == node() ->
-        Data.registry_delete(name, shard, cluster, key, pid)
-        state = maybe_demonitor_pid(state, name, shard, pid)
-
-        log_verbose(state, fn ->
-          "#{log_prefix_shard(state)} unregister key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
-        end)
-
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_unregister, cluster, key, pid, meta, :unregister}
-        )
-
-        event =
-          build_event(name, :unregistered, key, pid, meta, %{
-            reason: :unregister,
-            cluster: cluster
-          })
-
-        notify_monitors(name, [event])
-        {:reply, :ok, state}
-
-      nil ->
-        {:reply, {:error, :undefined}, state}
-
-      {_pid, _meta, _time, _other_node} ->
-        {:reply, {:error, :not_owner}, state}
-    end
+  def handle_call({:unregister, _, _} = request, _from, state) do
+    {reply, state} = process_local_request(state, request)
+    {:reply, reply, state}
   end
 
   # =====================================================================
   # Process group calls
   # =====================================================================
 
-  def handle_call({:join, cluster, key, pid, meta}, _from, state) do
-    state = flush_pending_replicated_pg_barrier(state)
-    %{name: name, shard_index: shard} = state
-
-    case Data.pg_lookup(name, shard, cluster, key, pid) do
-      nil ->
-        time = System.system_time()
-        mref = monitor_pid(state, pid)
-        Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-
-        log_verbose(state, fn ->
-          "#{log_prefix_shard(state)} join key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
-        end)
-
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_join, cluster, key, pid, meta, time, :join}
-        )
-
-        state = put_monitor(state, pid, mref)
-
-        event =
-          build_event(name, :joined, key, pid, meta, %{previous_meta: nil, cluster: cluster})
-
-        notify_monitors(name, [event])
-        {:reply, :ok, state}
-
-      {old_meta, _time, _node} when old_meta == meta ->
-        # Same metadata — noop
-        {:reply, :ok, state}
-
-      {old_meta, _time, _node} ->
-        # Re-join with updated metadata
-        time = System.system_time()
-        Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-
-        log_verbose(state, fn ->
-          "#{log_prefix_shard(state)} re-join key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
-        end)
-
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_join, cluster, key, pid, meta, time, :update}
-        )
-
-        event =
-          build_event(name, :joined, key, pid, meta, %{previous_meta: old_meta, cluster: cluster})
-
-        notify_monitors(name, [event])
-        {:reply, :ok, state}
-    end
+  def handle_call({:join, _, _, _, _} = request, _from, state) do
+    {reply, state} = process_local_request(state, request)
+    {:reply, reply, state}
   end
 
-  def handle_call({:leave, cluster, key, pid}, _from, state) do
-    state = flush_pending_replicated_pg_barrier(state)
-    %{name: name, shard_index: shard} = state
-
-    case Data.pg_lookup(name, shard, cluster, key, pid) do
-      nil ->
-        {:reply, {:error, :not_in_group}, state}
-
-      {meta, _time, _node} ->
-        Data.pg_delete(name, shard, cluster, key, pid)
-        state = maybe_demonitor_pid(state, name, shard, pid)
-
-        log_verbose(state, fn ->
-          "#{log_prefix_shard(state)} leave key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
-        end)
-
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_leave, cluster, key, pid, meta, :leave}
-        )
-
-        event = build_event(name, :left, key, pid, meta, %{reason: :leave, cluster: cluster})
-        notify_monitors(name, [event])
-        {:reply, :ok, state}
-    end
+  def handle_call({:leave, _, _, _} = request, _from, state) do
+    {reply, state} = process_local_request(state, request)
+    {:reply, reply, state}
   end
 
   # =====================================================================
   # Cluster connect/disconnect (broadcast to all shards, rare operation)
   # =====================================================================
 
-  def handle_call({:cluster_connect, clusters}, _from, state) do
-    state = flush_pending_replicated_pg_barrier(state)
-    %{name: name} = state
-
-    log(state, fn ->
-      "#{log_prefix(state)} cluster_connect #{inspect(clusters)}"
-    end)
-
-    # Use shared ETS (cluster_nodes for nil cluster) instead of per-shard
-    # remote_shards. The nil cluster ETS is populated by any shard processing
-    # peer_connect (incoming), so it's available before this shard's
-    # peer_connect_ack populates remote_shards. This eliminates the race where
-    # connect/2 runs before peer discovery completes on the random shard.
-    shard_name = shard_name(name, state.shard_index)
-    peers = Data.cluster_nodes(name, nil) -- [node()]
-
-    for target_node <- peers do
-      send({shard_name, target_node}, {:cluster_connect, clusters, self()})
-    end
-
-    {:reply, :ok, state}
+  def handle_call({:cluster_connect, _} = request, _from, state) do
+    {reply, state} = process_local_request(state, request)
+    {:reply, reply, state}
   end
 
-  def handle_call({:cluster_disconnect, clusters}, _from, state) do
-    state = flush_pending_replicated_pg_barrier(state)
-    %{name: name, shard_index: shard} = state
-
-    log_once(state, fn ->
-      "#{log_prefix(state)} cluster_disconnect #{inspect(clusters)}"
-    end)
-
-    events =
-      Enum.reduce(clusters, [], fn cluster, acc ->
-        {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, node())
-        build_purged_events(name, purged_reg, purged_pg, :cluster_disconnect, acc)
-      end)
-
-    if shard == 0 do
-      broadcast_to_peers(state, {:cluster_disconnect, clusters, self()})
-    end
-
-    notify_monitors(name, events)
-    {:reply, :ok, state}
+  def handle_call({:cluster_disconnect, _} = request, _from, state) do
+    {reply, state} = process_local_request(state, request)
+    {:reply, reply, state}
   end
 
   # =====================================================================
@@ -760,15 +609,25 @@ defmodule Group.Replica do
   end
 
   def handle_info({:replicate_join, cluster, key, pid, meta, time, reason}, state) do
-    state =
+    {state, flushed?} =
       enqueue_replicated_pg_op(state, {:join, cluster, key, pid, meta, time, reason, node(pid)})
+
+    state = if flushed?, do: take_priority_turn(state), else: state
 
     {:noreply, state}
   end
 
   def handle_info({:replicate_leave, cluster, key, pid, meta, reason}, state) do
-    state = enqueue_replicated_pg_op(state, {:leave, cluster, key, pid, meta, reason})
+    {state, flushed?} =
+      enqueue_replicated_pg_op(state, {:leave, cluster, key, pid, meta, reason})
+
+    state = if flushed?, do: take_priority_turn(state), else: state
     {:noreply, state}
+  end
+
+  def handle_info({@local_request_tag, caller_pid, ref, request}, state)
+      when is_pid(caller_pid) and is_reference(ref) do
+    {:noreply, handle_local_request_message(state, caller_pid, ref, request)}
   end
 
   # =====================================================================
@@ -1154,7 +1013,9 @@ defmodule Group.Replica do
   def handle_info({@replicated_pg_receiver_flush_timer, flush_ref}, state) do
     state =
       if state.pending_replicated_pg_flush_ref == flush_ref do
-        flush_pending_replicated_pg(state)
+        state
+        |> flush_pending_replicated_pg()
+        |> take_priority_turn()
       else
         state
       end
@@ -1171,8 +1032,296 @@ defmodule Group.Replica do
   # Internal helpers
   # =====================================================================
 
+  defp do_local_request(pid, shard_name, request, :infinity) when is_pid(pid) do
+    ref = make_ref()
+    mref = Process.monitor(pid)
+    send(pid, {@local_request_tag, self(), ref, request})
+
+    receive do
+      {@local_reply_tag, ^ref, reply} ->
+        Process.demonitor(mref, [:flush])
+        reply
+
+      {:DOWN, ^mref, :process, ^pid, reason} ->
+        exit({reason, {GenServer, :call, [shard_name, request, :infinity]}})
+    end
+  end
+
+  defp do_local_request(pid, shard_name, request, timeout)
+       when is_pid(pid) and is_integer(timeout) do
+    ref = make_ref()
+    mref = Process.monitor(pid)
+    send(pid, {@local_request_tag, self(), ref, request})
+
+    receive do
+      {@local_reply_tag, ^ref, reply} ->
+        Process.demonitor(mref, [:flush])
+        reply
+
+      {:DOWN, ^mref, :process, ^pid, reason} ->
+        exit({reason, {GenServer, :call, [shard_name, request, timeout]}})
+    after
+      timeout ->
+        Process.demonitor(mref, [:flush])
+
+        receive do
+          {@local_reply_tag, ^ref, _reply} -> :ok
+        after
+          0 -> :ok
+        end
+
+        exit({:timeout, {GenServer, :call, [shard_name, request, timeout]}})
+    end
+  end
+
+  defp reply_local_request({:send, caller_pid, ref}, reply)
+       when is_pid(caller_pid) and is_reference(ref) do
+    send(caller_pid, {@local_reply_tag, ref, reply})
+    :ok
+  end
+
+  defp handle_local_request_message(state, caller_pid, ref, request) do
+    {reply, state} = process_local_request(state, request)
+    :ok = reply_local_request({:send, caller_pid, ref}, reply)
+    state
+  end
+
+  defp process_local_request(state, request) do
+    state = flush_pending_replicated_pg_barrier(state)
+
+    case request do
+      {:register, cluster, key, pid, meta} ->
+        do_register(state, cluster, key, pid, meta)
+
+      {:unregister, cluster, key} ->
+        do_unregister(state, cluster, key)
+
+      {:join, cluster, key, pid, meta} ->
+        do_join(state, cluster, key, pid, meta)
+
+      {:leave, cluster, key, pid} ->
+        do_leave(state, cluster, key, pid)
+
+      {:cluster_connect, clusters} ->
+        do_cluster_connect(state, clusters)
+
+      {:cluster_disconnect, clusters} ->
+        do_cluster_disconnect(state, clusters)
+    end
+  end
+
   defp flush_pending_replicated_pg_barrier(%{pending_replicated_pg_len: 0} = state), do: state
   defp flush_pending_replicated_pg_barrier(state), do: flush_pending_replicated_pg(state)
+
+  defp do_register(state, cluster, key, pid, meta) do
+    %{name: name, shard_index: shard} = state
+
+    case Data.registry_lookup(name, shard, cluster, key) do
+      nil ->
+        time = System.system_time()
+        mref = monitor_pid(state, pid)
+        Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} register key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
+
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_register, cluster, key, pid, meta, time, :register}
+        )
+
+        state = put_monitor(state, pid, mref)
+
+        event =
+          build_event(name, :registered, key, pid, meta, %{previous_meta: nil, cluster: cluster})
+
+        notify_monitors(name, [event])
+        {:ok, state}
+
+      {^pid, old_meta, _time, _node} when old_meta == meta ->
+        {:ok, state}
+
+      {^pid, old_meta, _time, _node} ->
+        time = System.system_time()
+        Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} re-register key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
+
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_register, cluster, key, pid, meta, time, :update}
+        )
+
+        event =
+          build_event(name, :registered, key, pid, meta, %{
+            previous_meta: old_meta,
+            cluster: cluster
+          })
+
+        notify_monitors(name, [event])
+        {:ok, state}
+
+      _other ->
+        {{:error, :taken}, state}
+    end
+  end
+
+  defp do_unregister(state, cluster, key) do
+    %{name: name, shard_index: shard} = state
+
+    case Data.registry_lookup(name, shard, cluster, key) do
+      {pid, meta, _time, entry_node} when entry_node == node() ->
+        Data.registry_delete(name, shard, cluster, key, pid)
+        state = maybe_demonitor_pid(state, name, shard, pid)
+
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} unregister key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
+
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_unregister, cluster, key, pid, meta, :unregister}
+        )
+
+        event =
+          build_event(name, :unregistered, key, pid, meta, %{
+            reason: :unregister,
+            cluster: cluster
+          })
+
+        notify_monitors(name, [event])
+        {:ok, state}
+
+      nil ->
+        {{:error, :undefined}, state}
+
+      {_pid, _meta, _time, _other_node} ->
+        {{:error, :not_owner}, state}
+    end
+  end
+
+  defp do_join(state, cluster, key, pid, meta) do
+    %{name: name, shard_index: shard} = state
+
+    case Data.pg_lookup(name, shard, cluster, key, pid) do
+      nil ->
+        time = System.system_time()
+        mref = monitor_pid(state, pid)
+        Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} join key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
+
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_join, cluster, key, pid, meta, time, :join}
+        )
+
+        state = put_monitor(state, pid, mref)
+
+        event =
+          build_event(name, :joined, key, pid, meta, %{previous_meta: nil, cluster: cluster})
+
+        notify_monitors(name, [event])
+        {:ok, state}
+
+      {old_meta, _time, _node} when old_meta == meta ->
+        {:ok, state}
+
+      {old_meta, _time, _node} ->
+        time = System.system_time()
+        Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
+
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} re-join key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
+
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_join, cluster, key, pid, meta, time, :update}
+        )
+
+        event =
+          build_event(name, :joined, key, pid, meta, %{previous_meta: old_meta, cluster: cluster})
+
+        notify_monitors(name, [event])
+        {:ok, state}
+    end
+  end
+
+  defp do_leave(state, cluster, key, pid) do
+    %{name: name, shard_index: shard} = state
+
+    case Data.pg_lookup(name, shard, cluster, key, pid) do
+      nil ->
+        {{:error, :not_in_group}, state}
+
+      {meta, _time, _node} ->
+        Data.pg_delete(name, shard, cluster, key, pid)
+        state = maybe_demonitor_pid(state, name, shard, pid)
+
+        log_verbose(state, fn ->
+          "#{log_prefix_shard(state)} leave key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
+        end)
+
+        broadcast_to_cluster(
+          state,
+          cluster,
+          {:replicate_leave, cluster, key, pid, meta, :leave}
+        )
+
+        event = build_event(name, :left, key, pid, meta, %{reason: :leave, cluster: cluster})
+        notify_monitors(name, [event])
+        {:ok, state}
+    end
+  end
+
+  defp do_cluster_connect(state, clusters) do
+    %{name: name} = state
+
+    log(state, fn ->
+      "#{log_prefix(state)} cluster_connect #{inspect(clusters)}"
+    end)
+
+    shard_name = shard_name(name, state.shard_index)
+    peers = Data.cluster_nodes(name, nil) -- [node()]
+
+    for target_node <- peers do
+      send({shard_name, target_node}, {:cluster_connect, clusters, self()})
+    end
+
+    {:ok, state}
+  end
+
+  defp do_cluster_disconnect(state, clusters) do
+    %{name: name, shard_index: shard} = state
+
+    log_once(state, fn ->
+      "#{log_prefix(state)} cluster_disconnect #{inspect(clusters)}"
+    end)
+
+    events =
+      Enum.reduce(clusters, [], fn cluster, acc ->
+        {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, node())
+        build_purged_events(name, purged_reg, purged_pg, :cluster_disconnect, acc)
+      end)
+
+    if shard == 0 do
+      broadcast_to_peers(state, {:cluster_disconnect, clusters, self()})
+    end
+
+    notify_monitors(name, events)
+    {:ok, state}
+  end
 
   defp enqueue_replicated_pg_op(state, op) do
     log_replicated_pg_op(state, op)
@@ -1197,9 +1346,94 @@ defmodule Group.Replica do
 
     if state.pending_replicated_pg_len >= state.replicated_pg_receiver_buffer_size or
          pending_replicated_pg_due?(state, now) do
-      flush_pending_replicated_pg(state)
+      {flush_pending_replicated_pg(state), true}
     else
-      state
+      {state, false}
+    end
+  end
+
+  defp process_inline_priority_message(state, msg) do
+    case handle_info(msg, state) do
+      {:noreply, next_state} ->
+        next_state
+    end
+  end
+
+  defp take_priority_turn(state) do
+    state
+    |> take_priority_control_turn()
+    |> take_one_local_request_turn()
+  end
+
+  defp take_priority_control_turn(state) do
+    receive do
+      {:peer_connect, _remote_pid, _remote_shard_index, _remote_num_shards, _remote_clusters} =
+          msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:peer_connect_ack, _remote_pid, _remote_shard_index, _remote_num_shards, _remote_clusters} =
+          msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:cluster_connect, _clusters, _remote_pid} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:cluster_connect_ack, _clusters, _remote_pid, _cluster_data} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:cluster_disconnect, _clusters, _remote_pid} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:cluster_state, _cluster, _reg_data, _pg_data} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:send_cluster_data, _clusters, _target_node} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:replicate_register, _cluster, _key, _pid, _meta, _time, _reason} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:replicate_unregister, _cluster, _key, _pid, _meta, _reason} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:replicate_process_down_batch, _reg_entries, _pg_entries} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:DOWN, _mref, :process, _pid, _reason} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:nodeup, _remote_node} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+
+      {:nodedown, _remote_node} = msg ->
+        state = process_inline_priority_message(state, msg)
+        take_priority_control_turn(state)
+    after
+      0 ->
+        state
+    end
+  end
+
+  defp take_one_local_request_turn(state) do
+    receive do
+      {@local_request_tag, caller_pid, ref, request}
+      when is_pid(caller_pid) and is_reference(ref) ->
+        handle_local_request_message(state, caller_pid, ref, request)
+    after
+      0 ->
+        state
     end
   end
 

@@ -324,6 +324,20 @@ defmodule Group.TestCluster do
     :erpc.call(node, __MODULE__, :do_spawn_join_forwarder, [name, key, target_pid, opts])
   end
 
+  @doc "Spawn a process on a remote node that joins a group and reports the result to target_pid."
+  def spawn_join_reporter(node, name, key, meta, target_pid, opts \\ []) do
+    :erpc.call(node, __MODULE__, :do_spawn_join_reporter, [name, key, meta, target_pid, opts])
+  end
+
+  @doc false
+  def do_spawn_join_reporter(name, key, meta, target_pid, opts) do
+    spawn(fn ->
+      result = Group.join(name, key, meta, opts)
+      send(target_pid, {:join_result, self(), result})
+      Process.sleep(:infinity)
+    end)
+  end
+
   @doc false
   def do_spawn_join_forwarder(name, key, target_pid, opts) do
     parent = self()

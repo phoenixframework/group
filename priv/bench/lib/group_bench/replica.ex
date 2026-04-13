@@ -139,6 +139,149 @@ defmodule GroupBench.Replica do
   end
 
   @doc """
+  Starts `worker_count` local processes that repeatedly re-join the same key with
+  changing metadata, generating a sustained stream of replicated PG updates.
+  Returns the spammer pids after they complete their initial join.
+  """
+  def start_pg_update_spammers(name, worker_count, key_prefix, opts \\ []) do
+    parent = self()
+
+    pids =
+      Enum.map(1..worker_count, fn i ->
+        spawn(fn ->
+          key = "#{key_prefix}#{i}"
+          :ok = Group.join(name, key, %{seq: 0}, opts)
+          send(parent, {:ready, self()})
+          pg_update_spam_loop(name, key, 1, opts)
+        end)
+      end)
+
+    Enum.each(pids, fn pid ->
+      receive do
+        {:ready, ^pid} -> :ok
+      after
+        30_000 -> raise "Timed out waiting for start_pg_update_spammers"
+      end
+    end)
+
+    pids
+  end
+
+  defp pg_update_spam_loop(name, key, seq, opts) do
+    :ok = Group.join(name, key, %{seq: seq}, opts)
+    pg_update_spam_loop(name, key, seq + 1, opts)
+  end
+
+  @doc """
+  Returns the message queue length for the given shard.
+  """
+  def shard_message_queue_len(name, shard_index) do
+    shard = Group.Replica.shard_name(name, shard_index)
+
+    case Process.info(Process.whereis(shard), :message_queue_len) do
+      {:message_queue_len, len} -> len
+      nil -> 0
+    end
+  end
+
+  @doc """
+  Returns the current receiver-pressure snapshot for a shard.
+  """
+  def replicated_pg_pressure(name, shard_index) do
+    shard = Group.Replica.shard_name(name, shard_index)
+    queue_len = shard_message_queue_len(name, shard_index)
+    state = :sys.get_state(shard)
+
+    %{
+      message_queue_len: queue_len,
+      pending_replicated_pg_len: state.pending_replicated_pg_len
+    }
+  end
+
+  @doc """
+  Collects local register latency samples on this node under the current load.
+  Uses unique keys and leaves the owner processes alive until the caller kills
+  them, so each sample measures the register call itself.
+  """
+  def local_register_samples(name, sample_count, key_prefix, opts \\ []) do
+    parent = self()
+
+    {samples, pids} =
+      Enum.reduce(1..sample_count, {[], []}, fn i, {samples, pids} ->
+        pid =
+          spawn(fn ->
+            key = "#{key_prefix}#{i}"
+            {us, result} = :timer.tc(fn -> Group.register(name, key, %{sample: i}, opts) end)
+            send(parent, {:sample, self(), us, result})
+            Process.sleep(:infinity)
+          end)
+
+        receive do
+          {:sample, ^pid, us, :ok} -> {[us | samples], [pid | pids]}
+          {:sample, ^pid, _us, other} -> raise "register sample failed: #{inspect(other)}"
+        after
+          30_000 -> raise "Timed out waiting for local_register_samples"
+        end
+      end)
+
+    samples = samples |> Enum.sort()
+
+    {samples, pids}
+  end
+
+  @doc """
+  Collects local join latency samples on this node under the current load.
+  Uses unique keys and leaves the member processes alive until the caller kills
+  them, so each sample measures the join call itself.
+  """
+  def local_join_samples(name, sample_count, key_prefix, opts \\ []) do
+    parent = self()
+
+    {samples, pids} =
+      Enum.reduce(1..sample_count, {[], []}, fn i, {samples, pids} ->
+        pid =
+          spawn(fn ->
+            key = "#{key_prefix}#{i}"
+            {us, result} = :timer.tc(fn -> Group.join(name, key, %{sample: i}, opts) end)
+            send(parent, {:sample, self(), us, result})
+            Process.sleep(:infinity)
+          end)
+
+        receive do
+          {:sample, ^pid, us, :ok} -> {[us | samples], [pid | pids]}
+          {:sample, ^pid, _us, other} -> raise "join sample failed: #{inspect(other)}"
+        after
+          30_000 -> raise "Timed out waiting for local_join_samples"
+        end
+      end)
+
+    samples = samples |> Enum.sort()
+
+    {samples, pids}
+  end
+
+  @doc """
+  Collects local named-cluster connect latency samples on this node under the
+  current load. Each sample connects to a fresh cluster name.
+  """
+  def local_connect_samples(name, sample_count, cluster_prefix, opts \\ []) do
+    Enum.map(1..sample_count, fn i ->
+      cluster = "#{cluster_prefix}#{i}"
+
+      {us, result} =
+        :timer.tc(fn ->
+          Group.connect(name, cluster, opts)
+        end)
+
+      case result do
+        :ok -> us
+        other -> raise "connect sample failed: #{inspect(other)}"
+      end
+    end)
+    |> Enum.sort()
+  end
+
+  @doc """
   Connects N named clusters concurrently (one per caller, like real usage).
   """
   def bulk_connect(name, n, prefix) do

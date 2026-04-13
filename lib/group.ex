@@ -235,7 +235,7 @@ defmodule Group do
 
   ## Options
 
-  - `:timeout` - timeout passed to `GenServer.call/3` (default: `60_000`)
+  - `:timeout` - timeout passed to the shard request (default: `60_000`)
   - `:ttl` - for named clusters, keep the local connection leased for this many
     milliseconds. The lease is only created on a new connect; repeated
     `connect/3` calls while already connected stay a cheap noop and do not
@@ -284,7 +284,7 @@ defmodule Group do
 
   ## Options
 
-  - `:timeout` - timeout passed to `GenServer.call/3` (default: `60_000`)
+  - `:timeout` - timeout passed to the shard request (default: `60_000`)
   """
   def disconnect(name, cluster_or_clusters, opts \\ [])
       when is_atom(name) and is_list(opts) do
@@ -388,7 +388,7 @@ defmodule Group do
   ## Options
 
   - `:cluster` - Register in a named cluster instead of the default cluster
-  - `:timeout` - timeout passed to `GenServer.call/3` (default: `5_000`)
+  - `:timeout` - timeout passed to the shard request (default: `5_000`)
 
   ## Returns
 
@@ -404,7 +404,7 @@ defmodule Group do
     validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, key)
 
-    GenServer.call(shard, {:register, cluster, key, self(), meta}, call_timeout(opts))
+    Replica.local_request(shard, {:register, cluster, key, self(), meta}, call_timeout(opts))
   end
 
   @doc """
@@ -422,7 +422,7 @@ defmodule Group do
   ## Options
 
   - `:cluster` - Unregister from a named cluster instead of the default cluster
-  - `:timeout` - timeout passed to `GenServer.call/3` (default: `5_000`)
+  - `:timeout` - timeout passed to the shard request (default: `5_000`)
 
   ## Returns
 
@@ -438,7 +438,7 @@ defmodule Group do
     validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, key)
 
-    GenServer.call(shard, {:unregister, cluster, key}, call_timeout(opts))
+    Replica.local_request(shard, {:unregister, cluster, key}, call_timeout(opts))
   end
 
   @doc """
@@ -573,7 +573,7 @@ defmodule Group do
   ## Options
 
   - `:cluster` - Join a named cluster instead of the default cluster
-  - `:timeout` - timeout passed to `GenServer.call/3` (default: `5_000`)
+  - `:timeout` - timeout passed to the shard request (default: `5_000`)
 
   ## Returns
 
@@ -590,7 +590,7 @@ defmodule Group do
     validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, group)
 
-    GenServer.call(shard, {:join, cluster, group, self(), meta}, call_timeout(opts))
+    Replica.local_request(shard, {:join, cluster, group, self(), meta}, call_timeout(opts))
   end
 
   @doc """
@@ -605,7 +605,7 @@ defmodule Group do
   ## Options
 
   - `:cluster` - Leave from a named cluster instead of the default cluster
-  - `:timeout` - timeout passed to `GenServer.call/3` (default: `5_000`)
+  - `:timeout` - timeout passed to the shard request (default: `5_000`)
 
   ## Returns
 
@@ -621,7 +621,7 @@ defmodule Group do
     validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, group)
 
-    GenServer.call(shard, {:leave, cluster, group, self()}, call_timeout(opts))
+    Replica.local_request(shard, {:leave, cluster, group, self()}, call_timeout(opts))
   end
 
   # ===========================================================================
@@ -1001,7 +1001,7 @@ defmodule Group do
 
     notify_shard = :rand.uniform(get_config(name).num_shards) - 1
 
-    GenServer.call(
+    Replica.local_request(
       Replica.shard_name(name, notify_shard),
       {:cluster_connect, clusters},
       timeout
@@ -1018,7 +1018,7 @@ defmodule Group do
     num_shards = get_config(name).num_shards
 
     for i <- 0..(num_shards - 1) do
-      GenServer.call(
+      Replica.local_request(
         Replica.shard_name(name, i),
         {:cluster_disconnect, clusters},
         timeout
