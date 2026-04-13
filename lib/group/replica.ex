@@ -368,11 +368,11 @@ defmodule Group.Replica do
   reply) rather than `GenServer.call/3`, so the replica can selectively receive
   one local request turn without reaching into `'$gen_call'` internals.
 
-  This is intentionally narrower than EKV's fairness model:
+  The fairness model ensures ordering is preserved where correctness matters:
 
-  - all public local shard calls get protection from replicated PG backlog
-  - earlier cluster/protocol messages still run first,
-    avoiding stale ordering around disconnect, peer discovery, and cluster sync
+  - all public local shard calls get protection from replicated PG backlog, but
+    earlier cluster/protocol messages still run first, avoiding stale ordering around
+    disconnect, peer discovery, and cluster sync
   - FIFO is preserved within the local lane because the selective receive matches
     a single broad `@local_request_tag` shape and therefore takes the oldest
     queued local request in the mailbox
