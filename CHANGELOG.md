@@ -1,3 +1,6 @@
+## 0.1.5 (2026-04-14)
+- Optimize replicated message churn with turn-taking queue
+
 ## 0.1.4 (2026-03-31)
 - Add named-cluster `Group.connect(..., ttl: ms)` leases
 
