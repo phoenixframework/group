@@ -5,13 +5,19 @@ cd "$(dirname "$0")"
 
 COOKIE=bench
 SHARDS=8
+COORDINATOR_EXPR=
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --shards) SHARDS="$2"; shift 2 ;;
+    --coordinator-expr) COORDINATOR_EXPR="$2"; shift 2 ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
+
+if [[ -z "$COORDINATOR_EXPR" ]]; then
+  COORDINATOR_EXPR="GroupBench.Distributed.run(shards: $SHARDS)"
+fi
 
 echo "==> Compiling..."
 mix deps.get --check 2>/dev/null || mix deps.get
@@ -39,4 +45,4 @@ sleep 2
 
 echo "==> Starting coordinator (shards=$SHARDS)..."
 elixir --name coordinator@127.0.0.1 --cookie "$COOKIE" \
-  -S mix run -e "GroupBench.Distributed.run(shards: $SHARDS)"
+  -S mix run -e "$COORDINATOR_EXPR"

@@ -167,9 +167,43 @@ defmodule GroupBench.Replica do
     pids
   end
 
+  @doc """
+  Starts `worker_count` local processes that repeatedly re-register the same key
+  with changing metadata, generating a sustained stream of replicated registry updates.
+  Returns the spammer pids after they complete their initial register.
+  """
+  def start_registry_update_spammers(name, worker_count, key_prefix, opts \\ []) do
+    parent = self()
+
+    pids =
+      Enum.map(1..worker_count, fn i ->
+        spawn(fn ->
+          key = "#{key_prefix}#{i}"
+          :ok = Group.register(name, key, %{seq: 0}, opts)
+          send(parent, {:ready, self()})
+          registry_update_spam_loop(name, key, 1, opts)
+        end)
+      end)
+
+    Enum.each(pids, fn pid ->
+      receive do
+        {:ready, ^pid} -> :ok
+      after
+        30_000 -> raise "Timed out waiting for start_registry_update_spammers"
+      end
+    end)
+
+    pids
+  end
+
   defp pg_update_spam_loop(name, key, seq, opts) do
     :ok = Group.join(name, key, %{seq: seq}, opts)
     pg_update_spam_loop(name, key, seq + 1, opts)
+  end
+
+  defp registry_update_spam_loop(name, key, seq, opts) do
+    :ok = Group.register(name, key, %{seq: seq}, opts)
+    registry_update_spam_loop(name, key, seq + 1, opts)
   end
 
   @doc """
@@ -199,32 +233,57 @@ defmodule GroupBench.Replica do
   end
 
   @doc """
+  Returns the current replicated registry receiver-pressure snapshot for a shard.
+  Works against older code that does not yet expose a registry receiver buffer.
+  """
+  def replicated_registry_pressure(name, shard_index) do
+    shard = Group.Replica.shard_name(name, shard_index)
+    queue_len = shard_message_queue_len(name, shard_index)
+    state = :sys.get_state(shard)
+
+    %{
+      message_queue_len: queue_len,
+      pending_replicated_registry_len: Map.get(state, :pending_replicated_registry_len, 0)
+    }
+  end
+
+  @doc """
   Collects local register latency samples on this node under the current load.
   Uses unique keys and leaves the owner processes alive until the caller kills
-  them, so each sample measures the register call itself.
+  them, so each sample measures the register call itself under concurrent local
+  load.
   """
   def local_register_samples(name, sample_count, key_prefix, opts \\ []) do
     parent = self()
 
-    {samples, pids} =
-      Enum.reduce(1..sample_count, {[], []}, fn i, {samples, pids} ->
-        pid =
-          spawn(fn ->
-            key = "#{key_prefix}#{i}"
-            {us, result} = :timer.tc(fn -> Group.register(name, key, %{sample: i}, opts) end)
-            send(parent, {:sample, self(), us, result})
-            Process.sleep(:infinity)
-          end)
+    pids =
+      Enum.map(1..sample_count, fn i ->
+        spawn(fn ->
+          key = "#{key_prefix}#{i}"
+          {us, result} = :timer.tc(fn -> Group.register(name, key, %{sample: i}, opts) end)
+          send(parent, {:sample, self(), us, result})
+          Process.sleep(:infinity)
+        end)
+      end)
 
+    {samples, completed_pids} =
+      Enum.reduce(1..sample_count, {[], []}, fn _, {samples, completed_pids} ->
         receive do
-          {:sample, ^pid, us, :ok} -> {[us | samples], [pid | pids]}
-          {:sample, ^pid, _us, other} -> raise "register sample failed: #{inspect(other)}"
+          {:sample, pid, us, :ok} -> {[us | samples], [pid | completed_pids]}
+          {:sample, _pid, _us, other} -> raise "register sample failed: #{inspect(other)}"
         after
           30_000 -> raise "Timed out waiting for local_register_samples"
         end
       end)
 
-    samples = samples |> Enum.sort()
+    completed_pids =
+      MapSet.new(completed_pids)
+
+    if Enum.any?(pids, &(not MapSet.member?(completed_pids, &1))) do
+      raise "local_register_samples lost sample pids"
+    end
+
+    samples = Enum.sort(samples)
 
     {samples, pids}
   end
@@ -232,32 +291,60 @@ defmodule GroupBench.Replica do
   @doc """
   Collects local join latency samples on this node under the current load.
   Uses unique keys and leaves the member processes alive until the caller kills
-  them, so each sample measures the join call itself.
+  them, so each sample measures the join call itself under concurrent local
+  load.
   """
   def local_join_samples(name, sample_count, key_prefix, opts \\ []) do
     parent = self()
 
-    {samples, pids} =
-      Enum.reduce(1..sample_count, {[], []}, fn i, {samples, pids} ->
-        pid =
-          spawn(fn ->
-            key = "#{key_prefix}#{i}"
-            {us, result} = :timer.tc(fn -> Group.join(name, key, %{sample: i}, opts) end)
-            send(parent, {:sample, self(), us, result})
-            Process.sleep(:infinity)
-          end)
+    pids =
+      Enum.map(1..sample_count, fn i ->
+        spawn(fn ->
+          key = "#{key_prefix}#{i}"
+          {us, result} = :timer.tc(fn -> Group.join(name, key, %{sample: i}, opts) end)
+          send(parent, {:sample, self(), us, result})
+          Process.sleep(:infinity)
+        end)
+      end)
 
+    {samples, completed_pids} =
+      Enum.reduce(1..sample_count, {[], []}, fn _, {samples, completed_pids} ->
         receive do
-          {:sample, ^pid, us, :ok} -> {[us | samples], [pid | pids]}
-          {:sample, ^pid, _us, other} -> raise "join sample failed: #{inspect(other)}"
+          {:sample, pid, us, :ok} -> {[us | samples], [pid | completed_pids]}
+          {:sample, _pid, _us, other} -> raise "join sample failed: #{inspect(other)}"
         after
           30_000 -> raise "Timed out waiting for local_join_samples"
         end
       end)
 
-    samples = samples |> Enum.sort()
+    completed_pids =
+      MapSet.new(completed_pids)
+
+    if Enum.any?(pids, &(not MapSet.member?(completed_pids, &1))) do
+      raise "local_join_samples lost sample pids"
+    end
+
+    samples = Enum.sort(samples)
 
     {samples, pids}
+  end
+
+  @doc """
+  Runs a fixed-inflight local register load test under the current receiver load.
+  Each attempted operation uses a unique key and a fresh owner process so the
+  benchmark exercises the one-shot public API path without interleaving cleanup.
+  """
+  def local_register_load(name, total_ops, max_inflight, key_prefix, opts \\ []) do
+    run_local_load(:register, name, total_ops, max_inflight, key_prefix, opts)
+  end
+
+  @doc """
+  Runs a fixed-inflight local join load test under the current receiver load.
+  Each attempted operation uses a unique key and a fresh member process so the
+  benchmark exercises the one-shot public API path without interleaving cleanup.
+  """
+  def local_join_load(name, total_ops, max_inflight, key_prefix, opts \\ []) do
+    run_local_load(:join, name, total_ops, max_inflight, key_prefix, opts)
   end
 
   @doc """
@@ -279,6 +366,163 @@ defmodule GroupBench.Replica do
       end
     end)
     |> Enum.sort()
+  end
+
+  defp run_local_load(kind, name, total_ops, max_inflight, key_prefix, opts)
+       when total_ops > 0 and max_inflight > 0 do
+    parent = self()
+    initial_inflight = min(total_ops, max_inflight)
+
+    next_index =
+      Enum.reduce(1..initial_inflight, 1, fn index, _next_index ->
+        spawn_local_load_sample(kind, parent, name, key_prefix, index, opts)
+        index + 1
+      end)
+
+    started_at = System.monotonic_time(:microsecond)
+
+    collect_local_load_results(
+      kind,
+      name,
+      total_ops,
+      max_inflight,
+      key_prefix,
+      opts,
+      %{
+        completed_ops: 0,
+        inflight: initial_inflight,
+        next_index: next_index,
+        successful_ops: 0,
+        timeout_count: 0,
+        error_count: 0,
+        samples: [],
+        pids: []
+      },
+      started_at
+    )
+  end
+
+  defp collect_local_load_results(
+         _kind,
+         _name,
+         total_ops,
+         _max_inflight,
+         _key_prefix,
+         _opts,
+         %{completed_ops: total_ops, inflight: 0} = acc,
+         started_at
+       ) do
+    wall_us = System.monotonic_time(:microsecond) - started_at
+
+    %{
+      wall_us: wall_us,
+      successful_ops: acc.successful_ops,
+      timeout_count: acc.timeout_count,
+      error_count: acc.error_count,
+      samples: Enum.sort(acc.samples),
+      pids: Enum.reverse(acc.pids)
+    }
+  end
+
+  defp collect_local_load_results(
+         kind,
+         name,
+         total_ops,
+         max_inflight,
+         key_prefix,
+         opts,
+         acc,
+         started_at
+       ) do
+    receive do
+      {:local_load_sample, pid, us, outcome} ->
+        acc =
+          case outcome do
+            :ok ->
+              %{
+                acc
+                | completed_ops: acc.completed_ops + 1,
+                  successful_ops: acc.successful_ops + 1,
+                  samples: [us | acc.samples],
+                  pids: [pid | acc.pids]
+              }
+
+            {:exit, {:timeout, _genserver_call}} ->
+              %{
+                acc
+                | completed_ops: acc.completed_ops + 1,
+                  timeout_count: acc.timeout_count + 1
+              }
+
+            {:error, _reason} ->
+              %{
+                acc
+                | completed_ops: acc.completed_ops + 1,
+                  error_count: acc.error_count + 1
+              }
+
+            {:exit, _reason} ->
+              %{
+                acc
+                | completed_ops: acc.completed_ops + 1,
+                  error_count: acc.error_count + 1
+              }
+          end
+
+        acc =
+          if acc.next_index <= total_ops do
+            spawn_local_load_sample(kind, self(), name, key_prefix, acc.next_index, opts)
+            %{acc | next_index: acc.next_index + 1}
+          else
+            %{acc | inflight: acc.inflight - 1}
+          end
+
+        collect_local_load_results(
+          kind,
+          name,
+          total_ops,
+          max_inflight,
+          key_prefix,
+          opts,
+          acc,
+          started_at
+        )
+    after
+      60_000 ->
+        raise "Timed out waiting for #{kind} load samples"
+    end
+  end
+
+  defp spawn_local_load_sample(kind, parent, name, key_prefix, index, opts) do
+    spawn(fn ->
+      key = "#{key_prefix}#{index}"
+
+      {us, outcome} =
+        :timer.tc(fn ->
+          try do
+            case kind do
+              :register -> Group.register(name, key, %{sample: index}, opts)
+              :join -> Group.join(name, key, %{sample: index}, opts)
+            end
+          catch
+            :exit, reason -> {:exit, reason}
+          end
+        end)
+
+      outcome =
+        case outcome do
+          :ok -> :ok
+          {:error, reason} -> {:error, reason}
+          {:exit, reason} -> {:exit, reason}
+          other -> {:error, other}
+        end
+
+      send(parent, {:local_load_sample, self(), us, outcome})
+
+      if outcome == :ok do
+        Process.sleep(:infinity)
+      end
+    end)
   end
 
   @doc """

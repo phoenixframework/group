@@ -85,13 +85,48 @@ defmodule GroupBench.Helpers do
   end
 
   @doc """
+  Reports wall-clock throughput, successful-call latency stats, and timeout/error counts.
+  """
+  def report_load_profile(label, successful_ops, wall_us, sorted_us, timeout_count, error_count) do
+    attempted_ops = successful_ops + timeout_count + error_count
+    ops_sec = if wall_us > 0, do: round(successful_ops * 1_000_000 / wall_us), else: 0
+
+    IO.puts("  #{label}")
+
+    IO.puts(
+      "    total:     #{format_number(successful_ops)} successful / #{format_number(attempted_ops)} attempted in #{format_number(div(wall_us, 1000))} ms"
+    )
+
+    IO.puts("    ops/sec:   #{format_number(ops_sec)}")
+
+    case sorted_us do
+      [] ->
+        IO.puts("    p50:       n/a")
+        IO.puts("    p99:       n/a")
+        IO.puts("    max:       n/a")
+
+      _ ->
+        IO.puts("    p50:       #{percentile(sorted_us, 50)} µs")
+        IO.puts("    p99:       #{percentile(sorted_us, 99)} µs")
+        IO.puts("    max:       #{percentile(sorted_us, 100)} µs")
+    end
+
+    IO.puts("    timeouts:  #{format_number(timeout_count)}")
+    IO.puts("    errors:    #{format_number(error_count)}")
+  end
+
+  @doc """
   Reports throughput from total wall-clock time and operation count.
   """
   def report_throughput(label, count, wall_us) do
     ops_sec = if wall_us > 0, do: round(count * 1_000_000 / wall_us), else: 0
 
     IO.puts("  #{label}")
-    IO.puts("    total:    #{format_number(count)} ops in #{format_number(div(wall_us, 1000))} ms")
+
+    IO.puts(
+      "    total:    #{format_number(count)} ops in #{format_number(div(wall_us, 1000))} ms"
+    )
+
     IO.puts("    ops/sec:  #{format_number(ops_sec)}")
   end
 

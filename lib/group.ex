@@ -209,6 +209,13 @@ defmodule Group do
     per shard before the receiver flushes immediately (default: `64`)
   - `:replicated_pg_receiver_flush_interval` — max time in milliseconds a shard will
     buffer replicated PG join/leave ops before flushing (default: `5`)
+  - `:replicated_registry_receiver_buffer_size` — max buffered replicated registry
+    register/unregister ops per shard before the receiver flushes immediately
+    (default: `64`)
+  - `:replicated_registry_receiver_flush_interval` — max time in milliseconds a shard
+    will buffer replicated register/unregister ops before flushing (default: `5`)
+  - `:replicated_pg_receiver_local_request_quota` — max queued local PG shard requests
+    drained after each replicated PG flush before yielding (default: `8`)
   """
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)

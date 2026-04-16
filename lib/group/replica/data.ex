@@ -163,11 +163,58 @@ defmodule Group.Replica.Data do
     :ok
   end
 
+  def registry_insert_many(_name, _shard, []), do: :ok
+
+  def registry_insert_many(name, shard, entries) do
+    table = reg_by_key_table(name, shard)
+    table_pid = reg_by_pid_table(name, shard)
+
+    :ets.insert(
+      table,
+      Enum.map(entries, fn {cluster, key, pid, meta, time, node} ->
+        {{cluster, key}, pid, meta, time, node}
+      end)
+    )
+
+    :ets.insert(
+      table_pid,
+      Enum.map(entries, fn {cluster, key, pid, meta, time, node} ->
+        {{pid, cluster, key}, meta, time, node}
+      end)
+    )
+
+    :ok
+  end
+
   def registry_delete(name, shard, cluster, key, pid) do
     table = reg_by_key_table(name, shard)
     :ets.delete(table, {cluster, key})
     table_pid = reg_by_pid_table(name, shard)
     :ets.delete(table_pid, {pid, cluster, key})
+    :ok
+  end
+
+  def registry_delete_many(_name, _shard, []), do: :ok
+
+  def registry_delete_many(name, shard, entries) do
+    entries = Enum.uniq(entries)
+    table = reg_by_key_table(name, shard)
+    table_pid = reg_by_pid_table(name, shard)
+
+    :ets.select_delete(
+      table,
+      Enum.map(entries, fn {cluster, key, _pid} ->
+        {{{cluster, key}, :_, :_, :_, :_}, [], [true]}
+      end)
+    )
+
+    :ets.select_delete(
+      table_pid,
+      Enum.map(entries, fn {cluster, key, pid} ->
+        {{{pid, cluster, key}, :_, :_, :_}, [], [true]}
+      end)
+    )
+
     :ok
   end
 

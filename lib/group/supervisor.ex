@@ -22,13 +22,25 @@ defmodule Group.Supervisor do
     replicated_pg_receiver_flush_interval =
       non_negative_integer_opt(opts, :replicated_pg_receiver_flush_interval, 5)
 
+    replicated_registry_receiver_buffer_size =
+      positive_integer_opt(opts, :replicated_registry_receiver_buffer_size, 64)
+
+    replicated_registry_receiver_flush_interval =
+      non_negative_integer_opt(opts, :replicated_registry_receiver_flush_interval, 5)
+
+    replicated_pg_receiver_local_request_quota =
+      positive_integer_opt(opts, :replicated_pg_receiver_local_request_quota, 8)
+
     # persistent_term config — must be set before children start (Replica reads it)
     config = %{
       callbacks: callbacks,
       num_shards: num_shards,
       log: log,
       replicated_pg_receiver_buffer_size: replicated_pg_receiver_buffer_size,
-      replicated_pg_receiver_flush_interval: replicated_pg_receiver_flush_interval
+      replicated_pg_receiver_flush_interval: replicated_pg_receiver_flush_interval,
+      replicated_registry_receiver_buffer_size: replicated_registry_receiver_buffer_size,
+      replicated_registry_receiver_flush_interval: replicated_registry_receiver_flush_interval,
+      replicated_pg_receiver_local_request_quota: replicated_pg_receiver_local_request_quota
     }
 
     config = if extract_meta, do: Map.put(config, :extract_meta, extract_meta), else: config

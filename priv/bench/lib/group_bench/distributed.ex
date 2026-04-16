@@ -37,6 +37,21 @@ defmodule GroupBench.Distributed do
     IO.puts("\n  Done.\n")
   end
 
+  def run_registry_pressure_only(opts \\ []) do
+    shards = Keyword.get(opts, :shards, 1)
+    Process.put(:bench_shards, shards)
+
+    header("Distributed Registry Pressure Benchmark")
+    IO.puts("  coordinator: #{node()}")
+    IO.puts("  shards:      #{shards}")
+    IO.puts("  schedulers:  #{System.schedulers_online()}")
+
+    connect_replicas()
+    bench_local_requests_under_replicated_registry_pressure(@replicas)
+
+    IO.puts("\n  Done.\n")
+  end
+
   # ── Connection ────────────────────────────────────────────────────────
 
   defp connect_replicas do
@@ -417,12 +432,24 @@ defmodule GroupBench.Distributed do
       :timer.tc(fn ->
         t1 =
           Task.async(fn ->
-            :erpc.call(r1, GroupBench.Replica, :bulk_connect, [@name, num_clusters, prefix], 120_000)
+            :erpc.call(
+              r1,
+              GroupBench.Replica,
+              :bulk_connect,
+              [@name, num_clusters, prefix],
+              120_000
+            )
           end)
 
         t2 =
           Task.async(fn ->
-            :erpc.call(r2, GroupBench.Replica, :bulk_connect, [@name, num_clusters, prefix], 120_000)
+            :erpc.call(
+              r2,
+              GroupBench.Replica,
+              :bulk_connect,
+              [@name, num_clusters, prefix],
+              120_000
+            )
           end)
 
         Task.await_many([t1, t2], 120_000)
@@ -500,7 +527,13 @@ defmodule GroupBench.Distributed do
 
     {disconnect_us, _} =
       :timer.tc(fn ->
-        :erpc.call(r1, GroupBench.Replica, :bulk_disconnect, [@name, num_clusters, prefix], 120_000)
+        :erpc.call(
+          r1,
+          GroupBench.Replica,
+          :bulk_disconnect,
+          [@name, num_clusters, prefix],
+          120_000
+        )
 
         # Wait for r2 to see r1's entries cleaned from all clusters
         poll_until(
@@ -512,7 +545,10 @@ defmodule GroupBench.Distributed do
       end)
 
     IO.puts("  disconnect+cleanup: #{format_number(div(disconnect_us, 1000))} ms")
-    IO.puts("  clusters/sec:       #{format_number(round(num_clusters * 1_000_000 / disconnect_us))}")
+
+    IO.puts(
+      "  clusters/sec:       #{format_number(round(num_clusters * 1_000_000 / disconnect_us))}"
+    )
 
     # Kill leftover processes
     :erpc.call(r1, GroupBench.Replica, :kill_processes, [pids])
@@ -533,14 +569,21 @@ defmodule GroupBench.Distributed do
     dispatches_per_round = 10
 
     total_users = num_clusters * workers_per_node * 2 * users_per_worker
-    total_rooms = num_clusters * workers_per_node * 2 * rooms_per_worker * div(users_per_worker, rooms_per_worker)
+
+    total_rooms =
+      num_clusters * workers_per_node * 2 * rooms_per_worker *
+        div(users_per_worker, rooms_per_worker)
 
     IO.puts("  clusters:      #{num_clusters}")
     IO.puts("  workers/node:  #{workers_per_node}")
     IO.puts("  users/worker:  #{users_per_worker}")
     IO.puts("  rooms/worker:  #{rooms_per_worker}")
     IO.puts("  churn rounds:  #{churn_rounds}")
-    IO.puts("  initial pids:  #{format_number(total_users + total_rooms)} (#{format_number(total_users)} reg + #{format_number(total_rooms)} pg)")
+
+    IO.puts(
+      "  initial pids:  #{format_number(total_users + total_rooms)} (#{format_number(total_users)} reg + #{format_number(total_rooms)} pg)"
+    )
+
     IO.puts("")
 
     start_group_on(r1)
@@ -597,7 +640,8 @@ defmodule GroupBench.Distributed do
     total_ops =
       num_clusters * workers_per_node * 2 *
         (users_per_worker + div(users_per_worker, rooms_per_worker) * rooms_per_worker +
-           churn_rounds * (lookups_per_round + dispatches_per_round + div(users_per_worker, 4) * 2))
+           churn_rounds *
+             (lookups_per_round + dispatches_per_round + div(users_per_worker, 4) * 2))
 
     wall_ms = div(wall_us, 1000)
     ops_sec = if wall_us > 0, do: round(total_ops * 1_000_000 / wall_us), else: 0
@@ -632,7 +676,10 @@ defmodule GroupBench.Distributed do
     IO.puts("  registry r2:   #{format_number(final_r2)}")
     IO.puts("  pg r1:         #{format_number(pg_r1)}")
     IO.puts("  pg r2:         #{format_number(pg_r2)}")
-    IO.puts("  match:         #{if final_r1 == final_r2 and pg_r1 == pg_r2, do: "YES", else: "NO"}")
+
+    IO.puts(
+      "  match:         #{if final_r1 == final_r2 and pg_r1 == pg_r2, do: "YES", else: "NO"}"
+    )
 
     # Cleanup
     for node <- replicas do
@@ -643,21 +690,25 @@ defmodule GroupBench.Distributed do
     stop_groups(replicas)
   end
 
-  # ── 10. Local request latency under replicated PG pressure ──────────
+  # ── 10. Local register/join throughput under replicated PG pressure ─
 
   defp bench_local_requests_under_replicated_pg_pressure([r1, r2] = replicas) do
-    header("10. Local Request Latency Under Replicated PG Pressure")
+    header("10. Local Register/Join Throughput Under Replicated PG Pressure")
 
-    sample_count = 250
+    total_ops = 1_000
+    inflight_levels = [1, 4, 8, 16, 32]
     spam_workers = 32
     hot_shard = 0
+    request_timeout = 5_000
 
     IO.puts("  setup:       1 shard, #{spam_workers} remote PG update spammers")
-    IO.puts("  samples/op:  #{sample_count}")
+    IO.puts("  total ops:   #{total_ops} per inflight level")
+    IO.puts("  inflight:    #{inspect(inflight_levels)}")
     IO.puts("  hot shard:   #{hot_shard}")
+    IO.puts("  timeout:     #{request_timeout} ms")
 
-    start_group_on(r1, shards: 1)
-    start_group_on(r2, shards: 1)
+    start_group_on(r1, shards: 1, replicated_pg_receiver_local_request_quota: 8)
+    start_group_on(r2, shards: 1, replicated_pg_receiver_local_request_quota: 8)
     wait_for_peer_discovery(replicas)
 
     spammers =
@@ -680,59 +731,200 @@ defmodule GroupBench.Distributed do
     )
 
     try do
-      {register_samples, register_pids} =
-        :erpc.call(
+      registry_baseline = :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name])
+      pg_baseline = :erpc.call(r2, GroupBench.Replica, :total_pg_count, [@name])
+
+      register_results =
+        bench_local_load_sweep(
           r2,
-          GroupBench.Replica,
-          :local_register_samples,
-          [@name, sample_count, "pressure/register/"],
-          60_000
+          :local_register_load,
+          "local Group.register/4 on receiver",
+          total_ops,
+          inflight_levels,
+          "pressure/register/",
+          [timeout: request_timeout],
+          fn ->
+            poll_until(
+              fn ->
+                :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) ==
+                  registry_baseline
+              end,
+              30_000
+            )
+          end
         )
 
-      try do
-        report_latency("local Group.register/4 on receiver", register_samples)
-      after
-        :erpc.call(r2, GroupBench.Replica, :kill_processes, [register_pids], 60_000)
-      end
+      report_best_no_timeout_result("register", register_results)
 
-      {join_samples, join_pids} =
-        :erpc.call(
+      join_results =
+        bench_local_load_sweep(
           r2,
-          GroupBench.Replica,
-          :local_join_samples,
-          [@name, sample_count, "pressure/join/"],
-          60_000
+          :local_join_load,
+          "local Group.join/4 on receiver",
+          total_ops,
+          inflight_levels,
+          "pressure/join/",
+          [timeout: request_timeout],
+          fn ->
+            poll_until(
+              fn ->
+                :erpc.call(r2, GroupBench.Replica, :total_pg_count, [@name]) == pg_baseline
+              end,
+              30_000
+            )
+          end
         )
 
-      try do
-        report_latency("local Group.join/4 on receiver", join_samples)
-      after
-        :erpc.call(r2, GroupBench.Replica, :kill_processes, [join_pids], 60_000)
-      end
-
-      connect_prefix = "pressure/connect/"
-
-      :erpc.call(
-        r1,
-        GroupBench.Replica,
-        :bulk_connect,
-        [@name, sample_count, connect_prefix],
-        120_000
-      )
-
-      connect_samples =
-        :erpc.call(
-          r2,
-          GroupBench.Replica,
-          :local_connect_samples,
-          [@name, sample_count, connect_prefix],
-          120_000
-        )
-
-      report_latency("local Group.connect/3 on receiver", connect_samples)
+      report_best_no_timeout_result("join", join_results)
     after
       :erpc.call(r1, GroupBench.Replica, :kill_processes, [spammers], 60_000)
       stop_groups(replicas)
+    end
+  end
+
+  defp bench_local_requests_under_replicated_registry_pressure([r1, r2] = replicas) do
+    header("Local Register/Join Throughput Under Replicated Registry Pressure")
+
+    total_ops = 1_000
+    inflight_levels = [1, 4, 8, 16, 32]
+    spam_workers = 32
+    hot_shard = 0
+    request_timeout = 5_000
+
+    IO.puts("  setup:       1 shard, #{spam_workers} remote registry update spammers")
+    IO.puts("  total ops:   #{total_ops} per inflight level")
+    IO.puts("  inflight:    #{inspect(inflight_levels)}")
+    IO.puts("  hot shard:   #{hot_shard}")
+    IO.puts("  timeout:     #{request_timeout} ms")
+
+    start_group_on(r1, shards: 1, replicated_pg_receiver_local_request_quota: 8)
+    start_group_on(r2, shards: 1, replicated_pg_receiver_local_request_quota: 8)
+    wait_for_peer_discovery(replicas)
+
+    spammers =
+      :erpc.call(
+        r1,
+        GroupBench.Replica,
+        :start_registry_update_spammers,
+        [@name, spam_workers, "pressure/registry-spam/"],
+        60_000
+      )
+
+    poll_until(
+      fn ->
+        case :erpc.call(r2, GroupBench.Replica, :replicated_registry_pressure, [@name, hot_shard]) do
+          %{message_queue_len: queue_len, pending_replicated_registry_len: pending_len} ->
+            queue_len > 0 or pending_len > 0
+        end
+      end,
+      10_000
+    )
+
+    try do
+      registry_baseline = :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name])
+      pg_baseline = :erpc.call(r2, GroupBench.Replica, :total_pg_count, [@name])
+
+      register_results =
+        bench_local_load_sweep(
+          r2,
+          :local_register_load,
+          "local Group.register/4 on receiver",
+          total_ops,
+          inflight_levels,
+          "pressure/registry-register/",
+          [timeout: request_timeout],
+          fn ->
+            poll_until(
+              fn ->
+                :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) ==
+                  registry_baseline
+              end,
+              30_000
+            )
+          end
+        )
+
+      report_best_no_timeout_result("register", register_results)
+
+      join_results =
+        bench_local_load_sweep(
+          r2,
+          :local_join_load,
+          "local Group.join/4 on receiver",
+          total_ops,
+          inflight_levels,
+          "pressure/registry-join/",
+          [timeout: request_timeout],
+          fn ->
+            poll_until(
+              fn ->
+                :erpc.call(r2, GroupBench.Replica, :total_pg_count, [@name]) == pg_baseline
+              end,
+              30_000
+            )
+          end
+        )
+
+      report_best_no_timeout_result("join", join_results)
+    after
+      :erpc.call(r1, GroupBench.Replica, :kill_processes, [spammers], 60_000)
+      stop_groups(replicas)
+    end
+  end
+
+  defp bench_local_load_sweep(
+         node,
+         replica_fun,
+         label,
+         total_ops,
+         inflight_levels,
+         key_prefix,
+         request_opts,
+         wait_for_cleanup
+       ) do
+    for inflight <- inflight_levels do
+      result =
+        :erpc.call(
+          node,
+          GroupBench.Replica,
+          replica_fun,
+          [@name, total_ops, inflight, "#{key_prefix}#{inflight}/", request_opts],
+          120_000
+        )
+
+      report_load_profile(
+        "#{label} (inflight=#{inflight})",
+        result.successful_ops,
+        result.wall_us,
+        result.samples,
+        result.timeout_count,
+        result.error_count
+      )
+
+      :erpc.call(node, GroupBench.Replica, :kill_processes, [result.pids], 60_000)
+      wait_for_cleanup.()
+
+      {inflight, result}
+    end
+  end
+
+  defp report_best_no_timeout_result(op_name, results) do
+    case Enum.filter(results, fn {_inflight, result} ->
+           result.timeout_count == 0 and result.error_count == 0
+         end)
+         |> Enum.max_by(
+           fn {_inflight, result} -> result.successful_ops / max(result.wall_us, 1) end,
+           fn -> nil end
+         ) do
+      nil ->
+        IO.puts("  best no-timeout #{op_name}: none")
+
+      {inflight, result} ->
+        ops_sec = round(result.successful_ops * 1_000_000 / max(result.wall_us, 1))
+
+        IO.puts(
+          "  best no-timeout #{op_name}: inflight=#{inflight}, #{format_number(ops_sec)} ops/sec"
+        )
     end
   end
 end
