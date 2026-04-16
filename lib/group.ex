@@ -214,6 +214,12 @@ defmodule Group do
     (default: `64`)
   - `:replicated_registry_receiver_flush_interval` — max time in milliseconds a shard
     will buffer replicated register/unregister ops before flushing (default: `5`)
+  - `:replicated_sender_buffer_size` — max buffered replicated outbound ops per shard
+    before the sender flushes immediately (default: `64`)
+  - `:replicated_sender_flush_interval` — max time in milliseconds a shard will
+    buffer replicated outbound ops before flushing during idle periods. Sender
+    buffers also flush on size, overdue enqueue, and control/routing barriers
+    (default: `5`)
   - `:replicated_pg_receiver_local_request_quota` — max queued local PG shard requests
     drained after each replicated PG flush before yielding (default: `8`)
   """

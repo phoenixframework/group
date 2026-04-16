@@ -394,6 +394,52 @@ defmodule Group.TestCluster do
     end)
   end
 
+  @doc "Returns the current message_queue_len for a shard on a remote node."
+  def shard_message_queue_len(node, name, shard) do
+    :erpc.call(node, __MODULE__, :do_shard_message_queue_len, [name, shard])
+  end
+
+  @doc false
+  def do_shard_message_queue_len(name, shard) do
+    shard_name = :"#{name}_replica_#{shard}"
+
+    case Process.info(Process.whereis(shard_name), :message_queue_len) do
+      {:message_queue_len, len} -> len
+      nil -> 0
+    end
+  end
+
+  @doc "Returns the current mailbox messages for a shard on a remote node."
+  def shard_messages(node, name, shard) do
+    :erpc.call(node, __MODULE__, :do_shard_messages, [name, shard])
+  end
+
+  @doc false
+  def do_shard_messages(name, shard) do
+    shard_name = :"#{name}_replica_#{shard}"
+
+    case Process.info(Process.whereis(shard_name), :messages) do
+      {:messages, messages} -> messages
+      nil -> []
+    end
+  end
+
+  @doc "Resumes a suspended shard on a remote node if it is still alive."
+  def resume_shard_if_alive(node, name, shard) do
+    :erpc.call(node, __MODULE__, :do_resume_shard_if_alive, [name, shard])
+  end
+
+  @doc false
+  def do_resume_shard_if_alive(name, shard) do
+    shard_name = :"#{name}_replica_#{shard}"
+
+    if Process.whereis(shard_name) do
+      :sys.resume(shard_name)
+    else
+      :ok
+    end
+  end
+
   @doc "Expires a named-cluster ttl lease on a remote node and forces an immediate sweep."
   def expire_cluster_lease_and_force_sweep(node, name, cluster) do
     :erpc.call(node, __MODULE__, :do_expire_cluster_lease_and_force_sweep, [name, cluster])

@@ -28,6 +28,12 @@ defmodule Group.Supervisor do
     replicated_registry_receiver_flush_interval =
       non_negative_integer_opt(opts, :replicated_registry_receiver_flush_interval, 5)
 
+    replicated_sender_buffer_size =
+      positive_integer_opt(opts, :replicated_sender_buffer_size, 64)
+
+    replicated_sender_flush_interval =
+      non_negative_integer_opt(opts, :replicated_sender_flush_interval, 5)
+
     replicated_pg_receiver_local_request_quota =
       positive_integer_opt(opts, :replicated_pg_receiver_local_request_quota, 8)
 
@@ -40,6 +46,8 @@ defmodule Group.Supervisor do
       replicated_pg_receiver_flush_interval: replicated_pg_receiver_flush_interval,
       replicated_registry_receiver_buffer_size: replicated_registry_receiver_buffer_size,
       replicated_registry_receiver_flush_interval: replicated_registry_receiver_flush_interval,
+      replicated_sender_buffer_size: replicated_sender_buffer_size,
+      replicated_sender_flush_interval: replicated_sender_flush_interval,
       replicated_pg_receiver_local_request_quota: replicated_pg_receiver_local_request_quota
     }
 

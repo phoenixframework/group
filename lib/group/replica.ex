@@ -6,6 +6,8 @@ defmodule Group.Replica do
   @process_down_batch_size 32
   @replicated_pg_receiver_flush_timer :flush_replicated_pg_receiver_buffer
   @replicated_registry_receiver_flush_timer :flush_replicated_registry_receiver_buffer
+  @replicated_pg_broadcast_flush_timer :flush_replicated_pg_broadcast_buffer
+  @replicated_registry_broadcast_flush_timer :flush_replicated_registry_broadcast_buffer
   @local_request_tag :group_local_request
   @local_reply_tag :group_local_reply
 
@@ -25,6 +27,8 @@ defmodule Group.Replica do
   | `{:replicate_unregister, cluster, key, pid, meta, reason}` | broadcast      | Propagate unregistration         |
   | `{:replicate_join, cluster, key, pid, meta, time, reason}` | broadcast      | Propagate join                   |
   | `{:replicate_leave, cluster, key, pid, meta, reason}`      | broadcast      | Propagate leave                  |
+  | `{:replicate_registry_batch, ops}`                         | broadcast      | Propagate batched registry ops   |
+  | `{:replicate_pg_batch, ops}`                               | broadcast      | Propagate batched PG ops         |
   | `{:cluster_connect, clusters, pid}`                        | S→remote S     | Node joining named clusters      |
   | `{:cluster_connect_ack, clusters, pid, cluster_data}`      | S→remote S     | Ack + bundled shard data         |
   | `{:cluster_disconnect, clusters, pid}`                     | shard 0→remote | Node leaving named clusters      |
@@ -70,9 +74,12 @@ defmodule Group.Replica do
 
   ### 2. Steady-State Replication
 
-  After peer discovery, all writes broadcast to cluster members. The nil cluster
-  uses `remote_shards` (per-shard map); named clusters use `cluster_nodes` ETS.
-  Reads (`lookup`, `members`) go directly to ETS — no GenServer involved.
+  After peer discovery, local writes enqueue outbound registry or PG replication
+  in separate sender buffers. Flushes group those ops by target node and send
+  one `{:replicate_registry_batch, ops}` or `{:replicate_pg_batch, ops}` per
+  remote node. The nil cluster uses `remote_shards` (per-shard map); named
+  clusters use `cluster_nodes` ETS. Reads (`lookup`, `members`) go directly to
+  ETS — no GenServer involved.
 
       Node A shard i                          Node B shard i
       ────────────                            ────────────
@@ -80,10 +87,13 @@ defmodule Group.Replica do
       Group.register(name, key, meta)              │
            │── ETS insert (by_key + by_pid)        │
            │── monitor pid                         │
+           │── enqueue sender-side registry op     │
            │                                       │
-           │  {:replicate_register, C, key, pid, meta, time, reason}
+           │  {:replicate_registry_batch, [ ... ]}
            │──────────────────────────────────────>│
-           │                                       │── lookup existing
+           │                                       │── enqueue receiver-side
+           │                                       │   registry ops
+           │                                       │── flush in FIFO order
            │                                       │   ├─ nil: insert
            │                                       │   ├─ same pid: update
            │                                       │   ├─ local conflict:
@@ -93,11 +103,15 @@ defmodule Group.Replica do
            │                                       │
       Group.join(name, group, meta)                │
            │── ETS insert (by_key + by_pid)        │
+           │── enqueue sender-side PG op           │
            │                                       │
-           │  {:replicate_join, C, key, pid, meta, time, reason}
+           │  {:replicate_pg_batch, [ ... ]}
            │──────────────────────────────────────>│
-           │                                       │── insert (no overwrite
-           │                                       │   conflict for PG)
+           │                                       │── enqueue receiver-side PG
+           │                                       │   ops
+           │                                       │── flush in FIFO order
+           │                                       │   (no overwrite conflict
+           │                                       │    for PG)
            │                                       │
       Group.dispatch(name, group, msg)               │
            │── send directly to local pids           │
@@ -324,12 +338,13 @@ defmodule Group.Replica do
   to `Group.monitor/3` subscribers in a batched diff of `{:group, events, info}` tuples.
   Each GenServer handler invocation is a natural batch boundary:
 
-  - **Single operations** (register, join, leave, unregister, replicate_register,
-    replicate_unregister): build one event, deliver one tuple with one event per
-    matching subscriber.
-  - **Buffered replicated PG operations** (`replicate_join`, `replicate_leave`):
-    receiver shards may accumulate several ops before flushing, then deliver one
-    tuple per subscriber containing the ordered events from that flush.
+  - **Single local operations** (register, join, leave, unregister): build one
+    event, deliver one tuple with one event per matching subscriber.
+  - **Buffered replicated operations** (`replicate_register`,
+    `replicate_unregister`, `replicate_join`, `replicate_leave`, and their
+    batched sender-side wire forms): receiver shards may accumulate several ops
+    before flushing, then deliver one tuple per subscriber containing the
+    ordered events from that flush.
   - **Bulk operations** (nodedown, process DOWN, cluster_disconnect, cluster_state
     merge): accumulate events into a local variable, then deliver one tuple per
     subscriber containing all matching events from that handler turn.
@@ -348,6 +363,27 @@ defmodule Group.Replica do
   partition heal, `Group.connect`) produce batched diffs with all new entries.
   `build_purged_events/5` takes an events accumulator and prepends purged-entry
   events to it.
+
+  ## Replicated Sender Buffering
+
+  Local writes stage outbound replicated registry and PG operations in separate
+  sender buffers. On flush, those ops are grouped by target node so one shard
+  send can carry many logical replication updates.
+
+  Sender-side buffering is not timer-only. A sender buffer flushes when:
+
+  - the lane reaches `replicated_sender_buffer_size`
+  - a new enqueue notices the lane is already older than
+    `replicated_sender_flush_interval`
+  - a control or topology path crosses the sender barrier (`cluster_connect`,
+    `cluster_disconnect`, peer protocol, `cluster_state`, `DOWN`, `nodedown`,
+    process-down cleanup, explicit mailbox barriers)
+  - terminate runs
+
+  The timer is therefore a fallback for idle periods, not the only flush
+  trigger. A very long single GenServer callback can still delay all of these
+  flush paths until that callback returns; batching and fairness only apply
+  between mailbox turns.
 
   ## Replicated Receiver Fairness
 
@@ -401,15 +437,25 @@ defmodule Group.Replica do
     :replicated_pg_receiver_flush_interval,
     :replicated_registry_receiver_buffer_size,
     :replicated_registry_receiver_flush_interval,
+    :replicated_sender_buffer_size,
+    :replicated_sender_flush_interval,
     :replicated_pg_receiver_local_request_quota,
     :pending_replicated_pg_started_at,
     :pending_replicated_pg_flush_ref,
     :pending_replicated_registry_started_at,
     :pending_replicated_registry_flush_ref,
+    :pending_replicated_pg_broadcast_started_at,
+    :pending_replicated_pg_broadcast_flush_ref,
+    :pending_replicated_registry_broadcast_started_at,
+    :pending_replicated_registry_broadcast_flush_ref,
     pending_replicated_pg_len: 0,
     pending_replicated_pg_ops: [],
     pending_replicated_registry_len: 0,
     pending_replicated_registry_ops: [],
+    pending_replicated_pg_broadcast_len: 0,
+    pending_replicated_pg_broadcast_ops: [],
+    pending_replicated_registry_broadcast_len: 0,
+    pending_replicated_registry_broadcast_ops: [],
     remote_shards: %{},
     monitors: %{}
   ]
@@ -471,6 +517,8 @@ defmodule Group.Replica do
       replicated_registry_receiver_buffer_size: config.replicated_registry_receiver_buffer_size,
       replicated_registry_receiver_flush_interval:
         config.replicated_registry_receiver_flush_interval,
+      replicated_sender_buffer_size: config.replicated_sender_buffer_size,
+      replicated_sender_flush_interval: config.replicated_sender_flush_interval,
       replicated_pg_receiver_local_request_quota:
         config.replicated_pg_receiver_local_request_quota
     }
@@ -495,7 +543,7 @@ defmodule Group.Replica do
 
   @impl true
   def terminate(_reason, state) do
-    _state = flush_pending_replicated_barrier(state)
+    _state = flush_pending_replicated_message_barrier(state)
     :ok
   end
 
@@ -548,6 +596,8 @@ defmodule Group.Replica do
 
   @impl true
   def handle_info({:replicate_register, cluster, key, pid, meta, time, _reason}, state) do
+    state = flush_pending_replicated_sender_barrier(state)
+
     {state, flushed?} =
       enqueue_replicated_registry_op(
         state,
@@ -559,6 +609,8 @@ defmodule Group.Replica do
   end
 
   def handle_info({:replicate_unregister, cluster, key, pid, meta, reason}, state) do
+    state = flush_pending_replicated_sender_barrier(state)
+
     {state, flushed?} =
       enqueue_replicated_registry_op(state, {:unregister, cluster, key, pid, meta, reason})
 
@@ -567,6 +619,8 @@ defmodule Group.Replica do
   end
 
   def handle_info({:replicate_join, cluster, key, pid, meta, time, reason}, state) do
+    state = flush_pending_replicated_sender_barrier(state)
+
     {state, flushed?} =
       enqueue_replicated_pg_op(state, {:join, cluster, key, pid, meta, time, reason, node(pid)})
 
@@ -576,8 +630,28 @@ defmodule Group.Replica do
   end
 
   def handle_info({:replicate_leave, cluster, key, pid, meta, reason}, state) do
+    state = flush_pending_replicated_sender_barrier(state)
+
     {state, flushed?} =
       enqueue_replicated_pg_op(state, {:leave, cluster, key, pid, meta, reason})
+
+    state = if flushed?, do: take_priority_turn(state), else: state
+    {:noreply, state}
+  end
+
+  def handle_info({:replicate_registry_batch, ops}, state) do
+    state = flush_pending_replicated_sender_barrier(state)
+
+    {state, flushed?} = enqueue_replicated_registry_ops(state, ops)
+
+    state = if flushed?, do: take_priority_turn(state), else: state
+    {:noreply, state}
+  end
+
+  def handle_info({:replicate_pg_batch, ops}, state) do
+    state = flush_pending_replicated_sender_barrier(state)
+
+    {state, flushed?} = enqueue_replicated_pg_ops(state, ops)
 
     state = if flushed?, do: take_priority_turn(state), else: state
     {:noreply, state}
@@ -597,7 +671,7 @@ defmodule Group.Replica do
         state
       )
       when remote_shard_index == state.shard_index do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
 
     if remote_num_shards != state.num_shards do
       raise "Group shard count mismatch: local=#{state.num_shards} remote=#{remote_num_shards} from #{node(remote_pid)}"
@@ -647,7 +721,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:peer_connect, _remote_pid, _other_shard, _num_shards, _clusters}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     # Wrong shard index, ignore
     {:noreply, state}
   end
@@ -657,7 +731,7 @@ defmodule Group.Replica do
         state
       )
       when remote_shard_index == state.shard_index do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
 
     if remote_num_shards != state.num_shards do
       raise "Group shard count mismatch: local=#{state.num_shards} remote=#{remote_num_shards} from #{node(remote_pid)}"
@@ -699,7 +773,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:peer_connect_ack, _remote_pid, _other_shard, _num_shards, _clusters}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     {:noreply, state}
   end
 
@@ -708,7 +782,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info({:cluster_state, cluster, reg_data, pg_data}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     %{name: name} = state
 
     # Guard: skip merge for named clusters we're not a member of
@@ -734,7 +808,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info({:cluster_connect, clusters, remote_pid}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     %{name: name} = state
     remote_node = node(remote_pid)
 
@@ -772,7 +846,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:cluster_connect_ack, clusters, remote_pid, cluster_data}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     %{name: name} = state
     remote_node = node(remote_pid)
 
@@ -814,7 +888,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:cluster_disconnect, clusters, remote_pid}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     %{name: name, shard_index: shard} = state
     remote_node = node(remote_pid)
 
@@ -845,7 +919,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info({:nodeup, remote_node}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     %{shard_index: shard, name: name} = state
     shard_registered_name = shard_name(name, shard)
 
@@ -858,7 +932,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:nodedown, dead_node}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     %{name: name, shard_index: shard} = state
 
     # Remove cluster memberships from shared tables. Every shard calls this
@@ -886,7 +960,7 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info({:DOWN, _mref, :process, pid, reason}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     %{name: name, shard_index: shard} = state
 
     remote_node = node(pid)
@@ -935,7 +1009,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:replicate_process_down_batch, reg_entries, pg_entries}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     %{name: name, shard_index: shard} = state
 
     log_verbose(state, fn ->
@@ -950,7 +1024,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:send_cluster_data, clusters, target_node}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     %{name: name} = state
 
     active = Enum.filter(clusters, fn c -> node() in Data.cluster_nodes(name, c) end)
@@ -963,7 +1037,7 @@ defmodule Group.Replica do
   end
 
   def handle_info({:group_dispatch, pids, message}, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     for pid <- pids, do: send(pid, message)
     {:noreply, state}
   end
@@ -994,8 +1068,30 @@ defmodule Group.Replica do
     {:noreply, state}
   end
 
+  def handle_info({@replicated_pg_broadcast_flush_timer, flush_ref}, state) do
+    state =
+      if state.pending_replicated_pg_broadcast_flush_ref == flush_ref do
+        flush_pending_replicated_pg_broadcast(state)
+      else
+        state
+      end
+
+    {:noreply, state}
+  end
+
+  def handle_info({@replicated_registry_broadcast_flush_timer, flush_ref}, state) do
+    state =
+      if state.pending_replicated_registry_broadcast_flush_ref == flush_ref do
+        flush_pending_replicated_registry_broadcast(state)
+      else
+        state
+      end
+
+    {:noreply, state}
+  end
+
   def handle_info(_msg, state) do
-    state = flush_pending_replicated_barrier(state)
+    state = flush_pending_replicated_message_barrier(state)
     {:noreply, state}
   end
 
@@ -1198,6 +1294,63 @@ defmodule Group.Replica do
   defp flush_pending_replicated_registry_barrier(state),
     do: flush_pending_replicated_registry(state)
 
+  defp flush_pending_replicated_message_barrier(state) do
+    state
+    |> flush_pending_replicated_sender_barrier()
+    |> flush_pending_replicated_barrier()
+  end
+
+  defp flush_pending_replicated_sender_barrier(
+         %{
+           pending_replicated_pg_broadcast_len: 0,
+           pending_replicated_registry_broadcast_len: 0
+         } = state
+       ),
+       do: state
+
+  defp flush_pending_replicated_sender_barrier(
+         %{pending_replicated_pg_broadcast_len: 0, pending_replicated_registry_broadcast_len: len} =
+           state
+       )
+       when len > 0,
+       do: flush_pending_replicated_registry_broadcast(state)
+
+  defp flush_pending_replicated_sender_barrier(
+         %{pending_replicated_pg_broadcast_len: len, pending_replicated_registry_broadcast_len: 0} =
+           state
+       )
+       when len > 0,
+       do: flush_pending_replicated_pg_broadcast(state)
+
+  defp flush_pending_replicated_sender_barrier(state) do
+    if state.pending_replicated_pg_broadcast_started_at <=
+         state.pending_replicated_registry_broadcast_started_at do
+      state
+      |> flush_pending_replicated_pg_broadcast()
+      |> flush_pending_replicated_registry_broadcast()
+    else
+      state
+      |> flush_pending_replicated_registry_broadcast()
+      |> flush_pending_replicated_pg_broadcast()
+    end
+  end
+
+  defp flush_pending_replicated_pg_broadcast_barrier(
+         %{pending_replicated_pg_broadcast_len: 0} = state
+       ),
+       do: state
+
+  defp flush_pending_replicated_pg_broadcast_barrier(state),
+    do: flush_pending_replicated_pg_broadcast(state)
+
+  defp flush_pending_replicated_registry_broadcast_barrier(
+         %{pending_replicated_registry_broadcast_len: 0} = state
+       ),
+       do: state
+
+  defp flush_pending_replicated_registry_broadcast_barrier(state),
+    do: flush_pending_replicated_registry_broadcast(state)
+
   defp process_pg_local_request_batch(state, messages) do
     %{name: name, shard_index: shard} = state
     local_node = node()
@@ -1295,7 +1448,7 @@ defmodule Group.Replica do
     Data.pg_delete_many(name, shard, delete_entries)
     Data.pg_insert_many(name, shard, insert_entries)
     state = finalize_local_batch_monitors(state, new_monitors, maybe_demonitor_pids)
-    send_local_batch_broadcasts(state, broadcasts)
+    state = send_local_batch_broadcasts(state, broadcasts)
     notify_monitors(name, events)
     reply_local_requests(replies)
     state
@@ -1414,9 +1567,55 @@ defmodule Group.Replica do
   end
 
   defp send_local_batch_broadcasts(state, broadcasts) do
-    Enum.each(Enum.reverse(broadcasts), fn {cluster, message} ->
-      broadcast_to_cluster(state, cluster, message)
+    Enum.reduce(Enum.reverse(broadcasts), state, fn {_cluster, message}, acc_state ->
+      enqueue_broadcast_message(acc_state, message)
     end)
+  end
+
+  defp enqueue_broadcast_message(
+         state,
+         {:replicate_register, _cluster, _key, _pid, _meta, _time, _reason} = message
+       ) do
+    enqueue_replicated_registry_broadcast(state, registry_broadcast_message_to_op(message))
+  end
+
+  defp enqueue_broadcast_message(
+         state,
+         {:replicate_unregister, _cluster, _key, _pid, _meta, _reason} = message
+       ) do
+    enqueue_replicated_registry_broadcast(state, registry_broadcast_message_to_op(message))
+  end
+
+  defp enqueue_broadcast_message(
+         state,
+         {:replicate_join, _cluster, _key, _pid, _meta, _time, _reason} = message
+       ) do
+    enqueue_replicated_pg_broadcast(state, pg_broadcast_message_to_op(message))
+  end
+
+  defp enqueue_broadcast_message(
+         state,
+         {:replicate_leave, _cluster, _key, _pid, _meta, _reason} = message
+       ) do
+    enqueue_replicated_pg_broadcast(state, pg_broadcast_message_to_op(message))
+  end
+
+  defp registry_broadcast_message_to_op(
+         {:replicate_register, cluster, key, pid, meta, time, _reason}
+       ) do
+    {:register, cluster, key, pid, meta, time, node(pid)}
+  end
+
+  defp registry_broadcast_message_to_op({:replicate_unregister, cluster, key, pid, meta, reason}) do
+    {:unregister, cluster, key, pid, meta, reason}
+  end
+
+  defp pg_broadcast_message_to_op({:replicate_join, cluster, key, pid, meta, time, reason}) do
+    {:join, cluster, key, pid, meta, time, reason, node(pid)}
+  end
+
+  defp pg_broadcast_message_to_op({:replicate_leave, cluster, key, pid, meta, reason}) do
+    {:leave, cluster, key, pid, meta, reason}
   end
 
   defp reply_local_requests(replies) do
@@ -1442,11 +1641,11 @@ defmodule Group.Replica do
           "#{log_prefix_shard(state)} register key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
         end)
 
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_register, cluster, key, pid, meta, time, :register}
-        )
+        state =
+          enqueue_replicated_registry_broadcast(
+            state,
+            {:register, cluster, key, pid, meta, time, node(pid)}
+          )
 
         state = put_monitor(state, pid, mref)
 
@@ -1467,11 +1666,11 @@ defmodule Group.Replica do
           "#{log_prefix_shard(state)} re-register key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
         end)
 
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_register, cluster, key, pid, meta, time, :update}
-        )
+        state =
+          enqueue_replicated_registry_broadcast(
+            state,
+            {:register, cluster, key, pid, meta, time, node(pid)}
+          )
 
         event =
           build_event(name, :registered, key, pid, meta, %{
@@ -1499,11 +1698,11 @@ defmodule Group.Replica do
           "#{log_prefix_shard(state)} unregister key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
         end)
 
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_unregister, cluster, key, pid, meta, :unregister}
-        )
+        state =
+          enqueue_replicated_registry_broadcast(
+            state,
+            {:unregister, cluster, key, pid, meta, :unregister}
+          )
 
         event =
           build_event(name, :unregistered, key, pid, meta, %{
@@ -1535,11 +1734,11 @@ defmodule Group.Replica do
           "#{log_prefix_shard(state)} join key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
         end)
 
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_join, cluster, key, pid, meta, time, :join}
-        )
+        state =
+          enqueue_replicated_pg_broadcast(
+            state,
+            {:join, cluster, key, pid, meta, time, :join, node(pid)}
+          )
 
         state = put_monitor(state, pid, mref)
 
@@ -1560,11 +1759,11 @@ defmodule Group.Replica do
           "#{log_prefix_shard(state)} re-join key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
         end)
 
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_join, cluster, key, pid, meta, time, :update}
-        )
+        state =
+          enqueue_replicated_pg_broadcast(
+            state,
+            {:join, cluster, key, pid, meta, time, :update, node(pid)}
+          )
 
         event =
           build_event(name, :joined, key, pid, meta, %{previous_meta: old_meta, cluster: cluster})
@@ -1589,11 +1788,11 @@ defmodule Group.Replica do
           "#{log_prefix_shard(state)} leave key=#{inspect(key)} pid=#{inspect(pid)} cluster=#{inspect(cluster)}"
         end)
 
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_leave, cluster, key, pid, meta, :leave}
-        )
+        state =
+          enqueue_replicated_pg_broadcast(
+            state,
+            {:leave, cluster, key, pid, meta, :leave}
+          )
 
         event = build_event(name, :left, key, pid, meta, %{reason: :leave, cluster: cluster})
         notify_monitors(name, [event])
@@ -1602,6 +1801,7 @@ defmodule Group.Replica do
   end
 
   defp do_cluster_connect(state, clusters) do
+    state = flush_pending_replicated_sender_barrier(state)
     %{name: name} = state
 
     log(state, fn ->
@@ -1619,6 +1819,7 @@ defmodule Group.Replica do
   end
 
   defp do_cluster_disconnect(state, clusters) do
+    state = flush_pending_replicated_sender_barrier(state)
     %{name: name, shard_index: shard} = state
 
     log_once(state, fn ->
@@ -1639,25 +1840,28 @@ defmodule Group.Replica do
     {:ok, state}
   end
 
-  defp enqueue_replicated_pg_op(state, op) do
+  defp enqueue_replicated_pg_op(state, op), do: enqueue_replicated_pg_ops(state, [op])
+
+  defp enqueue_replicated_pg_ops(state, ops) do
     state = flush_pending_replicated_registry_barrier(state)
-    log_replicated_pg_op(state, op)
+    Enum.each(ops, &log_replicated_pg_op(state, &1))
 
     now = System.monotonic_time(:millisecond)
+    ops_len = length(ops)
 
     state =
       case state.pending_replicated_pg_len do
         0 ->
           %{state | pending_replicated_pg_started_at: now}
           |> schedule_replicated_pg_flush()
-          |> Map.put(:pending_replicated_pg_ops, [op])
-          |> Map.put(:pending_replicated_pg_len, 1)
+          |> Map.put(:pending_replicated_pg_ops, Enum.reverse(ops))
+          |> Map.put(:pending_replicated_pg_len, ops_len)
 
         len ->
           %{
             state
-            | pending_replicated_pg_ops: [op | state.pending_replicated_pg_ops],
-              pending_replicated_pg_len: len + 1
+            | pending_replicated_pg_ops: Enum.reverse(ops, state.pending_replicated_pg_ops),
+              pending_replicated_pg_len: len + ops_len
           }
       end
 
@@ -1669,25 +1873,29 @@ defmodule Group.Replica do
     end
   end
 
-  defp enqueue_replicated_registry_op(state, op) do
+  defp enqueue_replicated_registry_op(state, op), do: enqueue_replicated_registry_ops(state, [op])
+
+  defp enqueue_replicated_registry_ops(state, ops) do
     state = flush_pending_replicated_pg_barrier(state)
-    log_replicated_registry_op(state, op)
+    Enum.each(ops, &log_replicated_registry_op(state, &1))
 
     now = System.monotonic_time(:millisecond)
+    ops_len = length(ops)
 
     state =
       case state.pending_replicated_registry_len do
         0 ->
           %{state | pending_replicated_registry_started_at: now}
           |> schedule_replicated_registry_flush()
-          |> Map.put(:pending_replicated_registry_ops, [op])
-          |> Map.put(:pending_replicated_registry_len, 1)
+          |> Map.put(:pending_replicated_registry_ops, Enum.reverse(ops))
+          |> Map.put(:pending_replicated_registry_len, ops_len)
 
         len ->
           %{
             state
-            | pending_replicated_registry_ops: [op | state.pending_replicated_registry_ops],
-              pending_replicated_registry_len: len + 1
+            | pending_replicated_registry_ops:
+                Enum.reverse(ops, state.pending_replicated_registry_ops),
+              pending_replicated_registry_len: len + ops_len
           }
       end
 
@@ -1696,6 +1904,72 @@ defmodule Group.Replica do
       {flush_pending_replicated_registry(state), true}
     else
       {state, false}
+    end
+  end
+
+  defp enqueue_replicated_pg_broadcast(state, op),
+    do: enqueue_replicated_pg_broadcasts(state, [op])
+
+  defp enqueue_replicated_pg_broadcasts(state, ops) do
+    state = flush_pending_replicated_registry_broadcast_barrier(state)
+    now = System.monotonic_time(:millisecond)
+    ops_len = length(ops)
+
+    state =
+      case state.pending_replicated_pg_broadcast_len do
+        0 ->
+          %{state | pending_replicated_pg_broadcast_started_at: now}
+          |> schedule_replicated_pg_broadcast_flush()
+          |> Map.put(:pending_replicated_pg_broadcast_ops, Enum.reverse(ops))
+          |> Map.put(:pending_replicated_pg_broadcast_len, ops_len)
+
+        len ->
+          %{
+            state
+            | pending_replicated_pg_broadcast_ops:
+                Enum.reverse(ops, state.pending_replicated_pg_broadcast_ops),
+              pending_replicated_pg_broadcast_len: len + ops_len
+          }
+      end
+
+    if state.pending_replicated_pg_broadcast_len >= state.replicated_sender_buffer_size or
+         pending_replicated_pg_broadcast_due?(state, now) do
+      flush_pending_replicated_pg_broadcast(state)
+    else
+      state
+    end
+  end
+
+  defp enqueue_replicated_registry_broadcast(state, op),
+    do: enqueue_replicated_registry_broadcasts(state, [op])
+
+  defp enqueue_replicated_registry_broadcasts(state, ops) do
+    state = flush_pending_replicated_pg_broadcast_barrier(state)
+    now = System.monotonic_time(:millisecond)
+    ops_len = length(ops)
+
+    state =
+      case state.pending_replicated_registry_broadcast_len do
+        0 ->
+          %{state | pending_replicated_registry_broadcast_started_at: now}
+          |> schedule_replicated_registry_broadcast_flush()
+          |> Map.put(:pending_replicated_registry_broadcast_ops, Enum.reverse(ops))
+          |> Map.put(:pending_replicated_registry_broadcast_len, ops_len)
+
+        len ->
+          %{
+            state
+            | pending_replicated_registry_broadcast_ops:
+                Enum.reverse(ops, state.pending_replicated_registry_broadcast_ops),
+              pending_replicated_registry_broadcast_len: len + ops_len
+          }
+      end
+
+    if state.pending_replicated_registry_broadcast_len >= state.replicated_sender_buffer_size or
+         pending_replicated_registry_broadcast_due?(state, now) do
+      flush_pending_replicated_registry_broadcast(state)
+    else
+      state
     end
   end
 
@@ -1810,6 +2084,40 @@ defmodule Group.Replica do
     %{state | pending_replicated_registry_flush_ref: flush_ref}
   end
 
+  defp schedule_replicated_pg_broadcast_flush(%{replicated_sender_flush_interval: 0} = state) do
+    %{state | pending_replicated_pg_broadcast_flush_ref: nil}
+  end
+
+  defp schedule_replicated_pg_broadcast_flush(state) do
+    flush_ref = make_ref()
+
+    Process.send_after(
+      self(),
+      {@replicated_pg_broadcast_flush_timer, flush_ref},
+      state.replicated_sender_flush_interval
+    )
+
+    %{state | pending_replicated_pg_broadcast_flush_ref: flush_ref}
+  end
+
+  defp schedule_replicated_registry_broadcast_flush(
+         %{replicated_sender_flush_interval: 0} = state
+       ) do
+    %{state | pending_replicated_registry_broadcast_flush_ref: nil}
+  end
+
+  defp schedule_replicated_registry_broadcast_flush(state) do
+    flush_ref = make_ref()
+
+    Process.send_after(
+      self(),
+      {@replicated_registry_broadcast_flush_timer, flush_ref},
+      state.replicated_sender_flush_interval
+    )
+
+    %{state | pending_replicated_registry_broadcast_flush_ref: flush_ref}
+  end
+
   defp pending_replicated_pg_due?(%{pending_replicated_pg_len: 0}, _now), do: false
 
   defp pending_replicated_pg_due?(state, now) do
@@ -1823,6 +2131,27 @@ defmodule Group.Replica do
     state.replicated_registry_receiver_flush_interval == 0 or
       now - state.pending_replicated_registry_started_at >=
         state.replicated_registry_receiver_flush_interval
+  end
+
+  defp pending_replicated_pg_broadcast_due?(%{pending_replicated_pg_broadcast_len: 0}, _now),
+    do: false
+
+  defp pending_replicated_pg_broadcast_due?(state, now) do
+    state.replicated_sender_flush_interval == 0 or
+      now - state.pending_replicated_pg_broadcast_started_at >=
+        state.replicated_sender_flush_interval
+  end
+
+  defp pending_replicated_registry_broadcast_due?(
+         %{pending_replicated_registry_broadcast_len: 0},
+         _now
+       ),
+       do: false
+
+  defp pending_replicated_registry_broadcast_due?(state, now) do
+    state.replicated_sender_flush_interval == 0 or
+      now - state.pending_replicated_registry_broadcast_started_at >=
+        state.replicated_sender_flush_interval
   end
 
   defp flush_pending_replicated_pg(%{pending_replicated_pg_len: 0} = state), do: state
@@ -1867,7 +2196,7 @@ defmodule Group.Replica do
     Data.registry_delete_many(name, shard, delete_entries)
     Data.registry_insert_many(name, shard, insert_entries)
     state = finalize_local_batch_monitors(state, %{}, maybe_demonitor_pids)
-    send_local_batch_broadcasts(state, broadcasts)
+    state = send_local_batch_broadcasts(state, broadcasts)
     notify_monitors(name, events)
 
     %{
@@ -1876,6 +2205,50 @@ defmodule Group.Replica do
         pending_replicated_registry_len: 0,
         pending_replicated_registry_started_at: nil,
         pending_replicated_registry_flush_ref: nil
+    }
+  end
+
+  defp flush_pending_replicated_pg_broadcast(%{pending_replicated_pg_broadcast_len: 0} = state),
+    do: state
+
+  defp flush_pending_replicated_pg_broadcast(state) do
+    ops = Enum.reverse(state.pending_replicated_pg_broadcast_ops)
+
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} flush_replicated_pg_broadcast_buffer ops=#{length(ops)}"
+    end)
+
+    send_replicated_pg_batches(state, ops)
+
+    %{
+      state
+      | pending_replicated_pg_broadcast_ops: [],
+        pending_replicated_pg_broadcast_len: 0,
+        pending_replicated_pg_broadcast_started_at: nil,
+        pending_replicated_pg_broadcast_flush_ref: nil
+    }
+  end
+
+  defp flush_pending_replicated_registry_broadcast(
+         %{pending_replicated_registry_broadcast_len: 0} = state
+       ),
+       do: state
+
+  defp flush_pending_replicated_registry_broadcast(state) do
+    ops = Enum.reverse(state.pending_replicated_registry_broadcast_ops)
+
+    log_verbose(state, fn ->
+      "#{log_prefix_shard(state)} flush_replicated_registry_broadcast_buffer ops=#{length(ops)}"
+    end)
+
+    send_replicated_registry_batches(state, ops)
+
+    %{
+      state
+      | pending_replicated_registry_broadcast_ops: [],
+        pending_replicated_registry_broadcast_len: 0,
+        pending_replicated_registry_broadcast_started_at: nil,
+        pending_replicated_registry_broadcast_flush_ref: nil
     }
   end
 
@@ -2080,6 +2453,76 @@ defmodule Group.Replica do
     end)
   end
 
+  defp send_replicated_pg_batches(state, ops) do
+    shard_name = shard_name(state.name, state.shard_index)
+
+    ops
+    |> group_broadcast_ops_by_target(state, &pg_op_cluster/1)
+    |> Enum.each(fn {target_node, target_ops} ->
+      send({shard_name, target_node}, {:replicate_pg_batch, target_ops})
+    end)
+  end
+
+  defp send_replicated_registry_batches(state, ops) do
+    shard_name = shard_name(state.name, state.shard_index)
+
+    ops
+    |> group_broadcast_ops_by_target(state, &registry_op_cluster/1)
+    |> Enum.each(fn {target_node, target_ops} ->
+      send({shard_name, target_node}, {:replicate_registry_batch, target_ops})
+    end)
+  end
+
+  defp group_broadcast_ops_by_target(ops, state, cluster_fun) do
+    {messages_by_node, _targets_cache} =
+      Enum.reduce(ops, {%{}, %{}}, fn op, {messages_by_node, targets_cache} ->
+        cluster = cluster_fun.(op)
+        {target_nodes, targets_cache} = broadcast_targets(state, cluster, targets_cache)
+
+        messages_by_node =
+          Enum.reduce(target_nodes, messages_by_node, fn target_node, acc ->
+            Map.update(acc, target_node, [op], &[op | &1])
+          end)
+
+        {messages_by_node, targets_cache}
+      end)
+
+    Enum.map(messages_by_node, fn {target_node, target_ops} ->
+      {target_node, Enum.reverse(target_ops)}
+    end)
+  end
+
+  defp broadcast_targets(state, cluster, cache) do
+    case cache do
+      %{^cluster => target_nodes} ->
+        {target_nodes, cache}
+
+      %{} ->
+        target_nodes =
+          case cluster do
+            nil ->
+              for {target_node, _pid} <- state.remote_shards, do: target_node
+
+            _cluster ->
+              for target_node <- Data.cluster_nodes(state.name, cluster),
+                  target_node != node(),
+                  do: target_node
+          end
+
+        {target_nodes, Map.put(cache, cluster, target_nodes)}
+    end
+  end
+
+  defp pg_op_cluster({:join, cluster, _key, _pid, _meta, _time, _reason, _entry_node}),
+    do: cluster
+
+  defp pg_op_cluster({:leave, cluster, _key, _pid, _meta, _reason}), do: cluster
+
+  defp registry_op_cluster({:register, cluster, _key, _pid, _meta, _time, _entry_node}),
+    do: cluster
+
+  defp registry_op_cluster({:unregister, cluster, _key, _pid, _meta, _reason}), do: cluster
+
   defp send_to_peer(state, target_node, message) do
     shard_name = shard_name(state.name, state.shard_index)
     send({shard_name, target_node}, message)
@@ -2089,19 +2532,6 @@ defmodule Group.Replica do
     shard_name = shard_name(state.name, state.shard_index)
 
     for {target_node, _pid} <- state.remote_shards do
-      send({shard_name, target_node}, message)
-    end
-  end
-
-  defp broadcast_to_cluster(state, nil = _cluster, message) do
-    broadcast_to_peers(state, message)
-  end
-
-  defp broadcast_to_cluster(state, cluster, message) do
-    %{name: name} = state
-    shard_name = shard_name(name, state.shard_index)
-
-    for target_node <- Data.cluster_nodes(name, cluster), target_node != node() do
       send({shard_name, target_node}, message)
     end
   end
@@ -2526,11 +2956,11 @@ defmodule Group.Replica do
           node(local_pid)
         )
 
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_register, cluster, key, local_pid, local_meta, time, :resolve_conflict}
-        )
+        state =
+          enqueue_replicated_registry_broadcast(
+            state,
+            {:register, cluster, key, local_pid, local_meta, time, node(local_pid)}
+          )
 
         {state, nil}
 
@@ -2539,11 +2969,11 @@ defmodule Group.Replica do
         Data.registry_delete(name, shard, cluster, key, local_pid)
         state = maybe_demonitor_pid(state, name, shard, local_pid)
 
-        broadcast_to_cluster(
-          state,
-          cluster,
-          {:replicate_unregister, cluster, key, local_pid, local_meta, :resolve_conflict}
-        )
+        state =
+          enqueue_replicated_registry_broadcast(
+            state,
+            {:unregister, cluster, key, local_pid, local_meta, :resolve_conflict}
+          )
 
         event =
           build_event(name, :unregistered, key, local_pid, local_meta, %{

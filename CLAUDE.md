@@ -88,7 +88,8 @@ All tables: `:public`, `read_concurrency: true`, `decentralized_counters: true`.
 ### Reads vs Writes
 
 - **Reads** (`lookup`, `members`, `local_registry_count`) go directly to ETS — no GenServer involved
-- **Writes** (`register`, `join`, `leave`, `unregister`) go through shard GenServer via `GenServer.call`
+- **Writes** (`register`, `join`, `leave`, `unregister`) go through the shard's
+  local request lane (`send` + monitor + tagged reply), not `GenServer.call`
 - **Replication** arrives as `handle_info` messages on shard GenServers
 
 ### Config
@@ -106,10 +107,14 @@ Stored in `persistent_term` keyed by `{Group, name}`. Map with: `num_shards`, `l
 
 ### Replication (steady state)
 
-After discovery, writes broadcast to cluster members:
+After discovery, writes replicate in two stages:
 - nil cluster: uses `state.remote_shards` map
 - Named clusters: uses `cluster_nodes` ETS table
-- Messages: `replicate_register`, `replicate_unregister`, `replicate_join`, `replicate_leave`
+- Sender batches: `replicate_registry_batch`, `replicate_pg_batch`
+- Legacy per-op receive shapes still exist locally: `replicate_register`,
+  `replicate_unregister`, `replicate_join`, `replicate_leave`
+- Receiver buffers registry and PG lanes separately, bulk-applies ETS writes,
+  then takes a bounded fairness turn for local work
 
 ### Conflict Resolution
 
@@ -176,7 +181,8 @@ Keys ending with `"/"` are rejected by `validate_key!/1` in register/unregister/
 - All helpers (`spawn_register`, `spawn_join`, `spawn_monitor_forwarder`) use `:erpc.call` with compiled modules from `test/support/`
 - `Node.spawn` with anonymous functions won't work — remote node needs the defining module's beam file
 - `assert_eventually/2` polls with retries for async replication
-- `flush_shards/2` sends a mailbox barrier through each shard so buffered replicated PG ops are flushed too
+- `flush_shards/2` sends a mailbox barrier through each shard so buffered sender
+  and receiver replication work is flushed too
 - `assert_ets_consistent/1` verifies dual-index tables match
 - Partition tests use 3 nodes (isolate 1 from other 2). 2-node partitions are unreliable because the test node bridges them.
 - `Supervisor.start_link` links to caller — in RPC context, must `Process.unlink(pid)` or supervisor dies on RPC return

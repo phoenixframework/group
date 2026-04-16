@@ -35,6 +35,8 @@ defmodule Group.DistributedTest do
     end
   end
 
+  defp shard_name(name, shard), do: :"#{name}_replica_#{shard}"
+
   describe "registration replication" do
     test "register replicates to other nodes" do
       peers = TestCluster.start_peers(2)
@@ -1503,6 +1505,226 @@ defmodule Group.DistributedTest do
       # C should have NO "game" data
       assert TestCluster.rpc!(node_c, Group, :lookup, [name, "game_key/1", [cluster: "game"]]) ==
                nil
+    end
+  end
+
+  describe "sender-side batching" do
+    test "batches replicated registry updates into a small number of remote mailbox messages" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_sender_registry_batch_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replicated_sender_buffer_size: 128,
+        replicated_sender_flush_interval: 60_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      shard = shard_name(name, 0)
+      assert :ok = TestCluster.rpc!(node_b, :sys, :suspend, [shard])
+
+      on_exit(fn ->
+        TestCluster.resume_shard_if_alive(node_b, name, 0)
+      end)
+
+      keys =
+        Enum.map(1..20, fn i ->
+          "sender/registry/#{i}"
+        end)
+
+      Enum.each(keys, fn key ->
+        TestCluster.spawn_register(node_a, name, key, %{key: key})
+      end)
+
+      TestCluster.flush_shards(node_a, name)
+
+      assert TestCluster.shard_message_queue_len(node_b, name, 0) <= 3
+
+      assert :ok = TestCluster.rpc!(node_b, :sys, :resume, [shard])
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?(keys, fn key ->
+          match?(
+            {pid, %{key: ^key}} when is_pid(pid),
+            TestCluster.rpc!(node_b, Group, :lookup, [name, key])
+          )
+        end)
+      end)
+    end
+
+    test "batches replicated PG updates into a small number of remote mailbox messages" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_sender_pg_batch_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replicated_sender_buffer_size: 128,
+        replicated_sender_flush_interval: 60_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      shard = shard_name(name, 0)
+      assert :ok = TestCluster.rpc!(node_b, :sys, :suspend, [shard])
+
+      on_exit(fn ->
+        TestCluster.resume_shard_if_alive(node_b, name, 0)
+      end)
+
+      keys =
+        Enum.map(1..20, fn i ->
+          "sender/pg/#{i}"
+        end)
+
+      Enum.each(keys, fn key ->
+        TestCluster.spawn_join(node_a, name, key, %{key: key})
+      end)
+
+      TestCluster.flush_shards(node_a, name)
+
+      assert TestCluster.shard_message_queue_len(node_b, name, 0) <= 3
+
+      assert :ok = TestCluster.rpc!(node_b, :sys, :resume, [shard])
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?(keys, fn key ->
+          match?(
+            [{pid, %{key: ^key}}] when is_pid(pid),
+            TestCluster.rpc!(node_b, Group, :members, [name, key])
+          )
+        end)
+      end)
+    end
+
+    test "flushes pending sender registry batches before process-down cleanup" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_sender_down_order_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replicated_sender_buffer_size: 128,
+        replicated_sender_flush_interval: 60_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      key = "sender/down/order"
+      pid = TestCluster.spawn_register(node_a, name, key, %{v: 1})
+      TestCluster.rpc!(node_a, Process, :exit, [pid, :kill])
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+      end)
+    end
+
+    test "flushes pending sender registry batches before cluster_disconnect changes routing" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_sender_disconnect_order_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replicated_sender_buffer_size: 128,
+        replicated_sender_flush_interval: 60_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        nodes_a = TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])
+        nodes_b = TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+        node_b in nodes_a and node_a in nodes_b
+      end)
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      shard = shard_name(name, 0)
+      assert :ok = TestCluster.rpc!(node_b, :sys, :suspend, [shard])
+
+      on_exit(fn ->
+        TestCluster.resume_shard_if_alive(node_b, name, 0)
+      end)
+
+      key = "sender/disconnect/order"
+      pid = TestCluster.spawn_register_in_cluster(node_a, name, key, %{v: 1}, "game")
+
+      assert :ok = TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        messages = TestCluster.shard_messages(node_b, name, 0)
+
+        case Enum.filter(messages, fn
+               {:replicate_registry_batch, _ops} -> true
+               {:cluster_disconnect, ["game"], _remote_pid} -> true
+               _ -> false
+             end) do
+          [
+            {:replicate_registry_batch, ops},
+            {:cluster_disconnect, ["game"], _remote_pid}
+          ] ->
+            Enum.any?(ops, fn
+              {:register, "game", ^key, reg_pid, %{v: 1}, _time, _entry_node}
+              when reg_pid == pid ->
+                true
+
+              _ ->
+                false
+            end)
+
+          _ ->
+            false
+        end
+      end)
+
+      assert :ok = TestCluster.rpc!(node_b, :sys, :resume, [shard])
+
+      TestCluster.flush_shards(node_a, name)
+      TestCluster.flush_shards(node_b, name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, key, [cluster: "game"]]) == nil
+      end)
     end
   end
 

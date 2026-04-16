@@ -311,9 +311,21 @@ This is how a new node catches up to the existing cluster state.
 
 ### Replication
 
-After the initial sync, steady-state changes propagate via broadcast messages
-(`replicate_register`, `replicate_join`, etc.) sent from the writing shard to
-the corresponding shard on all peer nodes in the relevant cluster.
+After the initial sync, steady-state changes propagate through separate sender
+and receiver batching lanes:
+
+- local writes enqueue outbound registry or PG replication in shard-local sender
+  buffers
+- sender flushes group those ops by target node and send one
+  `replicate_registry_batch` or `replicate_pg_batch` message per remote node
+- remote shards buffer those replicated registry / PG ops receiver-side, apply
+  them in FIFO order with bulk ETS operations, then take a bounded fairness turn
+  before yielding back to the mailbox
+
+The sender flush timer is mainly a fallback for idle periods. Outbound buffers
+also flush immediately when they hit the configured size, when a new enqueue
+finds the buffer already past its flush interval, and before control or
+routing work such as cluster connect/disconnect or peer-protocol handling.
 
 ### Named Cluster TTL Leases
 

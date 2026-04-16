@@ -1,5 +1,9 @@
+## 0.1.6 (2026-04-16)
+- Add bounded local PG turn-taking and bulk local PG ETS application
+- Add sender-side replicated registry / PG batching by target node
+
 ## 0.1.5 (2026-04-14)
-- Optimize replicated message churn with turn-taking queue
+- Add receiver-side batching and fairness for replicated registry traffic
 
 ## 0.1.4 (2026-03-31)
 - Add named-cluster `Group.connect(..., ttl: ms)` leases
