@@ -37,6 +37,10 @@ defmodule Group.DistributedTest do
 
   defp shard_name(name, shard), do: :"#{name}_replica_#{shard}"
 
+  defp reconnect_state(node, name) do
+    TestCluster.rpc!(node, :sys, :get_state, [Group.PeerReconnect.reconnect_name(name)])
+  end
+
   describe "registration replication" do
     test "register replicates to other nodes" do
       peers = TestCluster.start_peers(2)
@@ -1725,6 +1729,103 @@ defmodule Group.DistributedTest do
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_b, Group, :lookup, [name, key, [cluster: "game"]]) == nil
       end)
+    end
+  end
+
+  describe "busy dist reconnects" do
+    test "busy-link retry mode reconnects and stops once the node is back" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_busy_retry_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        busy_dist_retry_attempts: 20,
+        busy_dist_retry_interval: 50
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      TestCluster.rpc!(node_a, Group.PeerReconnect, :busy_link, [name, node_b])
+
+      TestCluster.assert_eventually(fn ->
+        Map.has_key?(reconnect_state(node_a, name).retrying, node_b)
+      end)
+
+      TestCluster.assert_eventually(
+        fn ->
+          node_b in TestCluster.rpc!(node_a, Node, :list, []) and
+            node_b in TestCluster.rpc!(node_a, Group, :nodes, [name]) and
+            not Map.has_key?(reconnect_state(node_a, name).retrying, node_b)
+        end,
+        timeout: 10_000
+      )
+    end
+
+    test "ordinary nodedown does not enter busy-link retry mode" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_busy_retry_ignore_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        busy_dist_retry_attempts: 5,
+        busy_dist_retry_interval: 50
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      TestCluster.disconnect_nodes(node_a, node_b)
+
+      TestCluster.assert_eventually(
+        fn ->
+          node_b not in TestCluster.rpc!(node_a, Node, :list, []) and
+            node_b not in TestCluster.rpc!(node_a, Group, :nodes, [name])
+        end,
+        timeout: 5_000
+      )
+
+      assert reconnect_state(node_a, name).retrying == %{}
+    end
+
+    test "busy-link retry mode eventually gives up on an unreachable node" do
+      peers = TestCluster.start_peers(1)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}] = peers
+      name = :"dist_busy_retry_giveup_#{System.unique_integer([:positive])}"
+      missing = :"group_missing_#{System.unique_integer([:positive])}@127.0.0.1"
+
+      TestCluster.start_group(node_a,
+        name: name,
+        shards: 1,
+        log: false,
+        busy_dist_retry_attempts: 2,
+        busy_dist_retry_interval: 20
+      )
+
+      TestCluster.rpc!(node_a, Group.PeerReconnect, :busy_link, [name, missing])
+
+      TestCluster.assert_eventually(
+        fn ->
+          reconnect_state(node_a, name).retrying == %{}
+        end,
+        timeout: 5_000
+      )
     end
   end
 

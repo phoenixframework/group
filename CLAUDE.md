@@ -115,6 +115,9 @@ After discovery, writes replicate in two stages:
   `replicate_unregister`, `replicate_join`, `replicate_leave`
 - Receiver buffers registry and PG lanes separately, bulk-applies ETS writes,
   then takes a bounded fairness turn for local work
+- Remote shard sends use `send_nosuspend(..., [:noconnect])`; a `false` result
+  force-disconnects that node and enters bounded reconnect retries for that
+  peer only
 
 ### Conflict Resolution
 

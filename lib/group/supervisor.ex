@@ -34,6 +34,12 @@ defmodule Group.Supervisor do
     replicated_sender_flush_interval =
       non_negative_integer_opt(opts, :replicated_sender_flush_interval, 5)
 
+    busy_dist_retry_attempts =
+      non_negative_integer_opt(opts, :busy_dist_retry_attempts, 300)
+
+    busy_dist_retry_interval =
+      positive_integer_opt(opts, :busy_dist_retry_interval, 1_000)
+
     replicated_pg_receiver_local_request_quota =
       positive_integer_opt(opts, :replicated_pg_receiver_local_request_quota, 8)
 
@@ -48,6 +54,8 @@ defmodule Group.Supervisor do
       replicated_registry_receiver_flush_interval: replicated_registry_receiver_flush_interval,
       replicated_sender_buffer_size: replicated_sender_buffer_size,
       replicated_sender_flush_interval: replicated_sender_flush_interval,
+      busy_dist_retry_attempts: busy_dist_retry_attempts,
+      busy_dist_retry_interval: busy_dist_retry_interval,
       replicated_pg_receiver_local_request_quota: replicated_pg_receiver_local_request_quota
     }
 
@@ -62,6 +70,12 @@ defmodule Group.Supervisor do
 
     children = [
       {Group.Replica.Data, name: name, num_shards: num_shards},
+      {
+        Group.PeerReconnect,
+        name: name,
+        busy_dist_retry_attempts: busy_dist_retry_attempts,
+        busy_dist_retry_interval: busy_dist_retry_interval
+      },
       {Group.Replica.Supervisor, name: name, num_shards: num_shards},
       {Registry, keys: :duplicate, name: Group.registry_name(name)},
       {Group.ClusterLease, name: name, num_shards: num_shards}

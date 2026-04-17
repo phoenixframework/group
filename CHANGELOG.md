@@ -1,3 +1,7 @@
+## 0.1.8 (2026-04-17)
+- Use `send_nosuspend` for remote shard sends and add bounded reconnect retries after busy-link disconnects
+  to avoid any single bad link from blocking a shard
+
 ## 0.1.7 (2026-04-17)
 - Fix local shard request reply leaks by using reply aliases and draining any already-delivered timeout replies
 

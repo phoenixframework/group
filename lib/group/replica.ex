@@ -385,6 +385,12 @@ defmodule Group.Replica do
   flush paths until that callback returns; batching and fairness only apply
   between mailbox turns.
 
+  Remote shard sends use `send_nosuspend(..., [:noconnect])`. If a send returns
+  `false`, Group treats that as a degraded link: it drops the unsent message,
+  force-disconnects the Erlang node, and enters a bounded reconnect loop for
+  that node. Recovery only starts from this explicit busy-send path; ordinary
+  `nodedown` events do not start reconnect retries on their own.
+
   ## Replicated Receiver Fairness
 
   Receiver-side batching solves the apply-cost problem for both replicated PG
@@ -529,11 +535,10 @@ defmodule Group.Replica do
     log_once(state, fn -> "#{log_prefix(state)} started (shards=#{num_shards})" end)
 
     # Discover peers on all known nodes
-    registered_name = shard_name(name, shard_index)
-
     for remote_node <- Node.list() do
-      send(
-        {registered_name, remote_node},
+      send_remote_shard_message(
+        state,
+        remote_node,
         {:peer_connect, self(), shard_index, num_shards, Data.my_clusters(name)}
       )
     end
@@ -925,10 +930,10 @@ defmodule Group.Replica do
   def handle_info({:nodeup, remote_node}, state) do
     state = flush_pending_replicated_message_barrier(state)
     %{shard_index: shard, name: name} = state
-    shard_registered_name = shard_name(name, shard)
 
-    send(
-      {shard_registered_name, remote_node},
+    send_remote_shard_message(
+      state,
+      remote_node,
       {:peer_connect, self(), shard, state.num_shards, Data.my_clusters(name)}
     )
 
@@ -1825,11 +1830,10 @@ defmodule Group.Replica do
       "#{log_prefix(state)} cluster_connect #{inspect(clusters)}"
     end)
 
-    shard_name = shard_name(name, state.shard_index)
     peers = Data.cluster_nodes(name, nil) -- [node()]
 
     for target_node <- peers do
-      send({shard_name, target_node}, {:cluster_connect, clusters, self()})
+      send_remote_shard_message(state, target_node, {:cluster_connect, clusters, self()})
     end
 
     {:ok, state}
@@ -2474,22 +2478,18 @@ defmodule Group.Replica do
   end
 
   defp send_replicated_pg_batches(state, ops) do
-    shard_name = shard_name(state.name, state.shard_index)
-
     ops
     |> group_broadcast_ops_by_target(state, &pg_op_cluster/1)
     |> Enum.each(fn {target_node, target_ops} ->
-      send({shard_name, target_node}, {:replicate_pg_batch, target_ops})
+      send_remote_shard_message(state, target_node, {:replicate_pg_batch, target_ops})
     end)
   end
 
   defp send_replicated_registry_batches(state, ops) do
-    shard_name = shard_name(state.name, state.shard_index)
-
     ops
     |> group_broadcast_ops_by_target(state, &registry_op_cluster/1)
     |> Enum.each(fn {target_node, target_ops} ->
-      send({shard_name, target_node}, {:replicate_registry_batch, target_ops})
+      send_remote_shard_message(state, target_node, {:replicate_registry_batch, target_ops})
     end)
   end
 
@@ -2544,15 +2544,25 @@ defmodule Group.Replica do
   defp registry_op_cluster({:unregister, cluster, _key, _pid, _meta, _reason}), do: cluster
 
   defp send_to_peer(state, target_node, message) do
-    shard_name = shard_name(state.name, state.shard_index)
-    send({shard_name, target_node}, message)
+    send_remote_shard_message(state, target_node, message)
   end
 
   defp broadcast_to_peers(state, message) do
+    for {target_node, _pid} <- state.remote_shards do
+      send_remote_shard_message(state, target_node, message)
+    end
+  end
+
+  defp send_remote_shard_message(state, target_node, message) do
     shard_name = shard_name(state.name, state.shard_index)
 
-    for {target_node, _pid} <- state.remote_shards do
-      send({shard_name, target_node}, message)
+    case :erlang.send_nosuspend({shard_name, target_node}, message, [:noconnect]) do
+      true ->
+        :ok
+
+      false ->
+        Group.PeerReconnect.busy_link(state.name, target_node)
+        :ok
     end
   end
 

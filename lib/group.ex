@@ -220,6 +220,11 @@ defmodule Group do
     buffer replicated outbound ops before flushing during idle periods. Sender
     buffers also flush on size, overdue enqueue, and control/routing barriers
     (default: `5`)
+  - `:busy_dist_retry_attempts` — max reconnect attempts after a shard hits
+    `send_nosuspend == false` to a remote node and forces a disconnect
+    (default: `300`)
+  - `:busy_dist_retry_interval` — interval in milliseconds between reconnect
+    attempts after a busy-dist disconnect (default: `1_000`)
   - `:replicated_pg_receiver_local_request_quota` — max queued local PG shard requests
     drained after each replicated PG flush before yielding (default: `8`)
   """
