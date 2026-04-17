@@ -1,3 +1,6 @@
+## 0.1.7 (2026-04-17)
+- Fix local shard request reply leaks by using reply aliases and draining any already-delivered timeout replies
+
 ## 0.1.6 (2026-04-16)
 - Add bounded local PG turn-taking and bulk local PG ETS application
 - Add sender-side replicated registry / PG batching by target node

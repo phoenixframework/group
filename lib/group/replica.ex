@@ -659,7 +659,11 @@ defmodule Group.Replica do
 
   def handle_info({@local_request_tag, caller_pid, ref, request}, state)
       when is_pid(caller_pid) and is_reference(ref) do
-    {:noreply, process_local_request_turn(state, [{caller_pid, ref, request}])}
+    {:noreply, process_local_request_turn(state, [{{:send, caller_pid, ref}, request}])}
+  end
+
+  def handle_info({@local_request_tag, alias_ref, request}, state) when is_reference(alias_ref) do
+    {:noreply, process_local_request_turn(state, [{{:alias, alias_ref}, request}])}
   end
 
   # =====================================================================
@@ -1100,39 +1104,44 @@ defmodule Group.Replica do
   # =====================================================================
 
   defp do_local_request(pid, shard_name, request, :infinity) when is_pid(pid) do
-    ref = make_ref()
+    alias_ref = Process.alias()
     mref = Process.monitor(pid)
-    send(pid, {@local_request_tag, self(), ref, request})
+    send(pid, {@local_request_tag, alias_ref, request})
 
     receive do
-      {@local_reply_tag, ^ref, reply} ->
+      {@local_reply_tag, ^alias_ref, reply} ->
         Process.demonitor(mref, [:flush])
+        Process.unalias(alias_ref)
         reply
 
       {:DOWN, ^mref, :process, ^pid, reason} ->
+        Process.unalias(alias_ref)
         exit({reason, {GenServer, :call, [shard_name, request, :infinity]}})
     end
   end
 
   defp do_local_request(pid, shard_name, request, timeout)
        when is_pid(pid) and is_integer(timeout) do
-    ref = make_ref()
+    alias_ref = Process.alias()
     mref = Process.monitor(pid)
-    send(pid, {@local_request_tag, self(), ref, request})
+    send(pid, {@local_request_tag, alias_ref, request})
 
     receive do
-      {@local_reply_tag, ^ref, reply} ->
+      {@local_reply_tag, ^alias_ref, reply} ->
         Process.demonitor(mref, [:flush])
+        Process.unalias(alias_ref)
         reply
 
       {:DOWN, ^mref, :process, ^pid, reason} ->
+        Process.unalias(alias_ref)
         exit({reason, {GenServer, :call, [shard_name, request, timeout]}})
     after
       timeout ->
         Process.demonitor(mref, [:flush])
+        Process.unalias(alias_ref)
 
         receive do
-          {@local_reply_tag, ^ref, _reply} -> :ok
+          {@local_reply_tag, ^alias_ref, _reply} -> :ok
         after
           0 -> :ok
         end
@@ -1147,9 +1156,14 @@ defmodule Group.Replica do
     :ok
   end
 
+  defp reply_local_request({:alias, alias_ref}, reply) when is_reference(alias_ref) do
+    send(alias_ref, {@local_reply_tag, alias_ref, reply})
+    :ok
+  end
+
   defp process_local_request_turn(
          state,
-         [{_caller_pid, _ref, request} | _] = initial_messages
+         [{_reply_to, request} | _] = initial_messages
        ) do
     remaining =
       case local_request_domain(request) do
@@ -1170,7 +1184,10 @@ defmodule Group.Replica do
     receive do
       {@local_request_tag, caller_pid, ref, request}
       when is_pid(caller_pid) and is_reference(ref) ->
-        collect_local_request_messages([{caller_pid, ref, request} | acc], remaining - 1)
+        collect_local_request_messages([{{:send, caller_pid, ref}, request} | acc], remaining - 1)
+
+      {@local_request_tag, alias_ref, request} when is_reference(alias_ref) ->
+        collect_local_request_messages([{{:alias, alias_ref}, request} | acc], remaining - 1)
     after
       0 ->
         Enum.reverse(acc)
@@ -1196,8 +1213,8 @@ defmodule Group.Replica do
     do_split_local_request_segments(rest, [segment | acc])
   end
 
-  defp take_local_request_segment(message, rest) do
-    if local_request_domain(elem(message, 2)) == :pg do
+  defp take_local_request_segment({_reply_to, request} = message, rest) do
+    if local_request_domain(request) == :pg do
       do_take_local_request_segment(rest, [message])
     else
       {[message], rest}
@@ -1206,7 +1223,7 @@ defmodule Group.Replica do
 
   defp do_take_local_request_segment([], acc), do: {Enum.reverse(acc), []}
 
-  defp do_take_local_request_segment([{_caller_pid, _ref, request} = message | rest], acc) do
+  defp do_take_local_request_segment([{_reply_to, request} = message | rest], acc) do
     if local_request_domain(request) == :pg do
       do_take_local_request_segment(rest, [message | acc])
     else
@@ -1214,7 +1231,7 @@ defmodule Group.Replica do
     end
   end
 
-  defp process_local_request_segment(state, [{_caller_pid, _ref, request} | _] = messages) do
+  defp process_local_request_segment(state, [{_reply_to, request} | _] = messages) do
     case local_request_domain(request) do
       :pg -> process_pg_local_request_batch(state, messages)
       :other -> process_sequential_local_request_messages(state, messages)
@@ -1222,9 +1239,9 @@ defmodule Group.Replica do
   end
 
   defp process_sequential_local_request_messages(state, messages) do
-    Enum.reduce(messages, state, fn {caller_pid, ref, request}, acc_state ->
+    Enum.reduce(messages, state, fn {reply_to, request}, acc_state ->
       {reply, acc_state} = process_local_request_without_barrier(acc_state, request)
-      :ok = reply_local_request({:send, caller_pid, ref}, reply)
+      :ok = reply_local_request(reply_to, reply)
       acc_state
     end)
   end
@@ -1359,7 +1376,7 @@ defmodule Group.Replica do
       Enum.reduce(
         messages,
         {%{}, [], [], [], %{}, MapSet.new()},
-        fn {caller_pid, ref, request},
+        fn {reply_to, request},
            {entries, replies, events, broadcasts, new_monitors, maybe_demonitor_pids} ->
           case request do
             {:join, cluster, key, pid, meta} ->
@@ -1373,7 +1390,7 @@ defmodule Group.Replica do
 
                   {
                     Map.put(entries, member, {initial, {meta, time, local_node}}),
-                    [{{:send, caller_pid, ref}, :ok} | replies],
+                    [{reply_to, :ok} | replies],
                     [
                       build_event(name, :joined, key, pid, meta, %{
                         previous_meta: nil,
@@ -1390,15 +1407,15 @@ defmodule Group.Replica do
                   }
 
                 {old_meta, _time, _node} when old_meta == meta ->
-                  {entries, [{{:send, caller_pid, ref}, :ok} | replies], events, broadcasts,
-                   new_monitors, maybe_demonitor_pids}
+                  {entries, [{reply_to, :ok} | replies], events, broadcasts, new_monitors,
+                   maybe_demonitor_pids}
 
                 {old_meta, _time, _node} ->
                   time = System.system_time()
 
                   {
                     Map.put(entries, member, {initial, {meta, time, local_node}}),
-                    [{{:send, caller_pid, ref}, :ok} | replies],
+                    [{reply_to, :ok} | replies],
                     [
                       build_event(name, :joined, key, pid, meta, %{
                         previous_meta: old_meta,
@@ -1421,13 +1438,13 @@ defmodule Group.Replica do
 
               case current do
                 nil ->
-                  {entries, [{{:send, caller_pid, ref}, {:error, :not_in_group}} | replies],
-                   events, broadcasts, new_monitors, maybe_demonitor_pids}
+                  {entries, [{reply_to, {:error, :not_in_group}} | replies], events, broadcasts,
+                   new_monitors, maybe_demonitor_pids}
 
                 {meta, _time, _node} ->
                   {
                     Map.put(entries, member, {initial, nil}),
-                    [{{:send, caller_pid, ref}, :ok} | replies],
+                    [{reply_to, :ok} | replies],
                     [
                       build_event(name, :left, key, pid, meta, %{reason: :leave, cluster: cluster})
                       | events
@@ -2043,7 +2060,10 @@ defmodule Group.Replica do
     receive do
       {@local_request_tag, caller_pid, ref, request}
       when is_pid(caller_pid) and is_reference(ref) ->
-        process_local_request_turn(state, [{caller_pid, ref, request}])
+        process_local_request_turn(state, [{{:send, caller_pid, ref}, request}])
+
+      {@local_request_tag, alias_ref, request} when is_reference(alias_ref) ->
+        process_local_request_turn(state, [{{:alias, alias_ref}, request}])
     after
       0 ->
         state

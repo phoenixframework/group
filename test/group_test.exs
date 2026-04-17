@@ -966,6 +966,28 @@ defmodule GroupTest do
       end
     end
 
+    test "register timeout does not leak late local reply into caller mailbox" do
+      name = start_single_shard_group()
+      key = "timeout/register/leak/#{System.unique_integer([:positive])}"
+      shard = suspend_only_shard(name)
+
+      try do
+        assert_genserver_call_timeout(fn ->
+          Group.register(name, key, %{}, timeout: 10)
+        end)
+      after
+        resume_shard_if_alive(shard)
+      end
+
+      wait_until(fn ->
+        match?({pid, %{}} when pid == self(), Group.lookup(name, key))
+      end)
+
+      refute_receive {:group_local_reply, _, _}, 50
+
+      assert :ok = Group.unregister(name, key)
+    end
+
     test "unregister honors timeout option" do
       name = start_single_shard_group()
       key = "timeout/unregister/#{System.unique_integer([:positive])}"
