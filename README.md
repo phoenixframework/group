@@ -347,7 +347,7 @@ no longer care about a cluster.
 Shards monitor all registered/joined processes. On `DOWN`, the shard:
 
 1. Removes entries from both the primary and reverse-index ETS tables.
-2. Broadcasts `replicate_unregister` / `replicate_leave` to peer nodes.
+2. Enqueues replicated unregister / leave ops into the sender batching lanes for peer nodes.
 3. Fires `:unregistered` / `:left` events to local monitors.
 
 ### Node Disconnect

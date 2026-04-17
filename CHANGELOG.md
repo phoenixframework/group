@@ -1,3 +1,6 @@
+## 0.2.0 (2026-04-17)
+- remove deprecate message handling
+
 ## 0.1.8 (2026-04-17)
 - Use `send_nosuspend` for remote shard sends and add bounded reconnect retries after busy-link disconnects
   to avoid any single bad link from blocking a shard

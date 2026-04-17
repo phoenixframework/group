@@ -19,15 +19,15 @@ defmodule Group.DistributedTest do
     |> Enum.take(count)
   end
 
-  defp receive_batches_until(expected_event_count, acc \\ []) do
+  defp receive_batches_until(forwarder, expected_event_count, acc \\ []) do
     received = Enum.sum(Enum.map(acc, &length/1))
 
     if received >= expected_event_count do
       Enum.reverse(acc)
     else
       receive do
-        {:got_batch, events} ->
-          receive_batches_until(expected_event_count, [events | acc])
+        {:got_batch, ^forwarder, events} ->
+          receive_batches_until(forwarder, expected_event_count, [events | acc])
       after
         5000 ->
           flunk("timed out waiting for #{expected_event_count} batched events, got #{received}")
@@ -264,15 +264,15 @@ defmodule Group.DistributedTest do
           TestCluster.rpc!(node_b, Group, :members, [name, join_key]) != []
       end)
 
-      TestCluster.spawn_batch_forwarder(node_b, name, :all, self())
-      assert_receive {:monitor_ready, _}, 5000
+      forwarder = TestCluster.spawn_batch_forwarder(node_b, name, :all, self())
+      assert_receive {:monitor_ready, ^forwarder}, 5000
 
       Process.exit(pid, :kill)
 
-      assert_receive {:got_batch, events}, 5000
+      assert_receive {:got_batch, ^forwarder, events}, 5000
       assert Enum.sort(Enum.map(events, & &1.type)) == [:left, :unregistered]
       assert Enum.sort(Enum.map(events, & &1.key)) == Enum.sort([join_key, reg_key])
-      refute_receive {:got_batch, _}, 100
+      refute_receive {:got_batch, ^forwarder, _}, 100
     end
 
     test "process DOWN cleanup batches up to 32 member pids per shard turn" do
@@ -307,12 +307,12 @@ defmodule Group.DistributedTest do
           TestCluster.rpc!(node_b, Group, :member_count, [name, "down_batch_many/"]) == 33
       end)
 
-      TestCluster.spawn_batch_forwarder(node_b, name, :all, self())
-      assert_receive {:monitor_ready, _}, 5000
+      forwarder = TestCluster.spawn_batch_forwarder(node_b, name, :all, self())
+      assert_receive {:monitor_ready, ^forwarder}, 5000
 
       :ok = TestCluster.kill_pids(node_a, pids)
 
-      batches = receive_batches_until(66)
+      batches = receive_batches_until(forwarder, 66)
       batch_sizes = Enum.map(batches, &length/1)
 
       assert Enum.sum(batch_sizes) == 66
@@ -1910,8 +1910,14 @@ defmodule Group.DistributedTest do
       # Wait for A to confirm it saw C go down
       assert_receive {:nodedown_on_remote, ^node_c}, 5000
 
+      # Wait for Group's own peer tables to reflect the partition before writing.
+      TestCluster.assert_eventually(fn ->
+        node_c not in TestCluster.rpc!(node_a, Group, :nodes, [name]) and
+          node_c not in TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])
+      end)
+
       # Register data during partition
-      # flush_shards ensures nodedown is processed before registering
+      # Flush after the write so later assertions observe settled shard state.
       TestCluster.spawn_register(node_a, name, "nil_from_a", %{origin: :a}, flush_shards: 2)
 
       TestCluster.spawn_register_in_cluster(
@@ -3404,7 +3410,7 @@ defmodule Group.DistributedTest do
       assert_received_event(:unregistered, "user/evict", pid_a, :resolve_conflict)
 
       # pid_b should eventually have a :registered event on node A
-      # (from the winner's re-broadcast replicate_register)
+      # (from the winner's re-broadcast registry op)
       assert_received_event(:registered, "user/evict", pid_b)
 
       # ETS consistency
@@ -3458,7 +3464,7 @@ defmodule Group.DistributedTest do
 
       # All 3 :unregistered events should arrive in a single batch
       # (they're on the same shard, processed in one nodedown handler turn)
-      assert_receive {:got_batch, events}, 5000
+      assert_receive {:got_batch, ^forwarder, events}, 5000
       unreg_events = Enum.filter(events, &(&1.type == :unregistered))
       assert length(unreg_events) == 3
       assert Enum.map(unreg_events, & &1.key) |> Enum.sort() == Enum.sort(keys)
@@ -3509,7 +3515,7 @@ defmodule Group.DistributedTest do
       TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
 
       # All 3 :left events should arrive in one batch
-      assert_receive {:got_batch, events}, 5000
+      assert_receive {:got_batch, ^forwarder, events}, 5000
       left_events = Enum.filter(events, &(&1.type == :left))
       assert length(left_events) == 3
       assert Enum.all?(left_events, &(&1.reason == :cluster_disconnect))
@@ -3558,7 +3564,7 @@ defmodule Group.DistributedTest do
       TestCluster.reconnect_nodes(node_a, node_b)
 
       # All 3 :registered events should arrive in a single batch
-      assert_receive {:got_batch, events}, 5000
+      assert_receive {:got_batch, ^forwarder, events}, 5000
       reg_events = Enum.filter(events, &(&1.type == :registered))
       assert length(reg_events) == 3
       assert Enum.map(reg_events, & &1.key) |> Enum.sort() == Enum.sort(keys)
@@ -3602,7 +3608,7 @@ defmodule Group.DistributedTest do
       TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
 
       # All 3 :joined events should arrive in a single batch
-      assert_receive {:got_batch, events}, 5000
+      assert_receive {:got_batch, ^forwarder, events}, 5000
       join_events = Enum.filter(events, &(&1.type == :joined))
       assert length(join_events) == 3
       assert Enum.map(join_events, & &1.key) |> Enum.sort() == Enum.sort(keys)

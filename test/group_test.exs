@@ -2311,19 +2311,20 @@ defmodule GroupTest do
   end
 
   defp replicated_pg_join(cluster, key, pid, meta, reason) do
-    {:replicate_join, cluster, key, pid, meta, System.system_time(), reason}
+    {:replicate_pg_batch,
+     [{:join, cluster, key, pid, meta, System.system_time(), reason, node(pid)}]}
   end
 
   defp replicated_pg_leave(cluster, key, pid, meta, reason) do
-    {:replicate_leave, cluster, key, pid, meta, reason}
+    {:replicate_pg_batch, [{:leave, cluster, key, pid, meta, reason}]}
   end
 
-  defp replicated_register(cluster, key, pid, meta, reason, time \\ System.system_time()) do
-    {:replicate_register, cluster, key, pid, meta, time, reason}
+  defp replicated_register(cluster, key, pid, meta, _reason, time \\ System.system_time()) do
+    {:replicate_registry_batch, [{:register, cluster, key, pid, meta, time, node(pid)}]}
   end
 
   defp replicated_unregister(cluster, key, pid, meta, reason) do
-    {:replicate_unregister, cluster, key, pid, meta, reason}
+    {:replicate_registry_batch, [{:unregister, cluster, key, pid, meta, reason}]}
   end
 
   defp enqueue_replicated_pg_backlog(shard, key_prefix, pid, count) do

@@ -23,10 +23,6 @@ defmodule Group.Replica do
   | `{:peer_connect, pid, shard, num_shards, clusters}`        | A→B (per-shard)| Establish peer relationship      |
   | `{:peer_connect_ack, pid, shard, num_shards, clusters}`    | B→A (per-shard)| Acknowledge peer                 |
   | `{:cluster_state, cluster, reg_data, pg_data}`             | both           | Per-cluster data snapshot        |
-  | `{:replicate_register, cluster, key, pid, meta, time, reason}` | broadcast  | Propagate registration           |
-  | `{:replicate_unregister, cluster, key, pid, meta, reason}` | broadcast      | Propagate unregistration         |
-  | `{:replicate_join, cluster, key, pid, meta, time, reason}` | broadcast      | Propagate join                   |
-  | `{:replicate_leave, cluster, key, pid, meta, reason}`      | broadcast      | Propagate leave                  |
   | `{:replicate_registry_batch, ops}`                         | broadcast      | Propagate batched registry ops   |
   | `{:replicate_pg_batch, ops}`                               | broadcast      | Propagate batched PG ops         |
   | `{:cluster_connect, clusters, pid}`                        | S→remote S     | Node joining named clusters      |
@@ -239,7 +235,7 @@ defmodule Group.Replica do
         ├─ kill pid_a                           ├─ kill pid_a (cross-node, idempotent)
         ├─ delete pid_a entry                   ├─ re-insert pid_b with new timestamp
         ├─ insert pid_b                         └─ re-broadcast pid_b
-        ├─ demonitor pid_a                         {:replicate_register, ...}
+        ├─ demonitor pid_a                         in a registry batch
         ├─ dispatch :unregistered(pid_a)         │──────────────────────────>│
            │                                       │  (arrives as same-pid     │
            │                                       │   update — harmless)      │
@@ -276,9 +272,8 @@ defmodule Group.Replica do
         │── delete_all_for_pid(shard, pid)         │
         │   (scan by_pid, delete from by_key,      │
         │    match_delete from by_pid)             │
-        │── broadcast per cluster:                 │
-        │   {:replicate_unregister, ...}  ────────>│── delete if pid matches
-        │   {:replicate_leave, ...}       ────────>│── delete if pid matches
+        │── enqueue unregister/leave ops           │
+        │   into replicated sender batches  ──────>│── delete if pid matches
         │── demonitor pid                          │
         │── dispatch events                        │
 
@@ -318,11 +313,12 @@ defmodule Group.Replica do
   ## Conflict Resolution is Synchronous
 
   The `:resolve_registry_conflict` callback runs synchronously inside the shard
-  GenServer's `handle_info` (during `replicate_register` or `merge_remote_cluster_data`).
+  GenServer's `handle_info` (during replicated registry apply or
+  `merge_remote_cluster_data`).
   This is intentional: the resolver's return value determines ETS mutations (delete
   loser entry, insert winner, demonitor evicted local pid, re-broadcast winner) that
   must happen atomically within a single `handle_info` turn. Making the resolver async
-  would open a window where another `replicate_register`, `DOWN`, or `cluster_state`
+  would open a window where another replicated registry update, `DOWN`, or `cluster_state`
   for the same key could race with the pending resolution, corrupting the dual-index
   ETS tables.
 
@@ -340,11 +336,10 @@ defmodule Group.Replica do
 
   - **Single local operations** (register, join, leave, unregister): build one
     event, deliver one tuple with one event per matching subscriber.
-  - **Buffered replicated operations** (`replicate_register`,
-    `replicate_unregister`, `replicate_join`, `replicate_leave`, and their
-    batched sender-side wire forms): receiver shards may accumulate several ops
-    before flushing, then deliver one tuple per subscriber containing the
-    ordered events from that flush.
+  - **Buffered replicated operations** (batched replicated registry and PG
+    ops): receiver shards may accumulate several ops before flushing, then
+    deliver one tuple per subscriber containing the ordered events from that
+    flush.
   - **Bulk operations** (nodedown, process DOWN, cluster_disconnect, cluster_state
     merge): accumulate events into a local variable, then deliver one tuple per
     subscriber containing all matching events from that handler turn.
@@ -394,10 +389,9 @@ defmodule Group.Replica do
   ## Replicated Receiver Fairness
 
   Receiver-side batching solves the apply-cost problem for both replicated PG
-  (`replicate_join` / `replicate_leave`) and replicated registry
-  (`replicate_register` / `replicate_unregister`) traffic, but a hot stream in
-  either lane can still monopolize the shard if every completed replication
-  turn is immediately followed by another one.
+  and replicated registry traffic, but a hot stream in either lane can still
+  monopolize the shard if every completed replication turn is immediately
+  followed by another one.
 
   To keep local latency-sensitive writes from sitting behind an unbounded remote
   backlog, the shard gives a bounded local request turn after each completed
@@ -600,50 +594,6 @@ defmodule Group.Replica do
   # =====================================================================
 
   @impl true
-  def handle_info({:replicate_register, cluster, key, pid, meta, time, _reason}, state) do
-    state = flush_pending_replicated_sender_barrier(state)
-
-    {state, flushed?} =
-      enqueue_replicated_registry_op(
-        state,
-        {:register, cluster, key, pid, meta, time, node(pid)}
-      )
-
-    state = if flushed?, do: take_priority_turn(state), else: state
-    {:noreply, state}
-  end
-
-  def handle_info({:replicate_unregister, cluster, key, pid, meta, reason}, state) do
-    state = flush_pending_replicated_sender_barrier(state)
-
-    {state, flushed?} =
-      enqueue_replicated_registry_op(state, {:unregister, cluster, key, pid, meta, reason})
-
-    state = if flushed?, do: take_priority_turn(state), else: state
-    {:noreply, state}
-  end
-
-  def handle_info({:replicate_join, cluster, key, pid, meta, time, reason}, state) do
-    state = flush_pending_replicated_sender_barrier(state)
-
-    {state, flushed?} =
-      enqueue_replicated_pg_op(state, {:join, cluster, key, pid, meta, time, reason, node(pid)})
-
-    state = if flushed?, do: take_priority_turn(state), else: state
-
-    {:noreply, state}
-  end
-
-  def handle_info({:replicate_leave, cluster, key, pid, meta, reason}, state) do
-    state = flush_pending_replicated_sender_barrier(state)
-
-    {state, flushed?} =
-      enqueue_replicated_pg_op(state, {:leave, cluster, key, pid, meta, reason})
-
-    state = if flushed?, do: take_priority_turn(state), else: state
-    {:noreply, state}
-  end
-
   def handle_info({:replicate_registry_batch, ops}, state) do
     state = flush_pending_replicated_sender_barrier(state)
 
@@ -1404,8 +1354,7 @@ defmodule Group.Replica do
                       | events
                     ],
                     [
-                      {cluster, {:replicate_join, cluster, key, pid, meta, time, :join}}
-                      | broadcasts
+                      {:join, cluster, key, pid, meta, time, :join, node(pid)} | broadcasts
                     ],
                     new_monitors,
                     maybe_demonitor_pids
@@ -1429,8 +1378,7 @@ defmodule Group.Replica do
                       | events
                     ],
                     [
-                      {cluster, {:replicate_join, cluster, key, pid, meta, time, :update}}
-                      | broadcasts
+                      {:join, cluster, key, pid, meta, time, :update, node(pid)} | broadcasts
                     ],
                     new_monitors,
                     maybe_demonitor_pids
@@ -1455,8 +1403,7 @@ defmodule Group.Replica do
                       | events
                     ],
                     [
-                      {cluster, {:replicate_leave, cluster, key, pid, meta, :leave}}
-                      | broadcasts
+                      {:leave, cluster, key, pid, meta, :leave} | broadcasts
                     ],
                     new_monitors,
                     MapSet.put(maybe_demonitor_pids, pid)
@@ -1589,56 +1536,25 @@ defmodule Group.Replica do
   end
 
   defp send_local_batch_broadcasts(state, broadcasts) do
-    Enum.reduce(Enum.reverse(broadcasts), state, fn {_cluster, message}, acc_state ->
-      enqueue_broadcast_message(acc_state, message)
+    Enum.reduce(Enum.reverse(broadcasts), state, fn op, acc_state ->
+      enqueue_broadcast_op(acc_state, op)
     end)
   end
 
-  defp enqueue_broadcast_message(
+  defp enqueue_broadcast_op(state, {:register, _cluster, _key, _pid, _meta, _time, _node} = op),
+    do: enqueue_replicated_registry_broadcast(state, op)
+
+  defp enqueue_broadcast_op(state, {:unregister, _cluster, _key, _pid, _meta, _reason} = op),
+    do: enqueue_replicated_registry_broadcast(state, op)
+
+  defp enqueue_broadcast_op(
          state,
-         {:replicate_register, _cluster, _key, _pid, _meta, _time, _reason} = message
-       ) do
-    enqueue_replicated_registry_broadcast(state, registry_broadcast_message_to_op(message))
-  end
+         {:join, _cluster, _key, _pid, _meta, _time, _reason, _node} = op
+       ),
+       do: enqueue_replicated_pg_broadcast(state, op)
 
-  defp enqueue_broadcast_message(
-         state,
-         {:replicate_unregister, _cluster, _key, _pid, _meta, _reason} = message
-       ) do
-    enqueue_replicated_registry_broadcast(state, registry_broadcast_message_to_op(message))
-  end
-
-  defp enqueue_broadcast_message(
-         state,
-         {:replicate_join, _cluster, _key, _pid, _meta, _time, _reason} = message
-       ) do
-    enqueue_replicated_pg_broadcast(state, pg_broadcast_message_to_op(message))
-  end
-
-  defp enqueue_broadcast_message(
-         state,
-         {:replicate_leave, _cluster, _key, _pid, _meta, _reason} = message
-       ) do
-    enqueue_replicated_pg_broadcast(state, pg_broadcast_message_to_op(message))
-  end
-
-  defp registry_broadcast_message_to_op(
-         {:replicate_register, cluster, key, pid, meta, time, _reason}
-       ) do
-    {:register, cluster, key, pid, meta, time, node(pid)}
-  end
-
-  defp registry_broadcast_message_to_op({:replicate_unregister, cluster, key, pid, meta, reason}) do
-    {:unregister, cluster, key, pid, meta, reason}
-  end
-
-  defp pg_broadcast_message_to_op({:replicate_join, cluster, key, pid, meta, time, reason}) do
-    {:join, cluster, key, pid, meta, time, reason, node(pid)}
-  end
-
-  defp pg_broadcast_message_to_op({:replicate_leave, cluster, key, pid, meta, reason}) do
-    {:leave, cluster, key, pid, meta, reason}
-  end
+  defp enqueue_broadcast_op(state, {:leave, _cluster, _key, _pid, _meta, _reason} = op),
+    do: enqueue_replicated_pg_broadcast(state, op)
 
   defp reply_local_requests(replies) do
     Enum.each(Enum.reverse(replies), fn {reply_to, reply} ->
@@ -1861,8 +1777,6 @@ defmodule Group.Replica do
     {:ok, state}
   end
 
-  defp enqueue_replicated_pg_op(state, op), do: enqueue_replicated_pg_ops(state, [op])
-
   defp enqueue_replicated_pg_ops(state, ops) do
     state = flush_pending_replicated_registry_barrier(state)
     Enum.each(ops, &log_replicated_pg_op(state, &1))
@@ -1893,8 +1807,6 @@ defmodule Group.Replica do
       {state, false}
     end
   end
-
-  defp enqueue_replicated_registry_op(state, op), do: enqueue_replicated_registry_ops(state, [op])
 
   defp enqueue_replicated_registry_ops(state, ops) do
     state = flush_pending_replicated_pg_barrier(state)
@@ -2896,11 +2808,7 @@ defmodule Group.Replica do
         {
           Map.put(entries, entry, {initial, {local_pid, local_meta, time, node(local_pid)}}),
           events,
-          [
-            {cluster,
-             {:replicate_register, cluster, key, local_pid, local_meta, time, :resolve_conflict}}
-            | broadcasts
-          ],
+          [{:register, cluster, key, local_pid, local_meta, time, node(local_pid)} | broadcasts],
           maybe_demonitor_pids
         }
 
@@ -2914,11 +2822,7 @@ defmodule Group.Replica do
         {
           Map.put(entries, entry, {initial, nil}),
           [event | events],
-          [
-            {cluster,
-             {:replicate_unregister, cluster, key, local_pid, local_meta, :resolve_conflict}}
-            | broadcasts
-          ],
+          [{:unregister, cluster, key, local_pid, local_meta, :resolve_conflict} | broadcasts],
           MapSet.put(maybe_demonitor_pids, local_pid)
         }
     end
@@ -2962,7 +2866,7 @@ defmodule Group.Replica do
 
         # Dispatch lifecycle events so monitors see the eviction.
         # The :registered event for remote_pid will arrive via the winner's
-        # re-broadcast (replicate_register), so we only dispatch :unregistered here.
+        # re-broadcast registry op, so we only dispatch :unregistered here.
         event =
           build_event(name, :unregistered, key, local_pid, local_meta, %{
             reason: :resolve_conflict,

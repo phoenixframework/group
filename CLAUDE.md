@@ -111,8 +111,6 @@ After discovery, writes replicate in two stages:
 - nil cluster: uses `state.remote_shards` map
 - Named clusters: uses `cluster_nodes` ETS table
 - Sender batches: `replicate_registry_batch`, `replicate_pg_batch`
-- Legacy per-op receive shapes still exist locally: `replicate_register`,
-  `replicate_unregister`, `replicate_join`, `replicate_leave`
 - Receiver buffers registry and PG lanes separately, bulk-applies ETS writes,
   then takes a bounded fairness turn for local work
 - Remote shard sends use `send_nosuspend(..., [:noconnect])`; a `false` result
@@ -121,7 +119,7 @@ After discovery, writes replicate in two stages:
 
 ### Conflict Resolution
 
-`resolve_conflict/6` handles ALL registry key conflicts (live `replicate_register` AND partition heal `merge_remote_cluster_data`).
+`resolve_conflict/6` handles ALL registry key conflicts (live replicated registry ops AND partition heal `merge_remote_cluster_data`).
 
 - Default resolver: most recent timestamp wins; pid ordering tiebreaker on equal timestamps
 - **Tiebreaker MUST be deterministic across all nodes**: `time2 > time1 or (time2 == time1 and pid2 > pid1)`. Using `>=` causes mutual kill.

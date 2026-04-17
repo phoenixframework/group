@@ -72,9 +72,9 @@ defmodule Group.TestCluster do
   Waits for the registration to complete before returning.
 
   Options:
-    - `flush_shards: num_shards` — after registering, flush the target shard
-      with `:sys.get_state` to ensure any pending nodedown or replicate messages
-      have been processed.
+    - `flush_shards: num_shards` — after the registration completes, flush the
+      target shard with `:sys.get_state` so later assertions observe settled
+      shard state. This does not act as a pre-write barrier.
   "
   def spawn_register(node, name, key, meta, opts \\ []) do
     :erpc.call(node, fn ->
@@ -168,7 +168,7 @@ defmodule Group.TestCluster do
   end
 
   @doc "Like spawn_monitor_forwarder, but preserves batch structure.
-  Sends `{:got_batch, events}` per received `{:group, events, info}` message."
+  Sends `{:got_batch, pid, events}` per received `{:group, events, info}` message."
   def spawn_batch_forwarder(node, name, pattern, target_pid, opts \\ []) do
     :erpc.call(node, fn ->
       spawn(fn ->
@@ -182,7 +182,7 @@ defmodule Group.TestCluster do
   defp forward_batches(target_pid) do
     receive do
       {:group, events, _info} ->
-        send(target_pid, {:got_batch, events})
+        send(target_pid, {:got_batch, self(), events})
         forward_batches(target_pid)
     after
       30_000 -> :ok
