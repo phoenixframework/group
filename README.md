@@ -115,7 +115,11 @@ Send a message to all members of a key:
 
 ```elixir
 :ok = Group.dispatch(:my_app, "chat/room/42", {:new_message, "hello"})
+:ok = Group.dispatch(:my_app, "chat/room/42", {:new_message, "hello"}, cluster: "servers_123")
 ```
+
+Compared to `Phoenix.PubSub`, `dispatch` only broadcasts to nodes with at least
+one subscription and can also be tailored to a given cluster.
 
 ### Named Clusters
 
