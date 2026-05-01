@@ -41,6 +41,14 @@ defmodule Group.DistributedTest do
     TestCluster.rpc!(node, :sys, :get_state, [Group.PeerReconnect.reconnect_name(name)])
   end
 
+  defp spawn_join_message_forwarder(node, name, key, meta, target_pid, opts \\ []) do
+    TestCluster.spawn_join_message_forwarder(node, name, key, meta, target_pid, opts)
+  end
+
+  defp spawn_join_members_forwarder(node, name, key, meta, target_pid, opts \\ []) do
+    TestCluster.spawn_join_members_forwarder(node, name, key, meta, target_pid, opts)
+  end
+
   describe "registration replication" do
     test "register replicates to other nodes" do
       peers = TestCluster.start_peers(2)
@@ -104,6 +112,175 @@ defmodule Group.DistributedTest do
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_b, Group, :members, [name, "room/1"]) == []
       end)
+    end
+  end
+
+  describe "dispatch and broadcast" do
+    test "broadcast reaches remote local member before join replication reaches sender" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_broadcast_#{System.unique_integer([:positive])}"
+      num_shards = 2
+      opts = [name: name, shards: num_shards]
+      key = "broadcast/race/#{System.unique_integer([:positive])}"
+      shard = :erlang.phash2({nil, key}, num_shards)
+      shard_name = shard_name(name, shard)
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+      end)
+
+      :ok = TestCluster.rpc!(node_a, :sys, :suspend, [shard_name])
+
+      try do
+        member =
+          spawn_join_message_forwarder(node_b, name, key, %{role: :listener}, self())
+
+        assert_receive {:join_forwarder_ready, ^member}, 5_000
+        assert TestCluster.rpc!(node_a, Group, :members, [name, key]) == []
+
+        :ok = TestCluster.rpc!(node_a, Group, :broadcast, [name, key, {:broadcast_race, key}])
+        refute_receive {:group_message, ^member, {:broadcast_race, ^key}}, 100
+        TestCluster.rpc!(node_a, :sys, :resume, [shard_name])
+        assert_receive {:group_message, ^member, {:broadcast_race, ^key}}, 5_000
+      after
+        TestCluster.rpc!(node_a, :sys, :resume, [shard_name])
+      end
+    end
+
+    test "dispatch remote lookup catches member that raced sender replication" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_dispatch_lookup_#{System.unique_integer([:positive])}"
+      num_shards = 2
+      opts = [name: name, shards: num_shards]
+      key = "dispatch/race/#{System.unique_integer([:positive])}"
+      shard = :erlang.phash2({nil, key}, num_shards)
+      shard_name = shard_name(name, shard)
+
+      start_group_on_peers(peers, opts)
+
+      first =
+        spawn_join_message_forwarder(node_b, name, key, %{order: 1}, self())
+
+      assert_receive {:join_forwarder_ready, ^first}, 5_000
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :members, [name, key]) == [{first, %{order: 1}}]
+      end)
+
+      :ok = TestCluster.rpc!(node_a, :sys, :suspend, [shard_name])
+
+      try do
+        second =
+          spawn_join_message_forwarder(node_b, name, key, %{order: 2}, self())
+
+        assert_receive {:join_forwarder_ready, ^second}, 5_000
+        assert TestCluster.rpc!(node_a, Group, :members, [name, key]) == [{first, %{order: 1}}]
+
+        :ok = TestCluster.rpc!(node_a, Group, :dispatch, [name, key, {:dispatch_race, key}])
+        refute_receive {:group_message, ^first, {:dispatch_race, ^key}}, 100
+        refute_receive {:group_message, ^second, {:dispatch_race, ^key}}, 100
+        TestCluster.rpc!(node_a, :sys, :resume, [shard_name])
+        assert_receive {:group_message, ^first, {:dispatch_race, ^key}}, 5_000
+        assert_receive {:group_message, ^second, {:dispatch_race, ^key}}, 5_000
+      after
+        TestCluster.rpc!(node_a, :sys, :resume, [shard_name])
+      end
+    end
+
+    test "broadcast delivery waits for receiver replica shard causal barrier" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_broadcast_dispatcher_#{System.unique_integer([:positive])}"
+      num_shards = 2
+      opts = [name: name, shards: num_shards]
+      key = "broadcast/dispatcher/#{System.unique_integer([:positive])}"
+      shard = :erlang.phash2({nil, key}, num_shards)
+      receiver_shard_name = shard_name(name, shard)
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+      end)
+
+      member =
+        spawn_join_message_forwarder(node_b, name, key, %{role: :listener}, self())
+
+      assert_receive {:join_forwarder_ready, ^member}, 5_000
+
+      :ok = TestCluster.rpc!(node_b, :sys, :suspend, [receiver_shard_name])
+
+      try do
+        :ok =
+          TestCluster.rpc!(node_a, Group, :broadcast, [name, key, {:broadcast_dispatcher, key}])
+
+        refute_receive {:group_message, ^member, {:broadcast_dispatcher, ^key}}, 100
+        TestCluster.rpc!(node_b, :sys, :resume, [receiver_shard_name])
+        assert_receive {:group_message, ^member, {:broadcast_dispatcher, ^key}}, 5_000
+      after
+        TestCluster.rpc!(node_b, :sys, :resume, [receiver_shard_name])
+      end
+    end
+
+    test "broadcast handler sees source membership after source join returned" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"dist_broadcast_causal_#{System.unique_integer([:positive])}"
+      num_shards = 2
+      opts = [name: name, shards: num_shards]
+      key = "broadcast/causal/#{System.unique_integer([:positive])}"
+      shard = :erlang.phash2({nil, key}, num_shards)
+      receiver_shard_name = shard_name(name, shard)
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+      end)
+
+      receiver =
+        spawn_join_members_forwarder(node_b, name, key, %{role: :receiver}, self())
+
+      assert_receive {:join_forwarder_ready, ^receiver}, 5_000
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :members, [name, key]) == [
+          {receiver, %{role: :receiver}}
+        ]
+      end)
+
+      :ok = TestCluster.rpc!(node_b, :sys, :suspend, [receiver_shard_name])
+
+      try do
+        source_member = TestCluster.spawn_join(node_a, name, key, %{role: :source})
+
+        assert TestCluster.rpc!(node_b, Group, :members, [name, key]) == [
+                 {receiver, %{role: :receiver}}
+               ]
+
+        :ok = TestCluster.rpc!(node_a, Group, :broadcast, [name, key, {:broadcast_causal, key}])
+        refute_receive {:group_message_members, ^receiver, {:broadcast_causal, ^key}, _}, 100
+        TestCluster.rpc!(node_b, :sys, :resume, [receiver_shard_name])
+
+        assert_receive {:group_message_members, ^receiver, {:broadcast_causal, ^key}, members},
+                       5_000
+
+        assert {source_member, %{role: :source}} in members
+      after
+        TestCluster.rpc!(node_b, :sys, :resume, [receiver_shard_name])
+      end
     end
   end
 

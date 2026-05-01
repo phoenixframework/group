@@ -124,6 +124,60 @@ defmodule Group.TestCluster do
     end)
   end
 
+  def spawn_join_message_forwarder(node, name, key, meta, target_pid, opts \\ []) do
+    :erpc.call(node, __MODULE__, :do_spawn_join_message_forwarder, [
+      name,
+      key,
+      meta,
+      target_pid,
+      opts
+    ])
+  end
+
+  @doc false
+  def do_spawn_join_message_forwarder(name, key, meta, target_pid, opts) do
+    spawn(fn ->
+      :ok = Group.join(name, key, meta, opts)
+      send(target_pid, {:join_forwarder_ready, self()})
+      forward_group_messages(target_pid)
+    end)
+  end
+
+  def spawn_join_members_forwarder(node, name, key, meta, target_pid, opts \\ []) do
+    :erpc.call(node, __MODULE__, :do_spawn_join_members_forwarder, [
+      name,
+      key,
+      meta,
+      target_pid,
+      opts
+    ])
+  end
+
+  @doc false
+  def do_spawn_join_members_forwarder(name, key, meta, target_pid, opts) do
+    spawn(fn ->
+      :ok = Group.join(name, key, meta, opts)
+      send(target_pid, {:join_forwarder_ready, self()})
+      forward_group_messages_with_members(name, key, target_pid)
+    end)
+  end
+
+  defp forward_group_messages_with_members(name, key, target_pid) do
+    receive do
+      message ->
+        send(target_pid, {:group_message_members, self(), message, Group.members(name, key)})
+        forward_group_messages_with_members(name, key, target_pid)
+    end
+  end
+
+  defp forward_group_messages(target_pid) do
+    receive do
+      message ->
+        send(target_pid, {:group_message, self(), message})
+        forward_group_messages(target_pid)
+    end
+  end
+
   @doc "Spawn a process on a remote node that registers, joins, and sleeps forever.
   Waits for both operations to complete before returning."
   def spawn_register_and_join(node, name, reg_key, reg_meta, join_key, join_meta) do
@@ -381,7 +435,7 @@ defmodule Group.TestCluster do
       for shard <- 0..(num_shards - 1) do
         shard_name = :"#{name}_replica_#{shard}"
         ref = make_ref()
-        send(shard_name, {:group_dispatch, [self()], {:test_cluster_flush_ack, ref}})
+        send(shard_name, {:group_flush_barrier, [self()], {:test_cluster_flush_ack, ref}})
 
         receive do
           {:test_cluster_flush_ack, ^ref} -> :ok

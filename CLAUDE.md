@@ -165,7 +165,11 @@ Keys ending with `"/"` are rejected by `validate_key!/1` in register/unregister/
 
 ### Dispatch
 
-`dispatch/4` sends to all members (registry + PG). Groups remote PG members by node, sends one `{:group_dispatch, pids, message}` per remote node (O(nodes) not O(members)). Target shard chosen by `phash2(self(), num_shards)` for per-sender ordering.
+`dispatch/4` sends to members in the local replicated view (registry + PG) for the selected cluster/key. It routes through the source owning shard, which flushes pending replication before sending one `{:group_dispatch, cluster, key, message}` to each target node's owning shard. The receiver shard flushes pending replication before forwarding to its per-shard dispatcher for fresh local lookup and delivery.
+
+`broadcast/4` uses the same causal shard path, but targets every peer node in the selected cluster rather than only nodes visible in the local member view. This is the Phoenix.PubSub-style fan-out path.
+
+Delivery is asynchronous: both APIs return after enqueueing work on the local owning shard, not after recipients process the message. Per-{cluster, key} causality is favored over the old per-sender cross-key ordering because the source barrier must be the selected cluster/key's owning shard. The default cluster and named clusters are independent routing and causality scopes.
 
 `dispatch_local/4` skips cross-node messaging.
 

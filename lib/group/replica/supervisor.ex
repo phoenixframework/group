@@ -14,13 +14,19 @@ defmodule Group.Replica.Supervisor do
     num_shards = Keyword.fetch!(opts, :num_shards)
 
     children =
-      for i <- 0..(num_shards - 1) do
-        %{
-          id: {Group.Replica, i},
-          start:
-            {Group.Replica, :start_link, [[name: name, shard_index: i, num_shards: num_shards]]}
-        }
-      end
+      Enum.flat_map(0..(num_shards - 1), fn i ->
+        [
+          %{
+            id: {Group.Dispatcher, i},
+            start: {Group.Dispatcher, :start_link, [[name: name, shard_index: i]]}
+          },
+          %{
+            id: {Group.Replica, i},
+            start:
+              {Group.Replica, :start_link, [[name: name, shard_index: i, num_shards: num_shards]]}
+          }
+        ]
+      end)
 
     Supervisor.init(children, strategy: :one_for_one)
   end
