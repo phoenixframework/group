@@ -797,7 +797,8 @@ defmodule Group do
     if String.ends_with?(group, "/") do
       Data.pg_count_by_prefix(name, num_shards, cluster, group)
     else
-      Data.pg_count(name, num_shards, cluster, group)
+      shard = Replica.shard_index_for(cluster, group, num_shards)
+      Data.pg_count(name, shard, cluster, group)
     end
   end
 
@@ -831,7 +832,8 @@ defmodule Group do
     if String.ends_with?(group, "/") do
       Data.local_pg_count_by_prefix(name, num_shards, cluster, group)
     else
-      Data.local_pg_count(name, num_shards, cluster, group)
+      shard = Replica.shard_index_for(cluster, group, num_shards)
+      Data.local_pg_count(name, shard, cluster, group)
     end
   end
 

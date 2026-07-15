@@ -1850,6 +1850,52 @@ defmodule GroupTest do
   end
 
   describe "local_member_count/2" do
+    test "exact member counts query only the owning shard", %{name: name} do
+      num_shards = Group.get_config(name).num_shards
+      target_shard = num_shards - 1
+
+      key =
+        Stream.iterate(0, &(&1 + 1))
+        |> Stream.map(&"count/exact/#{&1}")
+        |> Enum.find(fn key ->
+          Group.Replica.shard_index_for(nil, key, num_shards) == target_shard
+        end)
+
+      :ok = Group.join(name, key, %{})
+      expected_table = Group.Replica.Data.pg_by_key_table(name, target_shard)
+      parent = self()
+
+      :erlang.trace_pattern({:ets, :select_count, 2}, true, [:local])
+
+      on_exit(fn ->
+        :erlang.trace_pattern({:ets, :select_count, 2}, false, [:local])
+      end)
+
+      checks = [
+        total: fn -> Group.member_count(name, key) end,
+        local: fn -> Group.local_member_count(name, key) end
+      ]
+
+      for {kind, check} <- checks do
+        worker =
+          spawn(fn ->
+            receive do
+              :count -> send(parent, {:count_result, kind, check.()})
+            end
+          end)
+
+        :erlang.trace(worker, true, [:call])
+        send(worker, :count)
+
+        assert_receive {:trace, ^worker, :call,
+                        {:ets, :select_count, [^expected_table, _match_spec]}},
+                       1_000
+
+        assert_receive {:count_result, ^kind, 1}, 1_000
+        refute_receive {:trace, ^worker, :call, {:ets, :select_count, _args}}, 20
+      end
+    end
+
     test "counts local group members", %{name: name} do
       group = "my_group"
       assert Group.local_member_count(name, group) == 0

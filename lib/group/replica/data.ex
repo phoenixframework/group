@@ -637,17 +637,12 @@ defmodule Group.Replica.Data do
     end)
   end
 
-  def pg_count(name, num_shards, cluster, key) do
-    Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
-      table = pg_by_key_table(name, shard)
+  def pg_count(name, shard, cluster, key) do
+    table = pg_by_key_table(name, shard)
 
-      count =
-        :ets.select_count(table, [
-          {{{cluster, key, :_}, :_, :_, :_}, [], [true]}
-        ])
-
-      acc + count
-    end)
+    :ets.select_count(table, [
+      {{{cluster, key, :_}, :_, :_, :_}, [], [true]}
+    ])
   end
 
   def pg_count_by_prefix(name, num_shards, cluster, prefix) do
@@ -693,19 +688,13 @@ defmodule Group.Replica.Data do
     end)
   end
 
-  def local_pg_count(name, num_shards, cluster, key) do
+  def local_pg_count(name, shard, cluster, key) do
     local_node = node()
+    table = pg_by_key_table(name, shard)
 
-    Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
-      table = pg_by_key_table(name, shard)
-
-      count =
-        :ets.select_count(table, [
-          {{{cluster, key, :_}, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
-        ])
-
-      acc + count
-    end)
+    :ets.select_count(table, [
+      {{{cluster, key, :_}, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
+    ])
   end
 
   def local_pg_present?(name, num_shards, cluster) do
