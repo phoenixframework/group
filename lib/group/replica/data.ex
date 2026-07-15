@@ -750,15 +750,11 @@ defmodule Group.Replica.Data do
   end
 
   def add_cluster_node(name, cluster, node) do
-    :ets.insert(cluster_nodes_table(name), {cluster, node})
-    :ets.insert(node_clusters_table(name), {node, cluster})
-    :ok
+    GenServer.call(data_name(name), {:add_cluster_node, cluster, node}, :infinity)
   end
 
   def remove_cluster_node(name, cluster, node) do
-    :ets.delete_object(cluster_nodes_table(name), {cluster, node})
-    :ets.delete_object(node_clusters_table(name), {node, cluster})
-    :ok
+    GenServer.call(data_name(name), {:remove_cluster_node, cluster, node}, :infinity)
   end
 
   def all_clusters(name) do
@@ -772,15 +768,7 @@ defmodule Group.Replica.Data do
   end
 
   def purge_cluster_node(name, dead_node) do
-    reverse = node_clusters_table(name)
-    forward = cluster_nodes_table(name)
-
-    for {^dead_node, cluster} <- :ets.lookup(reverse, dead_node) do
-      :ets.delete_object(forward, {cluster, dead_node})
-    end
-
-    :ets.delete(reverse, dead_node)
-    :ok
+    GenServer.call(data_name(name), {:purge_cluster_node, dead_node}, :infinity)
   end
 
   # =====================================================================
@@ -833,6 +821,30 @@ defmodule Group.Replica.Data do
   # =====================================================================
   # GenServer callbacks
   # =====================================================================
+
+  @impl true
+  def handle_call({:add_cluster_node, cluster, node}, _from, state) do
+    :ets.insert(cluster_nodes_table(state.name), {cluster, node})
+    :ets.insert(node_clusters_table(state.name), {node, cluster})
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:remove_cluster_node, cluster, node}, _from, state) do
+    :ets.delete_object(cluster_nodes_table(state.name), {cluster, node})
+    :ets.delete_object(node_clusters_table(state.name), {node, cluster})
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:purge_cluster_node, dead_node}, _from, state) do
+    # Scan the forward index directly so this also repairs a one-sided row left
+    # by an interrupted or older dual-index mutation.
+    :ets.select_delete(cluster_nodes_table(state.name), [
+      {{:_, dead_node}, [], [true]}
+    ])
+
+    :ets.delete(node_clusters_table(state.name), dead_node)
+    {:reply, :ok, state}
+  end
 
   @impl true
   def init({name, num_shards}) do

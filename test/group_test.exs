@@ -568,6 +568,51 @@ defmodule GroupTest do
   end
 
   describe "named clusters" do
+    test "purging a node removes a forward-only membership row", %{name: name} do
+      cluster = "orphaned/#{System.unique_integer([:positive])}"
+      dead_node = :"dead_#{System.unique_integer([:positive])}@127.0.0.1"
+      forward = Group.Replica.Data.cluster_nodes_table(name)
+      reverse = Group.Replica.Data.node_clusters_table(name)
+
+      :ok = Group.Replica.Data.add_cluster_node(name, cluster, dead_node)
+
+      # Reproduce the one-sided state possible when add/remove/purge operations
+      # on the two public ETS indexes interleave.
+      :ets.delete_object(reverse, {dead_node, cluster})
+      assert {cluster, dead_node} in :ets.lookup(forward, cluster)
+      assert :ets.lookup(reverse, dead_node) == []
+
+      :ok = Group.Replica.Data.purge_cluster_node(name, dead_node)
+
+      refute {cluster, dead_node} in :ets.lookup(forward, cluster)
+      assert :ets.lookup(reverse, dead_node) == []
+    end
+
+    test "concurrent membership mutations keep both indexes consistent", %{name: name} do
+      cluster = "concurrent/#{System.unique_integer([:positive])}"
+      remote_node = :"remote_#{System.unique_integer([:positive])}@127.0.0.1"
+      forward = Group.Replica.Data.cluster_nodes_table(name)
+      reverse = Group.Replica.Data.node_clusters_table(name)
+
+      1..200
+      |> Task.async_stream(
+        fn i ->
+          if rem(i, 2) == 0 do
+            Group.Replica.Data.add_cluster_node(name, cluster, remote_node)
+          else
+            Group.Replica.Data.remove_cluster_node(name, cluster, remote_node)
+          end
+        end,
+        max_concurrency: 20,
+        ordered: false
+      )
+      |> Stream.run()
+
+      forward? = {cluster, remote_node} in :ets.lookup(forward, cluster)
+      reverse? = {remote_node, cluster} in :ets.lookup(reverse, remote_node)
+      assert forward? == reverse?
+    end
+
     test "connect/disconnect/connected? manage cluster lifecycle", %{name: name} do
       cluster = "game_servers"
 
