@@ -491,6 +491,22 @@ defmodule Group.Replica do
     end
   end
 
+  @doc false
+  def local_request_all(shard_names, request, timeout)
+      when is_list(shard_names) and (is_integer(timeout) or timeout == :infinity) do
+    requests = Enum.map(shard_names, &start_local_request(&1, request, timeout))
+
+    try do
+      Enum.each(requests, fn pending ->
+        :ok = await_local_request(pending, timeout)
+      end)
+    after
+      Enum.each(requests, &cancel_local_request/1)
+    end
+
+    :ok
+  end
+
   # =====================================================================
   # GenServer callbacks
   # =====================================================================
@@ -1057,6 +1073,71 @@ defmodule Group.Replica do
   # =====================================================================
   # Internal helpers
   # =====================================================================
+
+  defp start_local_request(shard_name, request, timeout) do
+    case GenServer.whereis(shard_name) do
+      nil ->
+        {:noproc, shard_name, request, timeout}
+
+      pid ->
+        alias_ref = Process.alias()
+        mref = Process.monitor(pid)
+        send(pid, {@local_request_tag, alias_ref, request})
+        {:pending, pid, shard_name, request, alias_ref, mref}
+    end
+  end
+
+  defp await_local_request({:noproc, shard_name, request, timeout}, _wait_timeout) do
+    exit({:noproc, {GenServer, :call, [shard_name, request, timeout]}})
+  end
+
+  defp await_local_request(
+         {:pending, pid, shard_name, request, alias_ref, mref},
+         :infinity
+       ) do
+    receive do
+      {@local_reply_tag, ^alias_ref, reply} ->
+        cancel_local_request({:pending, pid, shard_name, request, alias_ref, mref})
+        reply
+
+      {:DOWN, ^mref, :process, ^pid, reason} ->
+        Process.unalias(alias_ref)
+        exit({reason, {GenServer, :call, [shard_name, request, :infinity]}})
+    end
+  end
+
+  defp await_local_request(
+         {:pending, pid, shard_name, request, alias_ref, mref} = pending,
+         timeout
+       )
+       when is_integer(timeout) do
+    receive do
+      {@local_reply_tag, ^alias_ref, reply} ->
+        cancel_local_request(pending)
+        reply
+
+      {:DOWN, ^mref, :process, ^pid, reason} ->
+        Process.unalias(alias_ref)
+        exit({reason, {GenServer, :call, [shard_name, request, timeout]}})
+    after
+      timeout ->
+        cancel_local_request(pending)
+        exit({:timeout, {GenServer, :call, [shard_name, request, timeout]}})
+    end
+  end
+
+  defp cancel_local_request({:noproc, _shard_name, _request, _timeout}), do: :ok
+
+  defp cancel_local_request({:pending, _pid, _shard_name, _request, alias_ref, mref}) do
+    Process.demonitor(mref, [:flush])
+    Process.unalias(alias_ref)
+
+    receive do
+      {@local_reply_tag, ^alias_ref, _reply} -> :ok
+    after
+      0 -> :ok
+    end
+  end
 
   defp do_local_request(pid, shard_name, request, :infinity) when is_pid(pid) do
     alias_ref = Process.alias()

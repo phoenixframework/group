@@ -1178,6 +1178,36 @@ defmodule GroupTest do
         resume_shard_if_alive(shard)
       end
     end
+
+    test "disconnect timeout still fans cleanup out to every shard" do
+      name = :"test_disconnect_timeout_#{System.unique_integer([:positive])}"
+      cluster = "timeout_cluster"
+      start_supervised!({Group, name: name, shards: 2, log: false})
+
+      key =
+        Stream.iterate(0, &(&1 + 1))
+        |> Stream.map(&"timeout/shard-one/#{&1}")
+        |> Enum.find(fn key -> Group.Replica.shard_index_for(cluster, key, 2) == 1 end)
+
+      assert :ok = Group.connect(name, cluster)
+      assert :ok = Group.join(name, key, %{}, cluster: cluster)
+      assert Group.members(name, key, cluster: cluster) == [{self(), %{}}]
+
+      shard_zero = Group.Replica.shard_name(name, 0)
+      :ok = :sys.suspend(shard_zero)
+
+      try do
+        assert_genserver_call_timeout(fn ->
+          Group.disconnect(name, cluster, timeout: 10)
+        end)
+      after
+        resume_shard_if_alive(shard_zero)
+      end
+
+      :sys.get_state(shard_zero)
+      refute Group.connected?(name, cluster)
+      assert Group.members(name, key, cluster: cluster) == []
+    end
   end
 
   describe "local request fairness" do

@@ -1037,15 +1037,13 @@ defmodule Group do
 
     num_shards = get_config(name).num_shards
 
-    for i <- 0..(num_shards - 1) do
-      Replica.local_request(
-        Replica.shard_name(name, i),
-        {:cluster_disconnect, clusters},
-        timeout
-      )
-    end
+    shard_names = for i <- 0..(num_shards - 1), do: Replica.shard_name(name, i)
 
-    :ok
+    Replica.local_request_all(
+      shard_names,
+      {:cluster_disconnect, clusters},
+      timeout
+    )
   end
 
   # ===========================================================================
