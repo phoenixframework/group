@@ -174,6 +174,17 @@ defmodule GroupTest do
       assert meta == %{module: :test}
     end
 
+    test "lookup propagates ArgumentError from metadata extraction", %{name: name} do
+      key = "user/extractor-error/#{System.unique_integer([:positive])}"
+      :ok = Group.register(name, key, %{module: :test})
+
+      assert_raise ArgumentError, "extractor failed", fn ->
+        Group.lookup(name, key,
+          extract_meta: fn _meta -> raise ArgumentError, "extractor failed" end
+        )
+      end
+    end
+
     test "register triggers :registered event", %{name: name} do
       key = "user/#{System.unique_integer([:positive])}"
 

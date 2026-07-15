@@ -497,7 +497,14 @@ defmodule Group do
         num_shards = config.num_shards
         shard = Replica.shard_index_for(cluster, key, num_shards)
 
-        case Data.registry_lookup(name, shard, cluster, key) do
+        entry =
+          try do
+            Data.registry_lookup(name, shard, cluster, key)
+          rescue
+            ArgumentError -> nil
+          end
+
+        case entry do
           {pid, meta, _time, _node} ->
             {pid, extract_meta_fn.(meta)}
 
@@ -505,8 +512,6 @@ defmodule Group do
             nil
         end
     end
-  rescue
-    ArgumentError -> nil
   end
 
   # ===========================================================================

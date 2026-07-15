@@ -19,6 +19,8 @@
 - Configured function-form `extract_meta` callbacks are now applied on reads and lifecycle
   events (previously they were silently ignored and full metadata was exposed), and invalid
   `:extract_meta` values raise `ArgumentError` at startup.
+- `Group.lookup/3` no longer converts `ArgumentError` raised by metadata extraction callbacks
+  into a `nil` miss; extractor errors now propagate to the caller.
 
 ## 0.2.0 (2026-04-17)
 - remove deprecate message handling
