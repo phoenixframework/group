@@ -1763,10 +1763,26 @@ defmodule Group.Replica do
       "#{log_prefix(state)} cluster_disconnect #{inspect(clusters)}"
     end)
 
-    events =
-      Enum.reduce(clusters, [], fn cluster, acc ->
-        {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, node())
-        build_purged_events(name, purged_reg, purged_pg, :cluster_disconnect, acc)
+    {events, local_pids} =
+      Enum.reduce(clusters, {[], MapSet.new()}, fn cluster, {events, local_pids} ->
+        {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, :all)
+
+        local_pids =
+          Enum.reduce(purged_reg ++ purged_pg, local_pids, fn
+            {_cluster, _key, pid, _meta, _time}, acc when node(pid) == node() ->
+              MapSet.put(acc, pid)
+
+            _entry, acc ->
+              acc
+          end)
+
+        {build_purged_events(name, purged_reg, purged_pg, :cluster_disconnect, events),
+         local_pids}
+      end)
+
+    state =
+      Enum.reduce(local_pids, state, fn pid, acc ->
+        maybe_demonitor_pid(acc, name, shard, pid)
       end)
 
     if shard == 0 do
@@ -2992,14 +3008,16 @@ defmodule Group.Replica do
     MapSet.intersection(my_set, remote_set) |> MapSet.to_list()
   end
 
-  defp purge_cluster_entries(name, shard, cluster, target_node) do
-    # Remove entries for a specific cluster and node
+  defp purge_cluster_entries(name, shard, cluster, target) do
+    # Local disconnect uses :all to discard the complete replicated view.
+    # Remote disconnects remove only data owned by the departing node.
+    node_guard = if target == :all, do: [], else: [{:==, :"$5", target}]
     reg_table = Data.reg_by_key_table(name, shard)
     reg_pid_table = Data.reg_by_pid_table(name, shard)
 
     purged_reg =
       :ets.select(reg_table, [
-        {{{cluster, :"$1"}, :"$2", :"$3", :"$4", :"$5"}, [{:==, :"$5", target_node}],
+        {{{cluster, :"$1"}, :"$2", :"$3", :"$4", :"$5"}, node_guard,
          [{{:"$1", :"$2", :"$3", :"$4"}}]}
       ])
       |> Enum.map(fn {key, pid, meta, time} -> {cluster, key, pid, meta, time} end)
@@ -3014,7 +3032,7 @@ defmodule Group.Replica do
 
     purged_pg =
       :ets.select(pg_table, [
-        {{{cluster, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [{:==, :"$5", target_node}],
+        {{{cluster, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, node_guard,
          [{{:"$1", :"$2", :"$3", :"$4"}}]}
       ])
       |> Enum.map(fn {key, pid, meta, time} -> {cluster, key, pid, meta, time} end)

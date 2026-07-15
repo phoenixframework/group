@@ -1,3 +1,10 @@
+## Unreleased
+- **Breaking**: `Group.disconnect/3` now discards the complete local view of each departed
+  cluster — remote entries included, and monitors receive `:unregistered`/`:left` events for
+  them — instead of removing only locally owned rows. Reconnecting resyncs through the normal
+  snapshot exchange. `connect`/`disconnect` also raise `ArgumentError` for non-binary cluster
+  names instead of silently tolerating them.
+
 ## 0.2.0 (2026-04-17)
 - remove deprecate message handling
 

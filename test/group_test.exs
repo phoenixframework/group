@@ -568,6 +568,30 @@ defmodule GroupTest do
   end
 
   describe "named clusters" do
+    test "connect and disconnect reject non-binary cluster names", %{name: name} do
+      cluster = "validated/#{System.unique_integer([:positive])}"
+      key = "cluster-validation/#{System.unique_integer([:positive])}"
+      :ok = Group.register(name, key, %{})
+
+      for bad <- [nil, :default, 42] do
+        assert_raise ArgumentError, ~r/cluster name must be a binary/, fn ->
+          Group.connect(name, [bad])
+        end
+
+        assert_raise ArgumentError, ~r/cluster name must be a binary/, fn ->
+          Group.disconnect(name, [bad])
+        end
+      end
+
+      # The rejected disconnects must not have purged the default cluster view.
+      assert Group.lookup(name, key) == {self(), %{}}
+
+      assert :ok = Group.connect(name, cluster)
+      assert Group.connected?(name, cluster)
+      assert :ok = Group.disconnect(name, cluster)
+      refute Group.connected?(name, cluster)
+    end
+
     test "purging a node removes a forward-only membership row", %{name: name} do
       cluster = "orphaned/#{System.unique_integer([:positive])}"
       dead_node = :"dead_#{System.unique_integer([:positive])}@127.0.0.1"

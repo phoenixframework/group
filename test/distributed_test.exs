@@ -1011,6 +1011,80 @@ defmodule Group.DistributedTest do
       assert TestCluster.rpc!(node_a, Group, :lookup, [name, "new_key", [cluster: "game"]]) == nil
     end
 
+    test "disconnect purges existing remote data before a later reconnect" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"disc_purge_remote_#{System.unique_integer([:positive])}"
+      cluster = "game"
+      registry_key = "remote/registry"
+      pg_key = "remote/pg"
+
+      start_group_on_peers(peers, name: name, shards: 2)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, cluster])
+      TestCluster.rpc!(node_b, Group, :connect, [name, cluster])
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name, cluster])
+      end)
+
+      TestCluster.spawn_register_in_cluster(
+        node_b,
+        name,
+        registry_key,
+        %{from: :b},
+        cluster
+      )
+
+      pg_pid = TestCluster.spawn_join(node_b, name, pg_key, %{from: :b}, cluster: cluster)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :lookup, [
+          name,
+          registry_key,
+          [cluster: cluster]
+        ]) != nil and
+          TestCluster.rpc!(node_a, Group, :members, [name, pg_key, [cluster: cluster]]) != []
+      end)
+
+      assert :ok = TestCluster.rpc!(node_a, Group, :disconnect, [name, cluster])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :lookup, [
+          name,
+          registry_key,
+          [cluster: cluster]
+        ]) == nil and
+          TestCluster.rpc!(node_a, Group, :members, [name, pg_key, [cluster: cluster]]) == []
+      end)
+
+      # Remove both entries while A is disconnected. Reconnecting with an
+      # additive snapshot must not resurrect either entry on A.
+      assert :ok =
+               TestCluster.rpc!(node_b, Group, :unregister, [
+                 name,
+                 registry_key,
+                 [cluster: cluster]
+               ])
+
+      TestCluster.rpc!(node_b, Process, :exit, [pg_pid, :kill])
+      assert :ok = TestCluster.rpc!(node_a, Group, :connect, [name, cluster])
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name, cluster])
+      end)
+
+      assert TestCluster.rpc!(node_a, Group, :lookup, [
+               name,
+               registry_key,
+               [cluster: cluster]
+             ]) == nil
+
+      assert TestCluster.rpc!(node_a, Group, :members, [name, pg_key, [cluster: cluster]]) == []
+    end
+
     test "local join does not overtake an earlier remote cluster_disconnect after replicated PG flush" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)

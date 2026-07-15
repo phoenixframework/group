@@ -268,6 +268,7 @@ defmodule Group do
   def connect(name, cluster_or_clusters, opts \\ [])
       when is_atom(name) and is_list(opts) do
     clusters = List.wrap(cluster_or_clusters)
+    Enum.each(clusters, &validate_cluster_name!/1)
     local = node()
     ttl_ms = cluster_ttl(opts)
     new_clusters = Enum.reject(clusters, fn c -> local in Data.cluster_nodes(name, c) end)
@@ -307,6 +308,7 @@ defmodule Group do
   def disconnect(name, cluster_or_clusters, opts \\ [])
       when is_atom(name) and is_list(opts) do
     clusters = List.wrap(cluster_or_clusters)
+    Enum.each(clusters, &validate_cluster_name!/1)
     timeout = cluster_call_timeout(opts)
 
     if clusters != [] do
@@ -1055,6 +1057,14 @@ defmodule Group do
       raise ArgumentError,
             "key #{inspect(key)} must not end with \"/\" — trailing slash is reserved for prefix queries"
     end
+  end
+
+  defp validate_cluster_name!(cluster) when is_binary(cluster), do: :ok
+
+  defp validate_cluster_name!(other) do
+    raise ArgumentError,
+          "cluster name must be a binary, got: #{inspect(other)} — " <>
+            "the nil default cluster cannot be connected or disconnected"
   end
 
   defp call_timeout(opts), do: Keyword.get(opts, :timeout, @default_call_timeout)
