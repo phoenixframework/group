@@ -20,7 +20,7 @@ lifecycle monitoring, and isolated subclusters for Elixir. No external dependenc
 
 ```elixir
 def deps do
-  [{:group, "~> 0.1.0"}]
+  [{:group, "~> 0.2.0"}]
 end
 ```
 

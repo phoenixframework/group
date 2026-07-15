@@ -2,7 +2,7 @@ defmodule Group.MixProject do
   use Mix.Project
 
   @version "0.2.0"
-  @source_url "https://github.com/chrismccord/group"
+  @source_url "https://github.com/phoenixframework/group"
 
   def project do
     [

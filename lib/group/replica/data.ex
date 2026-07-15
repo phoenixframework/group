@@ -814,7 +814,7 @@ defmodule Group.Replica.Data do
 
   defp next_binary_prefix(prefix) do
     size = byte_size(prefix) - 1
-    <<head::binary-size(size), last_byte>> = prefix
+    <<head::binary-size(^size), last_byte>> = prefix
     <<head::binary, last_byte + 1>>
   end
 
