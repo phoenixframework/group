@@ -10,7 +10,7 @@ defmodule Group.Supervisor do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
-    num_shards = Keyword.get(opts, :shards, 8)
+    num_shards = positive_integer_opt(opts, :shards, 8)
     callbacks = Keyword.get(opts, :callbacks, %{})
     extract_meta = validate_extract_meta!(Keyword.get(opts, :extract_meta))
     resolve_registry_conflict = Keyword.get(opts, :resolve_registry_conflict)

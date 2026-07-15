@@ -21,6 +21,8 @@
   `:extract_meta` values raise `ArgumentError` at startup.
 - `Group.lookup/3` no longer converts `ArgumentError` raised by metadata extraction callbacks
   into a `nil` miss; extractor errors now propagate to the caller.
+- Invalid `:shards` values (zero, negative, non-integer) raise `ArgumentError` at startup
+  instead of failing later during key routing.
 
 ## 0.2.0 (2026-04-17)
 - remove deprecate message handling

@@ -29,6 +29,22 @@ defmodule GroupTest do
     {:ok, name: name}
   end
 
+  describe "startup options" do
+    test "rejects invalid shard counts" do
+      for shards <- [0, -1, 1.5, :many] do
+        name = :"invalid_shards_#{System.unique_integer([:positive])}"
+
+        error =
+          assert_raise ArgumentError, fn ->
+            Group.Supervisor.init(name: name, shards: shards, log: false)
+          end
+
+        assert error.message =~ ":shards"
+        assert error.message =~ "positive integer"
+      end
+    end
+  end
+
   describe "join/3 and leave/2" do
     test "joined process appears in members/2", %{name: name} do
       key = "chat/room/#{System.unique_integer([:positive])}"
