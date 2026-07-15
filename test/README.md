@@ -3,9 +3,8 @@
 ## Running tests
 
 ```bash
-cd priv/group
-mix test                          # all tests
-mix test test/group_test.exs      # local only
+mix test                           # all tests
+mix test test/group_test.exs       # local only
 mix test test/distributed_test.exs # distributed only
 ```
 
@@ -185,7 +184,11 @@ resolver on reconnection to pick a winner.
 
 ```elixir
 # Configured via Group.start_link:
-TestCluster.start_group(node, name: :test, resolve_registry_conflict: &Group.TestConflictResolver.resolve/4)
+TestCluster.start_group(
+  node,
+  name: :test,
+  resolve_registry_conflict: {Group.TestConflictResolver, :resolve, []}
+)
 ```
 
 The resolver uses "most recent wins" — keeps the registration with the higher
@@ -220,7 +223,11 @@ peers = TestCluster.start_peers(3)
 [{_, a}, {_, b}, {_, c}] = peers
 
 # Start Group on all 3 with conflict resolver
-opts = [name: :test, shards: 4, resolve_registry_conflict: &Group.TestConflictResolver.resolve/4]
+opts = [
+  name: :test,
+  shards: 4,
+  resolve_registry_conflict: {Group.TestConflictResolver, :resolve, []}
+]
 Enum.each([a, b, c], &TestCluster.start_group(&1, opts))
 
 # Monitor nodedown so we know when partition takes effect

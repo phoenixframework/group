@@ -30,6 +30,10 @@ defmodule GroupTest do
   end
 
   describe "startup options" do
+    test "runtime config omits unused callback state", %{name: name} do
+      refute Map.has_key?(Group.get_config(name), :callbacks)
+    end
+
     test "rejects invalid shard counts" do
       for shards <- [0, -1, 1.5, :many] do
         name = :"invalid_shards_#{System.unique_integer([:positive])}"

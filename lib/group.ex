@@ -34,21 +34,13 @@ defmodule Group do
   local node has no cluster-scoped monitors, no local registrations, and no
   local group memberships in that named cluster.
 
-  ### Important: DurableServer Registration
-
-  DurableServers always register in the **default cluster** to ensure global uniqueness
-  via the distributed locking mechanism. Named clusters are purely for isolating your own
-  registries, process groups, and subscriptions to isolated subclusters. If a DurableServer
-  wants to participate in an isolated cluster, it can call `connect/2` and `join/4`
-  inside its `init` callback.
-
   ## Core Concepts
 
   ### Monitoring vs Memberships
 
   - **Monitoring** (`monitor/2`, `demonitor/2`): Receive events in your mailbox
-    when DurableServers or other processes register/join matching keys anywhere in the
-    cluster. Supports pattern matching on keys.
+    when processes register/join matching keys anywhere in the cluster. Supports
+    pattern matching on keys.
 
   - **Memberships** (`join/3`, `leave/2`): Make your process discoverable cluster-wide
     via `members/2`. Triggers `:joined`/`:left` events to monitors.
@@ -67,7 +59,7 @@ defmodule Group do
           cluster: cluster_name,  # nil for default cluster
           key: key,
           pid: pid,
-          meta: meta,             # always user-provided meta (internal keys stripped)
+          meta: meta,             # optionally transformed by extract_meta
           previous_meta: ...,     # nil for new, old meta for re-register/re-join
           reason: ...             # set on :unregistered/:left events
         }
@@ -83,8 +75,8 @@ defmodule Group do
   `:previous_meta` is `nil` for new registrations/joins, or the old
   metadata map when re-registering/re-joining.
 
-  DurableServers automatically register/unregister during their lifecycle, so these
-  events can be used to track DurableServer start/stop.
+  Registrations and memberships are automatically removed when their owning
+  process exits, so these events can track process lifecycles.
 
   ## Pattern Types
 
@@ -127,9 +119,9 @@ defmodule Group do
       def handle_info({:group, events, _info}, state) do
         Enum.each(events, fn
           %Group.Event{type: :registered, key: key} ->
-            IO.puts("DurableServer started: \#{key}")
+            IO.puts("Process registered: \#{key}")
           %Group.Event{type: :unregistered, key: key, reason: reason} ->
-            IO.puts("DurableServer stopped: \#{key}, reason: \#{inspect(reason)}")
+            IO.puts("Process unregistered: \#{key}, reason: \#{inspect(reason)}")
           _ -> :ok
         end)
         {:noreply, state}
@@ -167,14 +159,15 @@ defmodule Group do
 
   ## Architecture Notes
 
-  - **Events are cluster-wide**: Replication callbacks fire on ALL nodes in the cluster.
-    This means a monitor on Node A receives events when a DurableServer registers on Node B.
+  - **Events are cluster-wide**: Replicated operations fire lifecycle events on all
+    participating nodes. A monitor on Node A receives events when a process registers
+    on Node B.
 
   - **Monitors** are stored per-node in an Elixir `Registry`, enabling pattern matching
     and automatic cleanup when monitoring processes die.
 
-  - **Memberships** use built-in process groups for cluster-wide distribution and automatic
-    cleanup when member processes die.
+  - **Memberships** are stored in replicated, sharded ETS indexes and are
+    automatically cleaned up when member processes die.
   """
 
   alias Group.Replica
@@ -196,7 +189,8 @@ defmodule Group do
   - `:shards` — number of GenServer shards (default: 8). Must match across all nodes
   - `:log` — logging level. `:info` (default) logs peer discovery, node events,
     and cluster membership changes. `:verbose` additionally logs per-shard
-    replication messages. `false` disables all Group log output.
+    replication messages. `false` disables routine info/verbose logs; registry
+    conflicts and busy distribution links still emit error/warning logs.
   - `:resolve_registry_conflict` — `{module, function, extra_args}` callback invoked when
     two nodes hold the same registry key (partition heal or concurrent registration).
     Called as `apply(module, function, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
@@ -204,7 +198,8 @@ defmodule Group do
     **Important:** This callback runs synchronously inside the shard GenServer — it must
     return quickly and never block. Any information needed for the decision should be
     carried in the registration metadata, not fetched at resolution time.
-  - `:extract_meta` — `{module, function, args}` to transform metadata on reads
+  - `:extract_meta` — `{module, function, args}` or a one-argument function to
+    transform metadata on reads and lifecycle events
   - `:replicated_pg_receiver_buffer_size` — max buffered replicated PG join/leave ops
     per shard before the receiver flushes immediately (default: `64`)
   - `:replicated_pg_receiver_flush_interval` — max time in milliseconds a shard will
@@ -739,7 +734,7 @@ defmodule Group do
   @doc """
   Count processes registered in the local node's registry.
 
-  This counts only processes registered via `register/5` on the local node.
+  This counts only processes registered via `register/4` on the local node.
 
   ## Parameters
 
@@ -877,19 +872,18 @@ defmodule Group do
   Dispatch a message to all members of a key.
 
   Sends `message` to all processes that have joined the key via `join/3`, as well as
-  any DurableServer registered at that key. This is useful for application-level
-  messaging between a DurableServer and connected clients (e.g., Phoenix Channels).
+  the process registered at that key, if present.
 
   ## Dispatch vs Monitor
 
   There are two ways to receive messages in this module:
 
   - **`monitor/2`** - Receive *lifecycle events* (`:registered`, `:unregistered`, etc.)
-    when DurableServers or processes join/leave keys matching a pattern. These are
+    when processes register/join/leave keys matching a pattern. These are
     system-generated events.
 
   - **`dispatch/3`** - Receive *application messages* sent explicitly by your code.
-    Only members of the exact key receive the message.
+    The registered process and joined members of the exact key receive the message.
 
   Use `monitor` to react to lifecycle changes. Use `dispatch` to send your own
   messages to members.

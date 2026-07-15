@@ -11,7 +11,6 @@ defmodule Group.Supervisor do
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
     num_shards = positive_integer_opt(opts, :shards, 8)
-    callbacks = Keyword.get(opts, :callbacks, %{})
     extract_meta = validate_extract_meta!(Keyword.get(opts, :extract_meta))
     resolve_registry_conflict = Keyword.get(opts, :resolve_registry_conflict)
     log = Keyword.get(opts, :log, :info)
@@ -45,7 +44,6 @@ defmodule Group.Supervisor do
 
     # persistent_term config — must be set before children start (Replica reads it)
     config = %{
-      callbacks: callbacks,
       num_shards: num_shards,
       log: log,
       replicated_pg_receiver_buffer_size: replicated_pg_receiver_buffer_size,

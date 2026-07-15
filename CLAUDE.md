@@ -10,15 +10,16 @@ Distributed process registry + process groups + lifecycle monitoring + isolated 
 lib/
   group.ex              — Public API: register, join, members, monitor, dispatch, connect/disconnect
   group/event.ex        — %Group.Event{} struct
-  group/supervisor.ex   — Top-level supervisor (rest_for_one: Data → Replica.Supervisor → Registry → ClusterLease)
+  group/supervisor.ex   — Top-level supervisor (rest_for_one: Data → PeerReconnect → Replica.Supervisor → Registry → ClusterLease)
   group/cluster_lease.ex — Local named-cluster TTL sweeper
+  group/peer_reconnect.ex — Bounded reconnect loop after busy distribution links
   group/replica/
-    data.ex             — GenServer that owns ETS tables. Pure function API for all ETS ops.
+    data.ex             — GenServer that owns ETS tables and serializes shared membership mutations.
     supervisor.ex       — one_for_one supervisor for Replica shards
   group/replica.ex      — Sharded GenServer: replication, peer discovery, conflict resolution, monitoring
   group/application.ex  — Empty app supervisor (Group instances are started by consumers)
 test/
-  test_helper.exs       — Starts distribution (Node.start), disables prevent_overlapping_partitions
+  test_helper.exs       — Ensures EPMD/distribution are running; disables prevent_overlapping_partitions
   group_test.exs        — Local tests (async: true)
   distributed_test.exs  — Multi-node tests using OTP :peer
   support/
@@ -50,7 +51,8 @@ cd priv/bench && ./run_distributed.sh
 
 ```
 Group.Supervisor (rest_for_one)
-├── Group.Replica.Data        — owns all ETS tables, survives shard crashes
+├── Group.Replica.Data        — owns all ETS tables; serializes membership mutations
+├── Group.PeerReconnect       — bounded reconnects after busy-link disconnects
 ├── Group.Replica.Supervisor  — one_for_one, N shard GenServers
 │   ├── Replica shard 0
 │   ├── Replica shard 1
@@ -59,7 +61,7 @@ Group.Supervisor (rest_for_one)
 └── Group.ClusterLease        — local named-cluster TTL sweeper
 ```
 
-`rest_for_one` means: if Data dies, Replica.Supervisor restarts (rebuilds monitors from surviving ETS). If Replica.Supervisor dies, Registry restarts (monitors re-subscribe).
+`rest_for_one` means: if Data dies, every later child restarts. If PeerReconnect dies, the Replica supervisor and monitor Registry restart. If Replica.Supervisor dies, Registry and ClusterLease restart. Replica shards rebuild local process monitors from surviving ETS after restart.
 
 ### Sharding
 
@@ -83,7 +85,7 @@ Group.Supervisor (rest_for_one)
 
 **Why set for reg_by_key**: Only needs direct lookup/delete by `{cluster, key}` — O(1).
 
-All tables: `:public`, `read_concurrency: true`, `decentralized_counters: true`. No `write_concurrency` — writes serialize through shard GenServer anyway.
+All tables: `:public`, `read_concurrency: true`, `decentralized_counters: true`. Per-key registry/PG writes serialize through the owning Replica shard; shared cluster-membership dual-index mutations serialize through `Group.Replica.Data`. No table enables `write_concurrency`.
 
 ### Reads vs Writes
 
@@ -94,7 +96,7 @@ All tables: `:public`, `read_concurrency: true`, `decentralized_counters: true`.
 
 ### Config
 
-Stored in `persistent_term` keyed by `{Group, name}`. Map with: `num_shards`, `log`, `callbacks`, optionally `extract_meta`, `resolve_registry_conflict`.
+Stored in `persistent_term` keyed by `{Group, name}`. Includes shard/buffering/reconnect settings plus `log`, and optionally `extract_meta` and `resolve_registry_conflict`.
 
 ## Key Protocols
 
@@ -119,7 +121,7 @@ After discovery, writes replicate in two stages:
 
 ### Conflict Resolution
 
-`resolve_conflict/6` handles ALL registry key conflicts (live replicated registry ops AND partition heal `merge_remote_cluster_data`).
+`resolve_conflict/5` and the batched equivalent handle all registry key conflicts (live replicated registry ops and partition-heal `merge_remote_cluster_data`).
 
 - Default resolver: most recent timestamp wins; pid ordering tiebreaker on equal timestamps
 - **Tiebreaker MUST be deterministic across all nodes**: `time2 > time1 or (time2 == time1 and pid2 > pid1)`. Using `>=` causes mutual kill.
@@ -130,7 +132,7 @@ After discovery, writes replicate in two stages:
 ### Named Cluster Connect/Disconnect
 
 - `connect/2`: adds to ETS, picks random shard S, S notifies remote S, remote acks with bundled data + fans out to siblings
-- `disconnect/2`: removes from ETS, calls ALL local shards to purge, shard 0 broadcasts to remotes
+- `disconnect/2`: removes local membership, calls ALL local shards to purge the complete replicated cluster view, and has shard 0 broadcast to remotes
 - `connect(..., ttl: ms)`: still checks `cluster_nodes` first, so an already-connected
   cluster stays an ETS-fast noop and does not refresh the TTL
 - TTL rows are local policy only; they do not change `cluster_nodes` /
@@ -142,7 +144,7 @@ After discovery, writes replicate in two stages:
 ### Nodedown / Process Death
 
 - `nodedown`: every shard calls `purge_cluster_node` (unconditional — not gated on shard 0) then `purge_node`
-- Process DOWN: `delete_all_for_pid` + broadcast unregister/leave per entry
+- Process DOWN: `delete_all_for_pids` + one non-suspending `replicate_process_down_batch` per target peer
 - Remote shard DOWN (monitored pid): treated like nodedown for that node
 
 ### Monitor Events
@@ -165,7 +167,7 @@ Keys ending with `"/"` are rejected by `validate_key!/1` in register/unregister/
 
 ### Dispatch
 
-`dispatch/4` sends to all members (registry + PG). Groups remote PG members by node, sends one `{:group_dispatch, pids, message}` per remote node (O(nodes) not O(members)). Target shard chosen by `phash2(self(), num_shards)` for per-sender ordering.
+`dispatch/4` sends to all members (registry + PG). Groups remote PG members by node and sends one non-suspending `{:group_dispatch, pids, message}` per remote node (O(nodes), not O(members)). The target shard is chosen by `phash2(self(), num_shards)` for per-sender ordering.
 
 `dispatch_local/4` skips cross-node messaging.
 
@@ -187,21 +189,20 @@ Keys ending with `"/"` are rejected by `validate_key!/1` in register/unregister/
 - `assert_ets_consistent/1` verifies dual-index tables match
 - Partition tests use 3 nodes (isolate 1 from other 2). 2-node partitions are unreliable because the test node bridges them.
 - `Supervisor.start_link` links to caller — in RPC context, must `Process.unlink(pid)` or supervisor dies on RPC return
-- `test_helper.exs`: calls `Node.start/2`, sets cookie, disables `prevent_overlapping_partitions`
+- `test_helper.exs`: starts EPMD when needed, calls `Node.start/2`, sets the cookie, and disables `prevent_overlapping_partitions`
 
 ## Critical Invariants
 
 1. **purge_cluster_node is unconditional** — every shard calls it on nodedown/DOWN, not just shard 0. Late peer_connect on non-zero shard can re-add dead node after shard 0 cleaned it.
 2. **Dispatch :unregistered for evicted local pid** in "remote wins" branch of resolve_conflict — monitors need to see the eviction.
 3. **merge_remote_cluster_data uses Enum.reduce** (not `for`) to thread `{state, events}` through, since resolve_conflict modifies `state.monitors`.
-4. **Additive merge only** — cluster_state merge inserts but never deletes. TCP ordering guarantees no stale entries survive into the merge.
+4. **Additive merge only** — cluster_state merge inserts but never deletes. Local named-cluster disconnect therefore purges the complete local cluster view, and replicated batches are membership-gated at apply time.
 5. **PG tables have no overwrite conflicts** — `pg_by_key` key includes pid: `{cluster, key, pid}`.
-6. **cluster_state handler has cluster_member? guard** — rejects data for clusters we left.
+6. **Named-cluster data is membership-gated** — both `cluster_state` and buffered replicated operations reject data for clusters the local node has left.
 
 ## Logging
 
-- `log:` option: `:info` (default), `false` (silent), `:verbose` (all shards)
-- `log/2` (normal), `log_verbose/2` (verbose only), `log_once/2` (shard 0 only)
-- All use `Logger.info` — `:verbose` is Group's own flag, not Logger level
-- Registry conflict is unconditional `Logger.error`
+- `log:` option: `:info` (default), `false` (routine logs disabled), `:verbose` (all shards)
+- `log/2` (normal), `log_verbose/2` (verbose only), `log_once/2` (shard 0 only) use `Logger.info`; `:verbose` is Group's own flag, not a Logger level
+- Registry conflicts are unconditional `Logger.error` events; busy distribution links are unconditional `Logger.warning` events
 - Runtime change: `Group.log_level(name, level)`

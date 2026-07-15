@@ -167,7 +167,7 @@ Toggle verbose logging at runtime without restart:
 ```elixir
 Group.log_level(:my_app, :verbose)  # turn on verbose
 Group.log_level(:my_app, :info)     # back to normal
-Group.log_level(:my_app, false)     # silence all Group logs
+Group.log_level(:my_app, false)     # silence routine info/verbose logs
 ```
 
 `Group.log_level/2` updates `:persistent_term`, so it should be used as an
@@ -221,9 +221,16 @@ All operations are **eventually consistent**:
   shards: 8,                                   # number of write shards (default)
   log: :info,                                  # :info | :verbose | false
   resolve_registry_conflict: {MyResolver, :resolve, []},  # partition conflict resolver
-  extract_meta: {MyApp, :extract_meta, []},    # transform meta on read
-  replicated_pg_receiver_buffer_size: 64,      # buffered remote PG join/leave ops per shard
-  replicated_pg_receiver_flush_interval: 5     # max buffer age in ms before flush
+  extract_meta: {MyApp, :extract_meta, []},    # transform read/event metadata
+  replicated_pg_receiver_buffer_size: 64,
+  replicated_pg_receiver_flush_interval: 5,
+  replicated_registry_receiver_buffer_size: 64,
+  replicated_registry_receiver_flush_interval: 5,
+  replicated_sender_buffer_size: 64,
+  replicated_sender_flush_interval: 5,
+  busy_dist_retry_attempts: 300,
+  busy_dist_retry_interval: 1_000,
+  replicated_pg_receiver_local_request_quota: 8
 }
 ```
 
@@ -236,25 +243,41 @@ All operations are **eventually consistent**:
 - **`log`** — logging level. `:info` (default) logs peer discovery, node
   connects/disconnects, and cluster membership changes. `:verbose` additionally
   logs per-shard operations (register, join, leave, process deaths, replication).
-  `false` disables all Group log output. All log output uses `Logger.info`.
-  Can be changed at runtime with `Group.log_level/2`.
+  `false` disables routine info/verbose logs. Registry conflicts remain
+  `Logger.error` events and busy distribution links remain `Logger.warning`
+  events. The level can be changed at runtime with `Group.log_level/2`.
 - **`resolve_registry_conflict`** — `{module, function, extra_args}` callback
   invoked as `apply(mod, fun, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
   Called when partition healing or concurrent registration finds the same key
   registered on two nodes. Must return the winning pid. Runs synchronously
   inside the shard GenServer — must return quickly and never block.
 - **`extract_meta`** — `{module, function, args}` or `fun(meta)` applied to
-  metadata on reads (`lookup`, `members`). Useful for stripping internal fields.
+  metadata on reads and lifecycle events. Useful for stripping internal fields.
 - **`replicated_pg_receiver_buffer_size`** — max buffered replicated PG
   join/leave ops per shard before the receiver flushes immediately. Defaults to 64.
 - **`replicated_pg_receiver_flush_interval`** — max time in milliseconds a shard
   will buffer replicated PG join/leave ops before flushing. Defaults to 5.
+- **`replicated_registry_receiver_buffer_size`** — max buffered replicated
+  register/unregister operations per shard. Defaults to 64.
+- **`replicated_registry_receiver_flush_interval`** — max registry receiver
+  buffer age in milliseconds. Defaults to 5.
+- **`replicated_sender_buffer_size`** — max buffered outbound operations per
+  shard. Defaults to 64.
+- **`replicated_sender_flush_interval`** — max outbound buffer age in
+  milliseconds. Defaults to 5.
+- **`busy_dist_retry_attempts`** — reconnect attempts after a non-suspending
+  remote send reports a busy link. Defaults to 300.
+- **`busy_dist_retry_interval`** — milliseconds between busy-link reconnect
+  attempts. Defaults to 1,000.
+- **`replicated_pg_receiver_local_request_quota`** — local PG requests drained
+  after each replicated receiver turn. Defaults to 8.
 
 ## Architecture
 
 ```
 Group.Supervisor (:"my_app_group_sup")
-├── Group.Replica.Data        — owns all ETS tables, survives shard crashes
+├── Group.Replica.Data        — owns ETS tables and serializes membership writes
+├── Group.PeerReconnect       — bounded recovery after busy distribution links
 ├── Group.Replica.Supervisor  — supervises N shard GenServers
 │   ├── Group.Replica (shard 0)
 │   ├── Group.Replica (shard 1)
@@ -308,8 +331,8 @@ nodes. This handshake:
 
 1. Validates that shard counts match (raises on mismatch).
 2. Exchanges cluster membership lists.
-3. Sends `cluster_state` snapshots for shared clusters — the full registry and
-   group data, delivered in a single message per cluster.
+3. Each shard sends its locally owned registry and group slice in a
+   `cluster_state` message for each shared cluster.
 
 This is how a new node catches up to the existing cluster state.
 
@@ -351,7 +374,7 @@ no longer care about a cluster.
 Shards monitor all registered/joined processes. On `DOWN`, the shard:
 
 1. Removes entries from both the primary and reverse-index ETS tables.
-2. Enqueues replicated unregister / leave ops into the sender batching lanes for peer nodes.
+2. Groups removed entries by peer and sends one non-suspending process-down batch per peer.
 3. Fires `:unregistered` / `:left` events to local monitors.
 
 ### Node Disconnect
