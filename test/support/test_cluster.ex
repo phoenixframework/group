@@ -12,7 +12,10 @@ defmodule Group.TestCluster do
 
     for _i <- 1..count do
       name = :"peer#{System.unique_integer([:positive])}"
-      {:ok, pid, node} = :peer.start(%{name: name, args: args})
+
+      {:ok, pid, node} =
+        :peer.start(%{name: name, host: ~c"127.0.0.1", longnames: true, args: args})
+
       {:ok, _} = :rpc.call(node, :application, :ensure_all_started, [:elixir])
       {:ok, _} = :rpc.call(node, :application, :ensure_all_started, [:group])
       {pid, node}
