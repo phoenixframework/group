@@ -11,6 +11,11 @@
   exit signal is redundant), but resolvers that expected the losing process to keep running must
   now handle its termination. The exit reason's metadata is now consistently the winner's
   metadata on every node (previously each node reported its remote side's metadata).
+- **Breaking**: `Group.dispatch/4` remote sends and process-DOWN replication are now
+  non-suspending and never auto-connect — on a busy or disconnected distribution link the
+  message is dropped, the link is force-disconnected, and bounded reconnect retries begin (the
+  same policy replication lanes have used since 0.1.8). Previously dispatch could block the
+  caller and initiate new connections.
 
 ## 0.2.0 (2026-04-17)
 - remove deprecate message handling

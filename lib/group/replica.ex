@@ -2612,11 +2612,10 @@ defmodule Group.Replica do
         end)
       end)
 
-    shard_name = shard_name(state.name, state.shard_index)
-
     Enum.each(messages, fn {target_node, {reg_entries, pg_entries}} ->
-      send(
-        {shard_name, target_node},
+      send_remote_shard_message(
+        state,
+        target_node,
         {:replicate_process_down_batch, Enum.reverse(reg_entries), Enum.reverse(pg_entries)}
       )
     end)

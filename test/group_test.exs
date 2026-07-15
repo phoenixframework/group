@@ -1001,6 +1001,58 @@ defmodule GroupTest do
       refute_receive {:test_message, :from_default}, 200
     end
 
+    test "remote dispatch uses a non-suspending send without connecting", %{name: name} do
+      key = "dispatch/nonblocking/#{System.unique_integer([:positive])}"
+      remote_node = :"missing_#{System.unique_integer([:positive])}@127.0.0.1"
+      member = spawn_forever()
+      num_shards = Group.get_config(name).num_shards
+      key_shard = Group.Replica.shard_index_for(nil, key, num_shards)
+
+      on_exit(fn -> kill_if_alive(member) end)
+
+      now = System.system_time()
+      Group.Replica.Data.registry_insert(name, key_shard, nil, key, member, %{}, now, remote_node)
+      Group.Replica.Data.pg_insert(name, key_shard, nil, key, member, %{}, now, remote_node)
+
+      test_pid = self()
+
+      dispatcher =
+        spawn(fn ->
+          receive do
+            :dispatch ->
+              send(test_pid, {:dispatch_result, self(), Group.dispatch(name, key, :hello)})
+          end
+        end)
+
+      on_exit(fn -> kill_if_alive(dispatcher) end)
+      :erlang.trace(dispatcher, true, [:call])
+      :erlang.trace_pattern({:erlang, :send_nosuspend, 3}, true, [:local])
+
+      on_exit(fn ->
+        if Process.alive?(dispatcher), do: :erlang.trace(dispatcher, false, [:call])
+        :erlang.trace_pattern({:erlang, :send_nosuspend, 3}, false, [:local])
+      end)
+
+      send(dispatcher, :dispatch)
+      assert_receive {:dispatch_result, ^dispatcher, :ok}, 1_000
+
+      assert_receive {:trace, ^dispatcher, :call,
+                      {:erlang, :send_nosuspend, [^member, :hello, [:noconnect]]}},
+                     1_000
+
+      dispatch_shard = :erlang.phash2(dispatcher, num_shards)
+      shard_name = Group.Replica.shard_name(name, dispatch_shard)
+
+      assert_receive {:trace, ^dispatcher, :call,
+                      {:erlang, :send_nosuspend,
+                       [
+                         {^shard_name, ^remote_node},
+                         {:group_dispatch, [^member], :hello},
+                         [:noconnect]
+                       ]}},
+                     1_000
+    end
+
     test "dispatch_local only sends to local members", %{name: name} do
       key = "dispatch_local/#{System.unique_integer([:positive])}"
 
@@ -1925,6 +1977,52 @@ defmodule GroupTest do
       assert types == [:left, :unregistered]
       assert Enum.all?(events, &(&1.key == key))
       assert Enum.all?(events, &(&1.pid == pid))
+    end
+
+    test "process death replication uses the non-suspending remote send path", %{name: name} do
+      key = "batch/nonblocking/#{System.unique_integer([:positive])}"
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          :ok = Group.register(name, key, %{})
+          send(parent, {:nonblocking_owner_ready, self()})
+          Process.sleep(:infinity)
+        end)
+
+      on_exit(fn -> kill_if_alive(owner) end)
+      assert_receive {:nonblocking_owner_ready, ^owner}, 1_000
+
+      shard_name = Group.Replica.shard_for(name, nil, key)
+      shard_pid = Process.whereis(shard_name)
+
+      # Flush the registration sender buffer before tracing the DOWN path.
+      flush_replicated_registry_barrier(shard_name)
+      assert_receive {:replicated_registry_buffer_flushed, ^shard_name}, 1_000
+
+      :sys.replace_state(shard_pid, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, node(), self())}
+      end)
+
+      :erlang.trace(shard_pid, true, [:call])
+      :erlang.trace_pattern({:erlang, :send_nosuspend, 3}, true, [:local])
+
+      on_exit(fn ->
+        if Process.alive?(shard_pid), do: :erlang.trace(shard_pid, false, [:call])
+        :erlang.trace_pattern({:erlang, :send_nosuspend, 3}, false, [:local])
+      end)
+
+      Process.exit(owner, :kill)
+      local_node = node()
+
+      assert_receive {:trace, ^shard_pid, :call,
+                      {:erlang, :send_nosuspend,
+                       [
+                         {^shard_name, ^local_node},
+                         {:replicate_process_down_batch, _reg_entries, _pg_entries},
+                         [:noconnect]
+                       ]}},
+                     1_000
     end
 
     test "process death batches multiple :left events for same-shard keys", %{name: name} do

@@ -913,10 +913,17 @@ defmodule Group do
     shard = Replica.shard_index_for(cluster, key, num_shards)
     local = node()
 
-    # Registry entry (one or none) — always direct send, even cross-node
+    # Registry entry (one or none) — send directly without allowing a remote
+    # distribution channel to suspend the caller or establish a new link.
     case Data.registry_lookup(name, shard, cluster, key) do
-      {pid, _meta, _time, _node} -> send(pid, message)
-      nil -> :ok
+      {pid, _meta, _time, ^local} ->
+        send(pid, message)
+
+      {pid, _meta, _time, target_node} ->
+        send_remote_nosuspend(name, target_node, pid, message)
+
+      nil ->
+        :ok
     end
 
     # PG members — group remote pids by node for batched fan-out
@@ -942,7 +949,12 @@ defmodule Group do
         shard_name = Replica.shard_name(name, dispatch_shard)
 
         for {target_node, pids} <- remote_by_node do
-          send({shard_name, target_node}, {:group_dispatch, pids, message})
+          send_remote_nosuspend(
+            name,
+            target_node,
+            {shard_name, target_node},
+            {:group_dispatch, pids, message}
+          )
         end
     end
 
@@ -1049,6 +1061,13 @@ defmodule Group do
   # ===========================================================================
   # Internal
   # ===========================================================================
+
+  defp send_remote_nosuspend(name, target_node, destination, message) do
+    case :erlang.send_nosuspend(destination, message, [:noconnect]) do
+      true -> :ok
+      false -> Group.PeerReconnect.busy_link(name, target_node)
+    end
+  end
 
   defp validate_key!(key) do
     if String.ends_with?(key, "/") do
