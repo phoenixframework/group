@@ -526,9 +526,9 @@ defmodule Group.DistributedTest do
 
       # Register same key on both sides during partition
       # spawn_register now waits for registration to complete before returning
-      _pid_a = TestCluster.spawn_register(node_a, name, "user/conflict", %{side: :a})
+      pid_a = TestCluster.spawn_register(node_a, name, "user/conflict", %{side: :a})
       Process.sleep(50)
-      _pid_b = TestCluster.spawn_register(node_b, name, "user/conflict", %{side: :b})
+      pid_b = TestCluster.spawn_register(node_b, name, "user/conflict", %{side: :b})
 
       # Verify each side sees its own registration
       assert TestCluster.rpc!(node_a, Group, :lookup, [name, "user/conflict"]) != nil
@@ -554,6 +554,17 @@ defmodule Group.DistributedTest do
         end,
         timeout: 10_000
       )
+
+      {winner_pid, _meta} =
+        TestCluster.rpc!(node_a, Group, :lookup, [name, "user/conflict"])
+
+      loser_pid = if winner_pid == pid_a, do: pid_b, else: pid_a
+
+      TestCluster.assert_eventually(fn ->
+        not TestCluster.rpc!(node(loser_pid), Process, :alive?, [loser_pid])
+      end)
+
+      assert TestCluster.rpc!(node(winner_pid), Process, :alive?, [winner_pid])
     end
   end
 

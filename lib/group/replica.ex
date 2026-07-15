@@ -2962,42 +2962,75 @@ defmodule Group.Replica do
        ) do
     config = Group.get_config(name)
 
-    case Map.get(config, :resolve_registry_conflict) do
-      nil ->
-        default_resolve_conflict(
-          name,
-          cluster,
-          key,
-          {local_pid, local_meta, local_time},
-          {remote_pid, remote_meta, remote_time}
-        )
+    winner_pid =
+      case Map.get(config, :resolve_registry_conflict) do
+        nil ->
+          default_resolve_conflict(
+            name,
+            cluster,
+            key,
+            {local_pid, local_meta, local_time},
+            {remote_pid, remote_meta, remote_time}
+          )
 
-      {mod, func, extra_args} ->
-        apply(mod, func, [
-          name,
-          key,
-          {local_pid, local_meta, local_time},
-          {remote_pid, remote_meta, remote_time} | extra_args
-        ])
-    end
+        {mod, func, extra_args} ->
+          apply(mod, func, [
+            name,
+            key,
+            {local_pid, local_meta, local_time},
+            {remote_pid, remote_meta, remote_time} | extra_args
+          ])
+      end
+
+    terminate_conflict_loser(
+      key,
+      winner_pid,
+      {local_pid, local_meta},
+      {remote_pid, remote_meta}
+    )
+
+    winner_pid
   end
 
-  defp default_resolve_conflict(_name, _cluster, key, {pid1, _meta1, time1}, {pid2, meta2, time2}) do
+  defp default_resolve_conflict(
+         _name,
+         _cluster,
+         key,
+         {pid1, _meta1, time1},
+         {pid2, _meta2, time2}
+       ) do
     # Tiebreaker must be deterministic regardless of which node is resolving.
     # Using `>=` would pick the remote on BOTH nodes when timestamps are equal,
     # causing mutual kill (both processes die, key becomes unregistered).
     # Erlang pids have a total order (by node name then id), so pid comparison
     # gives a consistent tiebreaker across all nodes.
-    {winner_pid, loser_pid} =
-      if time2 > time1 or (time2 == time1 and pid2 > pid1), do: {pid2, pid1}, else: {pid1, pid2}
+    winner_pid =
+      if time2 > time1 or (time2 == time1 and pid2 > pid1), do: pid2, else: pid1
 
     Logger.error(fn ->
       "#{inspect(__MODULE__)}: registry conflict detected: key=#{inspect(key)}, " <>
         "pid1=#{inspect(pid1)}, pid2=#{inspect(pid2)}, picking #{inspect(winner_pid)} as winner"
     end)
 
-    Process.exit(loser_pid, {:group_registry_conflict, key, meta2})
     winner_pid
+  end
+
+  defp terminate_conflict_loser(
+         key,
+         winner_pid,
+         {local_pid, local_meta},
+         {remote_pid, remote_meta}
+       ) do
+    cond do
+      winner_pid == local_pid ->
+        Process.exit(remote_pid, {:group_registry_conflict, key, local_meta})
+
+      winner_pid == remote_pid ->
+        Process.exit(local_pid, {:group_registry_conflict, key, remote_meta})
+
+      true ->
+        :ok
+    end
   end
 
   # Gather local data for all shared clusters in ONE table scan (instead of C scans)

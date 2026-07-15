@@ -2279,6 +2279,54 @@ defmodule GroupTest do
                Group.Replica.Data.registry_lookup_by_pid(name, 0, new_pid)
     end
 
+    test "custom conflict resolver terminates the losing registry owner" do
+      key = "replicated-registry/custom-loser/#{System.unique_integer([:positive])}"
+
+      name =
+        start_single_shard_group(
+          replicated_registry_receiver_buffer_size: 1,
+          resolve_registry_conflict: {GroupTest.ResolveRegistryConflict, :pick, [:remote]}
+        )
+
+      parent = self()
+
+      local_owner =
+        spawn(fn ->
+          :ok = Group.register(name, key, %{owner: :local})
+          send(parent, {:custom_conflict_owner_ready, self()})
+          Process.sleep(:infinity)
+        end)
+
+      remote_pid = spawn_forever()
+
+      on_exit(fn ->
+        kill_if_alive(local_owner)
+        kill_if_alive(remote_pid)
+      end)
+
+      assert_receive {:custom_conflict_owner_ready, ^local_owner}, 1_000
+      owner_ref = Process.monitor(local_owner)
+      shard = Group.Replica.shard_name(name, 0)
+
+      send(
+        shard,
+        replicated_register(
+          nil,
+          key,
+          remote_pid,
+          %{owner: :remote},
+          :register,
+          System.system_time()
+        )
+      )
+
+      assert_receive {:DOWN, ^owner_ref, :process, ^local_owner,
+                      {:group_registry_conflict, ^key, %{owner: :remote}}},
+                     1_000
+
+      assert Group.lookup(name, key) == {remote_pid, %{owner: :remote}}
+    end
+
     test "batched remote conflict keeps the staged local winner when later unregister arrives" do
       key = "replicated-registry/conflict-local/#{System.unique_integer([:positive])}"
 

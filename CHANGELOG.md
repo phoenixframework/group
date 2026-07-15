@@ -4,6 +4,13 @@
   them — instead of removing only locally owned rows. Reconnecting resyncs through the normal
   snapshot exchange. `connect`/`disconnect` also raise `ArgumentError` for non-binary cluster
   names instead of silently tolerating them.
+- **Breaking**: registry conflict losers are now always terminated with
+  `{:group_registry_conflict, key, winner_meta}` after a winner is chosen. Previously only the
+  built-in default resolver killed the loser; custom `resolve_registry_conflict` callbacks left
+  it running. Custom resolvers that already kill the loser themselves are unaffected (the extra
+  exit signal is redundant), but resolvers that expected the losing process to keep running must
+  now handle its termination. The exit reason's metadata is now consistently the winner's
+  metadata on every node (previously each node reported its remote side's metadata).
 
 ## 0.2.0 (2026-04-17)
 - remove deprecate message handling
