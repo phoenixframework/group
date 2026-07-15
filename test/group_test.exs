@@ -1880,6 +1880,50 @@ defmodule GroupTest do
                {:registry, nil, "users/self", self(), %{public: :keep}}
              ]
     end
+
+    test "rejects invalid extract_meta configuration at startup" do
+      for bad <- ["nope", {Map, :take}, fn a, b -> {a, b} end] do
+        name = :"invalid_extract_meta_#{System.unique_integer([:positive])}"
+
+        error =
+          assert_raise ArgumentError, fn ->
+            Group.Supervisor.init(name: name, extract_meta: bad, log: false)
+          end
+
+        assert error.message =~ ":extract_meta"
+      end
+    end
+
+    test "applies a configured extract_meta function to reads and events" do
+      name = :"test_group_extract_fun_#{System.unique_integer([:positive])}"
+      extract_meta = fn meta -> Map.take(meta, [:public]) end
+      start_supervised!({Group, name: name, shards: 1, log: false, extract_meta: extract_meta})
+
+      registry_key = "users/function"
+      pg_key = "rooms/function"
+      :ok = Group.monitor(name, :all)
+
+      :ok = Group.register(name, registry_key, %{public: :registry, private: :drop})
+      :ok = Group.join(name, pg_key, %{public: :pg, private: :drop})
+
+      assert_receive {:group,
+                      [%Group.Event{type: :registered, key: ^registry_key} = registry_event], _},
+                     1_000
+
+      assert registry_event.meta == %{public: :registry}
+
+      assert_receive {:group, [%Group.Event{type: :joined, key: ^pg_key} = pg_event], _}, 1_000
+      assert pg_event.meta == %{public: :pg}
+
+      assert Group.lookup(name, registry_key) == {self(), %{public: :registry}}
+      assert Group.members(name, pg_key) == [{self(), %{public: :pg}}]
+
+      assert Enum.sort(Group.local_entries(name)) ==
+               Enum.sort([
+                 {:registry, nil, registry_key, self(), %{public: :registry}},
+                 {:pg, nil, pg_key, self(), %{public: :pg}}
+               ])
+    end
   end
 
   describe "concurrent operations" do

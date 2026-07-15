@@ -3212,6 +3212,7 @@ defmodule Group.Replica do
   defp extract_meta_fn(name) do
     case Group.get_config(name) do
       %{extract_meta: {mod, func, args}} -> fn meta -> apply(mod, func, [meta | args]) end
+      %{extract_meta: func} when is_function(func, 1) -> func
       _ -> & &1
     end
   end

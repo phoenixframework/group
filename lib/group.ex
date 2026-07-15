@@ -1123,6 +1123,7 @@ defmodule Group do
       nil ->
         case :persistent_term.get({__MODULE__, name}, nil) do
           %{extract_meta: {mod, func, args}} -> fn meta -> apply(mod, func, [meta | args]) end
+          %{extract_meta: func} when is_function(func, 1) -> func
           _ -> & &1
         end
 

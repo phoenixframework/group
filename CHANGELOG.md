@@ -16,6 +16,9 @@
   message is dropped, the link is force-disconnected, and bounded reconnect retries begin (the
   same policy replication lanes have used since 0.1.8). Previously dispatch could block the
   caller and initiate new connections.
+- Configured function-form `extract_meta` callbacks are now applied on reads and lifecycle
+  events (previously they were silently ignored and full metadata was exposed), and invalid
+  `:extract_meta` values raise `ArgumentError` at startup.
 
 ## 0.2.0 (2026-04-17)
 - remove deprecate message handling
