@@ -1785,6 +1785,46 @@ defmodule GroupTest do
   end
 
   describe "local_registry_count/1" do
+    test "local activity checks use bounded ETS selects", %{name: name} do
+      registry_key = "presence/registry/#{System.unique_integer([:positive])}"
+      pg_key = "presence/pg/#{System.unique_integer([:positive])}"
+      :ok = Group.register(name, registry_key, %{})
+      :ok = Group.join(name, pg_key, %{})
+      num_shards = Group.get_config(name).num_shards
+      parent = self()
+
+      :erlang.trace_pattern({:ets, :select, 3}, true, [:local])
+      :erlang.trace_pattern({:ets, :select_count, 2}, true, [:local])
+
+      on_exit(fn ->
+        :erlang.trace_pattern({:ets, :select, 3}, false, [:local])
+        :erlang.trace_pattern({:ets, :select_count, 2}, false, [:local])
+      end)
+
+      checks = [
+        registry: fn -> Group.Replica.Data.local_registry_present?(name, num_shards, nil) end,
+        pg: fn -> Group.Replica.Data.local_pg_present?(name, num_shards, nil) end
+      ]
+
+      for {kind, check} <- checks do
+        worker =
+          spawn(fn ->
+            receive do
+              :check -> send(parent, {:presence_result, kind, check.()})
+            end
+          end)
+
+        :erlang.trace(worker, true, [:call])
+        send(worker, :check)
+
+        assert_receive {:trace, ^worker, :call, {:ets, :select, [_table, _match_spec, 1]}},
+                       1_000
+
+        refute_receive {:trace, ^worker, :call, {:ets, :select_count, _args}}, 20
+        assert_receive {:presence_result, ^kind, true}, 1_000
+      end
+    end
+
     test "counts registered processes", %{name: name} do
       assert Group.local_registry_count(name) == 0
 

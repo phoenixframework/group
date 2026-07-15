@@ -687,9 +687,9 @@ defmodule Group.Replica.Data do
     Enum.any?(0..(num_shards - 1), fn shard ->
       table = reg_by_key_table(name, shard)
 
-      :ets.select_count(table, [
+      select_exists?(table, [
         {{{cluster, :_}, :_, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
-      ]) > 0
+      ])
     end)
   end
 
@@ -714,9 +714,9 @@ defmodule Group.Replica.Data do
     Enum.any?(0..(num_shards - 1), fn shard ->
       table = pg_by_key_table(name, shard)
 
-      :ets.select_count(table, [
+      select_exists?(table, [
         {{{cluster, :_, :_}, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
-      ]) > 0
+      ])
     end)
   end
 
@@ -738,6 +738,13 @@ defmodule Group.Replica.Data do
 
       acc + count
     end)
+  end
+
+  defp select_exists?(table, match_spec) do
+    case :ets.select(table, match_spec, 1) do
+      {[_match], _continuation} -> true
+      :"$end_of_table" -> false
+    end
   end
 
   # =====================================================================
