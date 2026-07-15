@@ -637,6 +637,57 @@ defmodule GroupTest do
       assert forward? == reverse?
     end
 
+    test "replication queued after disconnect cannot repopulate the cluster" do
+      name =
+        start_single_shard_group(
+          replicated_pg_receiver_buffer_size: 1,
+          replicated_registry_receiver_buffer_size: 1
+        )
+
+      cluster = "disconnect/race/#{System.unique_integer([:positive])}"
+      registry_key = "late/registry"
+      pg_key = "late/pg"
+      remote_pid = spawn_forever()
+      shard = Group.Replica.shard_name(name, 0)
+
+      on_exit(fn ->
+        resume_shard_if_alive(shard)
+        kill_if_alive(remote_pid)
+      end)
+
+      assert :ok = Group.connect(name, cluster)
+      :ok = :sys.suspend(shard)
+
+      disconnect_caller =
+        spawn_requester(fn -> Group.disconnect(name, cluster) end, :disconnect_result)
+
+      on_exit(fn -> kill_if_alive(disconnect_caller) end)
+
+      wait_until(fn ->
+        {:messages, messages} = Process.info(Process.whereis(shard), :messages)
+
+        disconnect_queued? =
+          Enum.any?(messages, fn
+            {:group_local_request, _alias, {:cluster_disconnect, [^cluster]}} -> true
+            {:group_local_request, _caller, _ref, {:cluster_disconnect, [^cluster]}} -> true
+            _ -> false
+          end)
+
+        not Group.connected?(name, cluster) and disconnect_queued?
+      end)
+
+      send(shard, replicated_register(cluster, registry_key, remote_pid, %{}, :register))
+      send(shard, replicated_pg_join(cluster, pg_key, remote_pid, %{}, :join))
+      :ok = :sys.resume(shard)
+
+      assert_receive {:disconnect_result, ^disconnect_caller, :ok}, 1_000
+      :sys.get_state(shard)
+
+      refute Group.connected?(name, cluster)
+      assert Group.lookup(name, registry_key, cluster: cluster) == nil
+      assert Group.members(name, pg_key, cluster: cluster) == []
+    end
+
     test "connect/disconnect/connected? manage cluster lifecycle", %{name: name} do
       cluster = "game_servers"
 

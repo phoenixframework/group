@@ -2208,6 +2208,11 @@ defmodule Group.Replica do
     %{name: name, shard_index: shard} = state
     local_node = node()
 
+    ops =
+      Enum.filter(ops, fn op ->
+        replicated_op_for_active_cluster?(name, op, &registry_op_cluster/1)
+      end)
+
     Enum.reduce(ops, {%{}, [], [], MapSet.new()}, fn
       {:register, cluster, key, pid, meta, time, entry_node},
       {entries, events, broadcasts, maybe_demonitor_pids} ->
@@ -2303,6 +2308,11 @@ defmodule Group.Replica do
   end
 
   defp apply_replicated_pg_ops(name, shard, ops) do
+    ops =
+      Enum.filter(ops, fn op ->
+        replicated_op_for_active_cluster?(name, op, &pg_op_cluster/1)
+      end)
+
     {entries, events} =
       Enum.reduce(ops, {%{}, []}, fn
         {:join, cluster, key, pid, meta, time, reason, entry_node}, {entries, events} ->
@@ -2470,6 +2480,14 @@ defmodule Group.Replica do
     do: cluster
 
   defp registry_op_cluster({:unregister, cluster, _key, _pid, _meta, _reason}), do: cluster
+
+  defp replicated_op_for_active_cluster?(name, op, cluster_fun)
+       when is_function(cluster_fun, 1) do
+    case cluster_fun.(op) do
+      nil -> true
+      cluster -> cluster_member?(name, cluster)
+    end
+  end
 
   defp send_to_peer(state, target_node, message) do
     send_remote_shard_message(state, target_node, message)
