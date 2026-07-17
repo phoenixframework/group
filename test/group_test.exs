@@ -314,6 +314,46 @@ defmodule GroupTest do
       members = Group.members(name, key)
       assert [{^joiner, %{type: :client}}] = members
     end
+
+    test "limits exact-key results without changing the return shape", %{name: name} do
+      key = "limited/#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      pids =
+        for id <- 1..5 do
+          pid =
+            spawn(fn ->
+              :ok = Group.join(name, key, %{id: id})
+              send(test_pid, {:joined, self()})
+              Process.sleep(:infinity)
+            end)
+
+          on_exit(fn ->
+            if Process.alive?(pid), do: Process.exit(pid, :kill)
+          end)
+
+          pid
+        end
+
+      for pid <- pids, do: assert_receive({:joined, ^pid}, 1000)
+
+      members = Group.members(name, key, limit: 2)
+
+      assert length(members) == 2
+      assert Enum.all?(members, fn {pid, %{id: id}} -> pid in pids and id in 1..5 end)
+      assert Group.members(name, key, limit: 0) == []
+      assert length(Group.members(name, key)) == 5
+    end
+
+    test "rejects invalid limits", %{name: name} do
+      assert_raise ArgumentError, ~r/expected :limit to be a non-negative integer/, fn ->
+        Group.members(name, "limited", limit: -1)
+      end
+
+      assert_raise ArgumentError, ~r/expected :limit to be a non-negative integer/, fn ->
+        Group.members(name, "limited", limit: "1")
+      end
+    end
   end
 
   describe "prefix members" do
@@ -437,6 +477,19 @@ defmodule GroupTest do
       # Verify all items present
       found_ids = Enum.map(members, fn {_pid, meta} -> meta.i end) |> Enum.sort()
       assert found_ids == Enum.to_list(1..20)
+    end
+
+    test "applies one global limit across prefix-query shards", %{name: name} do
+      prefix = "limited_shard_spread/#{System.unique_integer([:positive])}/"
+
+      for i <- 1..20 do
+        :ok = Group.join(name, prefix <> "item_#{i}", %{i: i})
+      end
+
+      members = Group.members(name, prefix, limit: 3)
+
+      assert length(members) == 3
+      assert Enum.all?(members, fn {pid, %{i: i}} -> pid == self() and i in 1..20 end)
     end
 
     test "register raises on key ending with /", %{name: name} do
@@ -1618,6 +1671,64 @@ defmodule GroupTest do
 
       assert Group.local_member_count(name, prefix) == 2
       assert Group.local_member_count(name, other) == 1
+    end
+  end
+
+  describe "local_members/3" do
+    test "returns local exact-key members and honors the limit", %{name: name} do
+      key = "local_members/#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      pids =
+        for id <- 1..4 do
+          pid =
+            spawn(fn ->
+              :ok = Group.join(name, key, %{id: id})
+              send(test_pid, {:joined, self()})
+              Process.sleep(:infinity)
+            end)
+
+          on_exit(fn ->
+            if Process.alive?(pid), do: Process.exit(pid, :kill)
+          end)
+
+          pid
+        end
+
+      for pid <- pids, do: assert_receive({:joined, ^pid}, 1000)
+
+      members = Group.local_members(name, key, limit: 2)
+
+      assert length(members) == 2
+      assert Enum.all?(members, fn {pid, %{id: id}} -> pid in pids and id in 1..4 end)
+      assert Group.local_members(name, key, limit: 0) == []
+      assert length(Group.local_members(name, key)) == 4
+    end
+
+    test "supports prefix queries and metadata extraction", %{name: name} do
+      prefix = "local_prefix/#{System.unique_integer([:positive])}/"
+
+      for id <- 1..5 do
+        :ok = Group.join(name, prefix <> Integer.to_string(id), %{public: id, private: :drop})
+      end
+
+      members =
+        Group.local_members(name, prefix,
+          limit: 2,
+          extract_meta: {GroupTest.ExtractMeta, :strip, []}
+        )
+
+      assert length(members) == 2
+
+      assert Enum.all?(members, fn {pid, meta} ->
+               pid == self() and Map.keys(meta) == [:public]
+             end)
+    end
+
+    test "rejects invalid limits", %{name: name} do
+      assert_raise ArgumentError, ~r/expected :limit to be a non-negative integer/, fn ->
+        Group.local_members(name, "local_members", limit: nil)
+      end
     end
   end
 

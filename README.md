@@ -56,11 +56,17 @@ children = [
 # List all members — returns [{pid, meta}, ...]
 members = Group.members(:my_app, "chat/room/42")
 
+# Read at most one arbitrary member without materializing the full group
+[member] = Group.members(:my_app, "chat/room/42", limit: 1)
+
+# Read only members whose owning process is on this node
+local_members = Group.local_members(:my_app, "chat/room/42", limit: 10)
+
 # Leave
 :ok = Group.leave(:my_app, "chat/room/42")
 ```
 
-`members/2` returns joined processes for a key. Registered processes are not
+`members/2` and `local_members/2` return joined processes for a key. Registered processes are not
 included — use `lookup/2` for those.
 Keys ending with `"/"` perform a prefix query across all shards:
 

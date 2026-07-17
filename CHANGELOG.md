@@ -1,3 +1,6 @@
+## Unreleased
+- Add bounded `Group.members/3` queries with `limit:` and local-owner process-group queries through `Group.local_members/3`
+
 ## 0.2.0 (2026-04-17)
 - remove deprecate message handling
 
