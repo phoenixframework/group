@@ -4,13 +4,9 @@
   them — instead of removing only locally owned rows. Reconnecting resyncs through the normal
   snapshot exchange. `connect`/`disconnect` also raise `ArgumentError` for non-binary cluster
   names instead of silently tolerating them.
-- **Breaking**: registry conflict losers are now always terminated with
-  `{:group_registry_conflict, key, winner_meta}` after a winner is chosen. Previously only the
-  built-in default resolver killed the loser; custom `resolve_registry_conflict` callbacks left
-  it running. Custom resolvers that already kill the loser themselves are unaffected (the extra
-  exit signal is redundant), but resolvers that expected the losing process to keep running must
-  now handle its termination. The exit reason's metadata is now consistently the winner's
-  metadata on every node (previously each node reported its remote side's metadata).
+- The built-in registry conflict resolver now consistently includes the winner's metadata in
+  the losing process's `{:group_registry_conflict, key, winner_meta}` exit reason. Custom
+  `resolve_registry_conflict` callbacks remain responsible for any process exits they require.
 - **Breaking**: `Group.dispatch/4` remote sends and process-DOWN replication are now
   non-suspending and never auto-connect — on a busy or disconnected distribution link the
   message is dropped, the link is force-disconnected, and bounded reconnect retries begin (the
@@ -23,6 +19,9 @@
   into a `nil` miss; extractor errors now propagate to the caller.
 - Invalid `:shards` values (zero, negative, non-integer) raise `ArgumentError` at startup
   instead of failing later during key routing.
+
+## 0.2.1 (2026-07-17)
+- Add bounded `Group.members/3` queries with `limit:` and local-owner process-group queries through `Group.local_members/3`
 
 ## 0.2.0 (2026-04-17)
 - remove deprecate message handling

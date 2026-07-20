@@ -16,8 +16,9 @@ defmodule Group do
   - Writes (register, join, etc.) return immediately after local update
   - Other nodes receive updates asynchronously via Erlang distribution
   - During network partitions, nodes may have divergent views
-  - When partitions heal, conflicts are resolved. The losing process is killed
-    with `{:group_registry_conflict, key, meta}`
+  - When partitions heal, conflicts are resolved. The built-in resolver kills
+    the losing process with `{:group_registry_conflict, key, winner_meta}`;
+    custom resolvers control any process exits themselves
 
   ## Clusters
 
@@ -194,8 +195,10 @@ defmodule Group do
   - `:resolve_registry_conflict` — `{module, function, extra_args}` callback invoked when
     two nodes hold the same registry key (partition heal or concurrent registration).
     Called as `apply(module, function, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
-    Must return the winner pid. The loser is killed with `{:group_registry_conflict, key, meta}`.
-    **Important:** This callback runs synchronously inside the shard GenServer — it must
+    Must return the winner pid and is responsible for any process exits it requires. When
+    no callback is configured, the built-in resolver kills the loser with
+    `{:group_registry_conflict, key, winner_meta}`. **Important:** This callback runs
+    synchronously inside the shard GenServer — it must
     return quickly and never block. Any information needed for the decision should be
     carried in the registration metadata, not fetched at resolution time.
   - `:extract_meta` — `{module, function, args}` or a one-argument function to
@@ -668,6 +671,7 @@ defmodule Group do
 
   - `:cluster` - Query a named cluster instead of the default cluster
   - `:extract_meta` - Override the configured extract_meta callback for this call
+  - `:limit` - Return at most this many members. Must be a non-negative integer.
 
   ## Returns
 
@@ -680,26 +684,70 @@ defmodule Group do
     cluster = Keyword.get(opts, :cluster)
     extract_meta_fn = resolve_extract_meta(name, opts)
     num_shards = get_config(name).num_shards
+    limit = member_limit!(opts)
 
     if String.ends_with?(group, "/") do
-      members_by_prefix(name, num_shards, cluster, group, extract_meta_fn)
+      members_by_prefix(name, num_shards, cluster, group, extract_meta_fn, limit)
     else
-      members_exact(name, num_shards, cluster, group, extract_meta_fn)
+      members_exact(name, num_shards, cluster, group, extract_meta_fn, limit)
     end
   end
 
-  defp members_exact(name, num_shards, cluster, group, extract_meta_fn) do
+  defp members_exact(name, num_shards, cluster, group, extract_meta_fn, limit) do
     shard = Replica.shard_index_for(cluster, group, num_shards)
 
-    Data.pg_members(name, shard, cluster, group)
+    Data.pg_members(name, shard, cluster, group, limit)
     |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
   end
 
-  defp members_by_prefix(name, num_shards, cluster, prefix, extract_meta_fn) do
-    Enum.flat_map(0..(num_shards - 1), fn shard ->
-      Data.pg_members_by_prefix(name, shard, cluster, prefix)
-      |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
+  defp members_by_prefix(name, num_shards, cluster, prefix, extract_meta_fn, limit) do
+    num_shards
+    |> members_across_shards(limit, fn shard, shard_limit ->
+      Data.pg_members_by_prefix(name, shard, cluster, prefix, shard_limit)
     end)
+    |> Enum.map(fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
+  end
+
+  @doc """
+  List process-group members owned by the local node.
+
+  Unlike `members/3`, this excludes replicated memberships owned by remote
+  nodes. Registry entries are not included.
+
+  Supports prefix matching: if `group` ends with `"/"`, returns local members
+  whose group key starts with that prefix. Prefix queries scan all shards. Exact
+  queries hit a single shard.
+
+  ## Options
+
+  - `:cluster` - Query a named cluster instead of the default cluster
+  - `:extract_meta` - Override the configured extract_meta callback for this call
+  - `:limit` - Return at most this many members. Must be a non-negative integer.
+
+  ## Returns
+
+  - List of `{pid, meta}` tuples
+  """
+  def local_members(name, group, opts \\ [])
+
+  def local_members(name, group, opts)
+      when is_atom(name) and is_binary(group) and is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    extract_meta_fn = resolve_extract_meta(name, opts)
+    num_shards = get_config(name).num_shards
+    limit = member_limit!(opts)
+
+    members =
+      if String.ends_with?(group, "/") do
+        members_across_shards(num_shards, limit, fn shard, shard_limit ->
+          Data.pg_members_local_by_prefix(name, shard, cluster, group, shard_limit)
+        end)
+      else
+        shard = Replica.shard_index_for(cluster, group, num_shards)
+        Data.pg_members_local_with_meta(name, shard, cluster, group, limit)
+      end
+
+    Enum.map(members, fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
   end
 
   @doc """
@@ -1026,11 +1074,7 @@ defmodule Group do
   @doc false
   def connect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
-    local = node()
-
-    for cluster <- clusters do
-      Data.add_cluster_node(name, cluster, local)
-    end
+    Data.add_cluster_node(name, clusters, node())
 
     notify_shard = :rand.uniform(get_config(name).num_shards) - 1
 
@@ -1044,9 +1088,7 @@ defmodule Group do
   @doc false
   def disconnect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
-    for cluster <- clusters do
-      Data.remove_cluster_node(name, cluster, node())
-    end
+    Data.remove_cluster_node(name, clusters, node())
 
     num_shards = get_config(name).num_shards
 
@@ -1088,6 +1130,45 @@ defmodule Group do
   defp call_timeout(opts), do: Keyword.get(opts, :timeout, @default_call_timeout)
   defp cluster_call_timeout(opts), do: Keyword.get(opts, :timeout, @default_cluster_call_timeout)
   defp cluster_ttl(opts), do: Keyword.get(opts, :ttl) |> validate_cluster_ttl!()
+
+  defp member_limit!(opts) do
+    case Keyword.fetch(opts, :limit) do
+      :error ->
+        :infinity
+
+      {:ok, limit} when is_integer(limit) and limit >= 0 ->
+        limit
+
+      {:ok, limit} ->
+        raise ArgumentError,
+              "expected :limit to be a non-negative integer, got: #{inspect(limit)}"
+    end
+  end
+
+  defp members_across_shards(num_shards, :infinity, query) do
+    Enum.flat_map(0..(num_shards - 1), fn shard -> query.(shard, :infinity) end)
+  end
+
+  defp members_across_shards(_num_shards, 0, _query), do: []
+
+  defp members_across_shards(num_shards, limit, query) do
+    {chunks, _remaining} =
+      Enum.reduce_while(0..(num_shards - 1), {[], limit}, fn shard, {chunks, remaining} ->
+        members = query.(shard, remaining)
+        remaining = remaining - length(members)
+        chunks = [members | chunks]
+
+        if remaining == 0 do
+          {:halt, {chunks, remaining}}
+        else
+          {:cont, {chunks, remaining}}
+        end
+      end)
+
+    chunks
+    |> Enum.reverse()
+    |> List.flatten()
+  end
 
   defp validate_cluster_connected!(_name, nil), do: :ok
 

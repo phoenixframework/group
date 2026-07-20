@@ -345,6 +345,46 @@ defmodule GroupTest do
       members = Group.members(name, key)
       assert [{^joiner, %{type: :client}}] = members
     end
+
+    test "limits exact-key results without changing the return shape", %{name: name} do
+      key = "limited/#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      pids =
+        for id <- 1..5 do
+          pid =
+            spawn(fn ->
+              :ok = Group.join(name, key, %{id: id})
+              send(test_pid, {:joined, self()})
+              Process.sleep(:infinity)
+            end)
+
+          on_exit(fn ->
+            if Process.alive?(pid), do: Process.exit(pid, :kill)
+          end)
+
+          pid
+        end
+
+      for pid <- pids, do: assert_receive({:joined, ^pid}, 1000)
+
+      members = Group.members(name, key, limit: 2)
+
+      assert length(members) == 2
+      assert Enum.all?(members, fn {pid, %{id: id}} -> pid in pids and id in 1..5 end)
+      assert Group.members(name, key, limit: 0) == []
+      assert length(Group.members(name, key)) == 5
+    end
+
+    test "rejects invalid limits", %{name: name} do
+      assert_raise ArgumentError, ~r/expected :limit to be a non-negative integer/, fn ->
+        Group.members(name, "limited", limit: -1)
+      end
+
+      assert_raise ArgumentError, ~r/expected :limit to be a non-negative integer/, fn ->
+        Group.members(name, "limited", limit: "1")
+      end
+    end
   end
 
   describe "prefix members" do
@@ -468,6 +508,19 @@ defmodule GroupTest do
       # Verify all items present
       found_ids = Enum.map(members, fn {_pid, meta} -> meta.i end) |> Enum.sort()
       assert found_ids == Enum.to_list(1..20)
+    end
+
+    test "applies one global limit across prefix-query shards", %{name: name} do
+      prefix = "limited_shard_spread/#{System.unique_integer([:positive])}/"
+
+      for i <- 1..20 do
+        :ok = Group.join(name, prefix <> "item_#{i}", %{i: i})
+      end
+
+      members = Group.members(name, prefix, limit: 3)
+
+      assert length(members) == 3
+      assert Enum.all?(members, fn {pid, %{i: i}} -> pid == self() and i in 1..20 end)
     end
 
     test "register raises on key ending with /", %{name: name} do
@@ -629,7 +682,7 @@ defmodule GroupTest do
       forward = Group.Replica.Data.cluster_nodes_table(name)
       reverse = Group.Replica.Data.node_clusters_table(name)
 
-      :ok = Group.Replica.Data.add_cluster_node(name, cluster, dead_node)
+      :ok = Group.Replica.Data.add_cluster_node(name, [cluster], dead_node)
 
       # Reproduce the one-sided state possible when add/remove/purge operations
       # on the two public ETS indexes interleave.
@@ -653,9 +706,9 @@ defmodule GroupTest do
       |> Task.async_stream(
         fn i ->
           if rem(i, 2) == 0 do
-            Group.Replica.Data.add_cluster_node(name, cluster, remote_node)
+            Group.Replica.Data.add_cluster_node(name, [cluster], remote_node)
           else
-            Group.Replica.Data.remove_cluster_node(name, cluster, remote_node)
+            Group.Replica.Data.remove_cluster_node(name, [cluster], remote_node)
           end
         end,
         max_concurrency: 20,
@@ -1940,6 +1993,64 @@ defmodule GroupTest do
     end
   end
 
+  describe "local_members/3" do
+    test "returns local exact-key members and honors the limit", %{name: name} do
+      key = "local_members/#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      pids =
+        for id <- 1..4 do
+          pid =
+            spawn(fn ->
+              :ok = Group.join(name, key, %{id: id})
+              send(test_pid, {:joined, self()})
+              Process.sleep(:infinity)
+            end)
+
+          on_exit(fn ->
+            if Process.alive?(pid), do: Process.exit(pid, :kill)
+          end)
+
+          pid
+        end
+
+      for pid <- pids, do: assert_receive({:joined, ^pid}, 1000)
+
+      members = Group.local_members(name, key, limit: 2)
+
+      assert length(members) == 2
+      assert Enum.all?(members, fn {pid, %{id: id}} -> pid in pids and id in 1..4 end)
+      assert Group.local_members(name, key, limit: 0) == []
+      assert length(Group.local_members(name, key)) == 4
+    end
+
+    test "supports prefix queries and metadata extraction", %{name: name} do
+      prefix = "local_prefix/#{System.unique_integer([:positive])}/"
+
+      for id <- 1..5 do
+        :ok = Group.join(name, prefix <> Integer.to_string(id), %{public: id, private: :drop})
+      end
+
+      members =
+        Group.local_members(name, prefix,
+          limit: 2,
+          extract_meta: {GroupTest.ExtractMeta, :strip, []}
+        )
+
+      assert length(members) == 2
+
+      assert Enum.all?(members, fn {pid, meta} ->
+               pid == self() and Map.keys(meta) == [:public]
+             end)
+    end
+
+    test "rejects invalid limits", %{name: name} do
+      assert_raise ArgumentError, ~r/expected :limit to be a non-negative integer/, fn ->
+        Group.local_members(name, "local_members", limit: nil)
+      end
+    end
+  end
+
   describe "local_entries/1" do
     test "returns local registry and pg entries across clusters", %{name: name} do
       :ok = Group.connect(name, "game")
@@ -2568,7 +2679,7 @@ defmodule GroupTest do
                Group.Replica.Data.registry_lookup_by_pid(name, 0, new_pid)
     end
 
-    test "custom conflict resolver terminates the losing registry owner" do
+    test "custom conflict resolver controls the losing registry owner's lifecycle" do
       key = "replicated-registry/custom-loser/#{System.unique_integer([:positive])}"
 
       name =
@@ -2609,11 +2720,12 @@ defmodule GroupTest do
         )
       )
 
-      assert_receive {:DOWN, ^owner_ref, :process, ^local_owner,
-                      {:group_registry_conflict, ^key, %{owner: :remote}}},
-                     1_000
+      wait_until(fn ->
+        Group.lookup(name, key) == {remote_pid, %{owner: :remote}}
+      end)
 
-      assert Group.lookup(name, key) == {remote_pid, %{owner: :remote}}
+      refute_receive {:DOWN, ^owner_ref, :process, ^local_owner, _reason}, 50
+      assert Process.alive?(local_owner)
     end
 
     test "batched remote conflict keeps the staged local winner when later unregister arrives" do

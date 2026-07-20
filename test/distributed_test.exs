@@ -555,16 +555,10 @@ defmodule Group.DistributedTest do
         timeout: 10_000
       )
 
-      {winner_pid, _meta} =
-        TestCluster.rpc!(node_a, Group, :lookup, [name, "user/conflict"])
-
-      loser_pid = if winner_pid == pid_a, do: pid_b, else: pid_a
-
-      TestCluster.assert_eventually(fn ->
-        not TestCluster.rpc!(node(loser_pid), Process, :alive?, [loser_pid])
-      end)
-
-      assert TestCluster.rpc!(node(winner_pid), Process, :alive?, [winner_pid])
+      # Custom resolvers own process lifecycle decisions. This resolver only
+      # picks a registry winner, so neither owner is terminated by Group.
+      assert TestCluster.rpc!(node_a, Process, :alive?, [pid_a])
+      assert TestCluster.rpc!(node_b, Process, :alive?, [pid_b])
     end
   end
 
@@ -3701,6 +3695,46 @@ defmodule Group.DistributedTest do
   end
 
   describe "prefix members across nodes" do
+    test "local members exclude replicated memberships owned by other nodes" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"local_members_dist_#{System.unique_integer([:positive])}"
+      key = "tunnels/host-1"
+      prefix = "tunnels/prefix/"
+      opts = [name: name, shards: 4]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+      end)
+
+      pid_a = TestCluster.spawn_join(node_a, name, key, %{owner: :a})
+      pid_b = TestCluster.spawn_join(node_b, name, key, %{owner: :b})
+      prefix_pid_a = TestCluster.spawn_join(node_a, name, prefix <> "a", %{owner: :prefix_a})
+      prefix_pid_b = TestCluster.spawn_join(node_b, name, prefix <> "b", %{owner: :prefix_b})
+
+      for node <- [node_a, node_b] do
+        TestCluster.assert_eventually(fn ->
+          length(TestCluster.rpc!(node, Group, :members, [name, key])) == 2
+        end)
+      end
+
+      assert [{^pid_a, %{owner: :a}}] =
+               TestCluster.rpc!(node_a, Group, :local_members, [name, key, [limit: 1]])
+
+      assert [{^pid_b, %{owner: :b}}] =
+               TestCluster.rpc!(node_b, Group, :local_members, [name, key, [limit: 1]])
+
+      assert [{^prefix_pid_a, %{owner: :prefix_a}}] =
+               TestCluster.rpc!(node_a, Group, :local_members, [name, prefix, [limit: 1]])
+
+      assert [{^prefix_pid_b, %{owner: :prefix_b}}] =
+               TestCluster.rpc!(node_b, Group, :local_members, [name, prefix, [limit: 1]])
+    end
+
     test "prefix query excludes registrations from all nodes" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)

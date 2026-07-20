@@ -327,14 +327,14 @@ defmodule Group.Replica.Data do
     end
   end
 
-  def pg_members(name, shard, cluster, key) do
+  def pg_members(name, shard, cluster, key, limit \\ :infinity) do
     table = pg_by_key_table(name, shard)
     # Use match spec to find all entries with the given {cluster, key, _pid} prefix
     match_spec = [
       {{{cluster, key, :"$1"}, :"$2", :_, :_}, [], [{{:"$1", :"$2"}}]}
     ]
 
-    :ets.select(table, match_spec)
+    select(table, match_spec, limit)
   end
 
   def pg_members_with_node(name, shard, cluster, key) do
@@ -347,14 +347,18 @@ defmodule Group.Replica.Data do
     :ets.select(table, match_spec)
   end
 
-  def pg_members_by_prefix(name, shard, cluster, prefix) do
+  def pg_members_by_prefix(name, shard, cluster, prefix, limit \\ :infinity) do
     table = pg_by_key_table(name, shard)
     prefix_end = next_binary_prefix(prefix)
 
-    :ets.select(table, [
-      {{{cluster, :"$1", :"$2"}, :"$3", :_, :_},
-       [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}], [{{:"$2", :"$3"}}]}
-    ])
+    select(
+      table,
+      [
+        {{{cluster, :"$1", :"$2"}, :"$3", :_, :_},
+         [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}], [{{:"$2", :"$3"}}]}
+      ],
+      limit
+    )
   end
 
   def pg_members_local(name, shard, cluster, key) do
@@ -366,6 +370,35 @@ defmodule Group.Replica.Data do
     ]
 
     :ets.select(table, match_spec)
+  end
+
+  def pg_members_local_with_meta(name, shard, cluster, key, limit \\ :infinity) do
+    local_node = node()
+    table = pg_by_key_table(name, shard)
+
+    match_spec = [
+      {{{cluster, key, :"$1"}, :"$2", :_, :"$3"}, [{:==, :"$3", local_node}], [{{:"$1", :"$2"}}]}
+    ]
+
+    select(table, match_spec, limit)
+  end
+
+  def pg_members_local_by_prefix(name, shard, cluster, prefix, limit \\ :infinity) do
+    local_node = node()
+    table = pg_by_key_table(name, shard)
+    prefix_end = next_binary_prefix(prefix)
+
+    select(
+      table,
+      [
+        {{{cluster, :"$1", :"$2"}, :"$3", :_, :"$4"},
+         [
+           {:==, :"$4", local_node},
+           {:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}
+         ], [{{:"$2", :"$3"}}]}
+      ],
+      limit
+    )
   end
 
   @doc """
@@ -745,12 +778,12 @@ defmodule Group.Replica.Data do
     :ets.lookup(table, cluster) |> Enum.map(&elem(&1, 1))
   end
 
-  def add_cluster_node(name, cluster, node) do
-    GenServer.call(data_name(name), {:add_cluster_node, cluster, node}, :infinity)
+  def add_cluster_node(name, clusters, node) when is_list(clusters) do
+    GenServer.call(data_name(name), {:add_cluster_node, clusters, node}, :infinity)
   end
 
-  def remove_cluster_node(name, cluster, node) do
-    GenServer.call(data_name(name), {:remove_cluster_node, cluster, node}, :infinity)
+  def remove_cluster_node(name, clusters, node) when is_list(clusters) do
+    GenServer.call(data_name(name), {:remove_cluster_node, clusters, node}, :infinity)
   end
 
   def all_clusters(name) do
@@ -819,15 +852,18 @@ defmodule Group.Replica.Data do
   # =====================================================================
 
   @impl true
-  def handle_call({:add_cluster_node, cluster, node}, _from, state) do
-    :ets.insert(cluster_nodes_table(state.name), {cluster, node})
-    :ets.insert(node_clusters_table(state.name), {node, cluster})
+  def handle_call({:add_cluster_node, clusters, node}, _from, state) do
+    :ets.insert(cluster_nodes_table(state.name), Enum.map(clusters, &{&1, node}))
+    :ets.insert(node_clusters_table(state.name), Enum.map(clusters, &{node, &1}))
     {:reply, :ok, state}
   end
 
-  def handle_call({:remove_cluster_node, cluster, node}, _from, state) do
-    :ets.delete_object(cluster_nodes_table(state.name), {cluster, node})
-    :ets.delete_object(node_clusters_table(state.name), {node, cluster})
+  def handle_call({:remove_cluster_node, clusters, node}, _from, state) do
+    Enum.each(clusters, fn cluster ->
+      :ets.delete_object(cluster_nodes_table(state.name), {cluster, node})
+      :ets.delete_object(node_clusters_table(state.name), {node, cluster})
+    end)
+
     {:reply, :ok, state}
   end
 
@@ -886,5 +922,15 @@ defmodule Group.Replica.Data do
     :ets.new(cluster_leases_table(name), set_opts)
 
     {:ok, %{name: name, num_shards: num_shards}}
+  end
+
+  defp select(table, match_spec, :infinity), do: :ets.select(table, match_spec)
+  defp select(_table, _match_spec, 0), do: []
+
+  defp select(table, match_spec, limit) when is_integer(limit) and limit > 0 do
+    case :ets.select(table, match_spec, limit) do
+      :"$end_of_table" -> []
+      {matches, _continuation} -> matches
+    end
   end
 end

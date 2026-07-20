@@ -125,8 +125,8 @@ After discovery, writes replicate in two stages:
 
 - Default resolver: most recent timestamp wins; pid ordering tiebreaker on equal timestamps
 - **Tiebreaker MUST be deterministic across all nodes**: `time2 > time1 or (time2 == time1 and pid2 > pid1)`. Using `>=` causes mutual kill.
-- Custom: `resolve_registry_conflict: {mod, func, extra_args}` option
-- Loser is killed with `{:group_registry_conflict, key, meta}`
+- Custom: `resolve_registry_conflict: {mod, func, extra_args}` option; the callback owns any process exits
+- The default resolver kills the loser with `{:group_registry_conflict, key, winner_meta}`
 - Runs synchronously inside shard GenServer — must return quickly
 
 ### Named Cluster Connect/Disconnect

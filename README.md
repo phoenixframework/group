@@ -56,11 +56,17 @@ children = [
 # List all members — returns [{pid, meta}, ...]
 members = Group.members(:my_app, "chat/room/42")
 
+# Read at most one arbitrary member without materializing the full group
+[member] = Group.members(:my_app, "chat/room/42", limit: 1)
+
+# Read only members whose owning process is on this node
+local_members = Group.local_members(:my_app, "chat/room/42", limit: 10)
+
 # Leave
 :ok = Group.leave(:my_app, "chat/room/42")
 ```
 
-`members/2` returns joined processes for a key. Registered processes are not
+`members/2` and `local_members/2` return joined processes for a key. Registered processes are not
 included — use `lookup/2` for those.
 Keys ending with `"/"` perform a prefix query across all shards:
 
@@ -211,7 +217,9 @@ All operations are **eventually consistent**:
 - When partitions heal, state is re-synced via `cluster_state` messages.
 - Registry conflicts (same key registered on two nodes during a partition) can
   be resolved with a configurable `resolve_registry_conflict` callback. The
-  losing process is killed with `{:group_registry_conflict, key, meta}`.
+  built-in resolver kills the losing process with
+  `{:group_registry_conflict, key, winner_meta}`; custom resolvers control any
+  process exits themselves.
 
 ## Configuration
 
@@ -249,8 +257,9 @@ All operations are **eventually consistent**:
 - **`resolve_registry_conflict`** — `{module, function, extra_args}` callback
   invoked as `apply(mod, fun, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
   Called when partition healing or concurrent registration finds the same key
-  registered on two nodes. Must return the winning pid. Runs synchronously
-  inside the shard GenServer — must return quickly and never block.
+  registered on two nodes. Must return the winning pid and is responsible for
+  any process exits it requires. Runs synchronously inside the shard GenServer —
+  must return quickly and never block.
 - **`extract_meta`** — `{module, function, args}` or `fun(meta)` applied to
   metadata on reads and lifecycle events. Useful for stripping internal fields.
 - **`replicated_pg_receiver_buffer_size`** — max buffered replicated PG

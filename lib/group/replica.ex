@@ -65,7 +65,7 @@ defmodule Group.Replica do
            ▼                               ▼        ▼                               ▼
       merge_remote_cluster_data       merge_remote_cluster_data
         ├─ no conflict: insert          ├─ no conflict: insert
-        ├─ local vs remote: resolve_conflict (kill loser, re-broadcast winner)
+        ├─ local vs remote: resolve_conflict (default kills loser; re-broadcast winner)
         └─ both remote: timestamp wins  └─ both remote: timestamp wins
 
   ### 2. Steady-State Replication
@@ -522,7 +522,7 @@ defmodule Group.Replica do
     :net_kernel.monitor_nodes(true)
 
     # Register self as nil cluster member
-    Data.add_cluster_node(name, nil, node())
+    Data.add_cluster_node(name, [nil], node())
 
     state = %__MODULE__{
       name: name,
@@ -655,17 +655,11 @@ defmodule Group.Replica do
     %{name: name, shard_index: shard} = state
     remote_node = node(remote_pid)
 
-    # Add remote node to nil cluster (all Group peers are in nil)
-    Data.add_cluster_node(name, nil, remote_node)
-
-    # Compute shared clusters
+    # Compute shared clusters and add the remote node to nil plus every shared
+    # named cluster in one serialized membership mutation.
     my_clusters = Data.my_clusters(name)
     shared = compute_shared_clusters(my_clusters, remote_clusters)
-
-    # Add remote node to shared named clusters
-    for cluster <- shared, cluster != nil do
-      Data.add_cluster_node(name, cluster, remote_node)
-    end
+    Data.add_cluster_node(name, [nil | Enum.reject(shared, &is_nil/1)], remote_node)
 
     already_known = Map.has_key?(state.remote_shards, remote_node)
 
@@ -715,17 +709,11 @@ defmodule Group.Replica do
     %{name: name} = state
     remote_node = node(remote_pid)
 
-    # Add remote node to nil cluster
-    Data.add_cluster_node(name, nil, remote_node)
-
-    # Compute shared clusters
+    # Compute shared clusters and add the remote node to nil plus every shared
+    # named cluster in one serialized membership mutation.
     my_clusters = Data.my_clusters(name)
     shared = compute_shared_clusters(my_clusters, remote_clusters)
-
-    # Add remote node to shared named clusters
-    for cluster <- shared, cluster != nil do
-      Data.add_cluster_node(name, cluster, remote_node)
-    end
+    Data.add_cluster_node(name, [nil | Enum.reject(shared, &is_nil/1)], remote_node)
 
     already_known = Map.has_key?(state.remote_shards, remote_node)
 
@@ -796,11 +784,9 @@ defmodule Group.Replica do
       "#{log_prefix(state)} #{remote_node} cluster_connect #{inspect(shared)} (#{length(shared)}/#{length(clusters)} shared)"
     end)
 
-    for cluster <- shared do
-      Data.add_cluster_node(name, cluster, remote_node)
-    end
-
     if shared != [] do
+      Data.add_cluster_node(name, shared, remote_node)
+
       # Bundle this shard's cluster data directly into the ack (one cross-node
       # message instead of ack + N separate cluster_state messages)
       {reg_by_cluster, pg_by_cluster} =
@@ -832,11 +818,9 @@ defmodule Group.Replica do
       if Map.has_key?(state.remote_shards, remote_node) do
         active = Enum.filter(clusters, fn c -> node() in Data.cluster_nodes(name, c) end)
 
-        for cluster <- active do
-          Data.add_cluster_node(name, cluster, remote_node)
-        end
-
         if active != [] do
+          Data.add_cluster_node(name, active, remote_node)
+
           # Merge the data bundled in the ack
           {new_state, events} =
             Enum.reduce(cluster_data, {state, []}, fn {cluster, reg_data, pg_data},
@@ -872,10 +856,7 @@ defmodule Group.Replica do
     end)
 
     if shard == 0 do
-      for cluster <- clusters do
-        Data.remove_cluster_node(name, cluster, remote_node)
-      end
-
+      Data.remove_cluster_node(name, clusters, remote_node)
       fan_out_to_siblings(state, {:cluster_disconnect, clusters, remote_pid})
     end
 
@@ -2825,7 +2806,7 @@ defmodule Group.Replica do
             {existing_pid, existing_meta, existing_time, existing_node}
             when existing_node == node() ->
               # Local entry vs incoming remote — use full conflict resolution
-              # (kills loser, re-broadcasts winner, invokes user's resolver)
+              # (runs the configured resolver and re-broadcasts the winner)
               {new_state, event} =
                 resolve_conflict(
                   acc_state,
@@ -3042,75 +3023,52 @@ defmodule Group.Replica do
        ) do
     config = Group.get_config(name)
 
-    winner_pid =
-      case Map.get(config, :resolve_registry_conflict) do
-        nil ->
-          default_resolve_conflict(
-            name,
-            cluster,
-            key,
-            {local_pid, local_meta, local_time},
-            {remote_pid, remote_meta, remote_time}
-          )
+    case Map.get(config, :resolve_registry_conflict) do
+      nil ->
+        default_resolve_conflict(
+          name,
+          cluster,
+          key,
+          {local_pid, local_meta, local_time},
+          {remote_pid, remote_meta, remote_time}
+        )
 
-        {mod, func, extra_args} ->
-          apply(mod, func, [
-            name,
-            key,
-            {local_pid, local_meta, local_time},
-            {remote_pid, remote_meta, remote_time} | extra_args
-          ])
-      end
-
-    terminate_conflict_loser(
-      key,
-      winner_pid,
-      {local_pid, local_meta},
-      {remote_pid, remote_meta}
-    )
-
-    winner_pid
+      {mod, func, extra_args} ->
+        apply(mod, func, [
+          name,
+          key,
+          {local_pid, local_meta, local_time},
+          {remote_pid, remote_meta, remote_time} | extra_args
+        ])
+    end
   end
 
   defp default_resolve_conflict(
          _name,
          _cluster,
          key,
-         {pid1, _meta1, time1},
-         {pid2, _meta2, time2}
+         {pid1, meta1, time1},
+         {pid2, meta2, time2}
        ) do
     # Tiebreaker must be deterministic regardless of which node is resolving.
     # Using `>=` would pick the remote on BOTH nodes when timestamps are equal,
     # causing mutual kill (both processes die, key becomes unregistered).
     # Erlang pids have a total order (by node name then id), so pid comparison
     # gives a consistent tiebreaker across all nodes.
-    winner_pid =
-      if time2 > time1 or (time2 == time1 and pid2 > pid1), do: pid2, else: pid1
+    {winner_pid, winner_meta, loser_pid} =
+      if time2 > time1 or (time2 == time1 and pid2 > pid1) do
+        {pid2, meta2, pid1}
+      else
+        {pid1, meta1, pid2}
+      end
 
     Logger.error(fn ->
       "#{inspect(__MODULE__)}: registry conflict detected: key=#{inspect(key)}, " <>
         "pid1=#{inspect(pid1)}, pid2=#{inspect(pid2)}, picking #{inspect(winner_pid)} as winner"
     end)
 
+    Process.exit(loser_pid, {:group_registry_conflict, key, winner_meta})
     winner_pid
-  end
-
-  defp terminate_conflict_loser(
-         key,
-         winner_pid,
-         {local_pid, local_meta},
-         {remote_pid, remote_meta}
-       ) do
-    cond do
-      winner_pid == local_pid ->
-        Process.exit(remote_pid, {:group_registry_conflict, key, local_meta})
-
-      winner_pid == remote_pid ->
-        Process.exit(local_pid, {:group_registry_conflict, key, remote_meta})
-
-      true ->
-        :ok
-    end
   end
 
   # Gather local data for all shared clusters in ONE table scan (instead of C scans)
