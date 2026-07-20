@@ -33,6 +33,7 @@ defmodule GroupBench.Distributed do
     bench_many_clusters(@replicas)
     bench_busy_app(@replicas)
     bench_local_requests_under_replicated_pg_pressure(@replicas)
+    bench_pubsub_single_shard(@replicas)
 
     IO.puts("\n  Done.\n")
   end
@@ -48,6 +49,20 @@ defmodule GroupBench.Distributed do
 
     connect_replicas()
     bench_local_requests_under_replicated_registry_pressure(@replicas)
+
+    IO.puts("\n  Done.\n")
+  end
+
+  def run_pubsub_single_shard_only(_opts \\ []) do
+    Process.put(:bench_shards, 1)
+
+    header("Distributed PubSub Single-Shard Benchmark")
+    IO.puts("  coordinator: #{node()}")
+    IO.puts("  shards:      1")
+    IO.puts("  schedulers:  #{System.schedulers_online()}")
+
+    connect_replicas()
+    bench_pubsub_single_shard(@replicas)
 
     IO.puts("\n  Done.\n")
   end
@@ -870,6 +885,157 @@ defmodule GroupBench.Distributed do
       :erpc.call(r1, GroupBench.Replica, :kill_processes, [spammers], 60_000)
       stop_groups(replicas)
     end
+  end
+
+  # ── 11. PubSub single-shard max fan-out ─────────────────────────────
+
+  defp bench_pubsub_single_shard([r1, r2] = replicas) do
+    header("11. PubSub Dispatch/Broadcast Single-Shard Fan-out")
+
+    member_counts = [1, 10, 100, 1_000]
+    publisher_counts = [1, 4, 16, 64]
+
+    IO.puts("  setup:        1 shard, one hot key, publishers on replica1, members on replica2")
+    IO.puts("  members:      #{inspect(member_counts)}")
+    IO.puts("  publishers:   #{inspect(publisher_counts)}")
+    IO.puts("  note:         subscriber delivery counts stay local on replica2")
+
+    for member_count <- member_counts do
+      subheader("#{format_number(member_count)} remote members")
+
+      for kind <- [:broadcast, :dispatch],
+          publisher_count <- publisher_counts do
+        run_pubsub_single_shard_case(replicas, r1, r2, kind, member_count, publisher_count)
+      end
+    end
+  end
+
+  defp run_pubsub_single_shard_case(
+         replicas,
+         r1,
+         r2,
+         kind,
+         member_count,
+         publisher_count
+       ) do
+    total_messages = pubsub_message_count(member_count)
+    expected_deliveries = total_messages * member_count
+    key = "pubsub/hot/#{kind}/m#{member_count}/p#{publisher_count}"
+
+    start_group_on(r1, shards: 1)
+    start_group_on(r2, shards: 1)
+    wait_for_peer_discovery(replicas)
+
+    member_pids =
+      :erpc.call(
+        r2,
+        GroupBench.Replica,
+        :start_counting_members,
+        [@name, key, member_count],
+        120_000
+      )
+
+    poll_until(
+      fn ->
+        length(:erpc.call(r1, Group, :members, [@name, key])) == member_count
+      end,
+      60_000
+    )
+
+    started_at = System.monotonic_time(:microsecond)
+
+    publish_result =
+      :erpc.call(
+        r1,
+        GroupBench.Replica,
+        :pubsub_publish_load,
+        [@name, kind, key, total_messages, publisher_count],
+        120_000
+      )
+
+    snapshot =
+      poll_pubsub_deliveries(r2, member_pids, expected_deliveries, 120_000)
+
+    total_wall_us = System.monotonic_time(:microsecond) - started_at
+
+    report_pubsub_single_shard_result(
+      kind,
+      member_count,
+      publisher_count,
+      total_messages,
+      expected_deliveries,
+      publish_result.publish_wall_us,
+      total_wall_us,
+      snapshot
+    )
+
+    :erpc.call(r2, GroupBench.Replica, :kill_processes, [member_pids], 60_000)
+    stop_groups(replicas)
+  end
+
+  defp pubsub_message_count(member_count) do
+    cond do
+      member_count <= 1 -> 50_000
+      member_count <= 10 -> 20_000
+      member_count <= 100 -> 5_000
+      true -> 1_000
+    end
+  end
+
+  defp poll_pubsub_deliveries(node, member_pids, expected_deliveries, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_poll_pubsub_deliveries(node, member_pids, expected_deliveries, deadline, nil)
+  end
+
+  defp do_poll_pubsub_deliveries(node, member_pids, expected_deliveries, deadline, last_snapshot) do
+    snapshot =
+      :erpc.call(node, GroupBench.Replica, :counting_member_snapshot, [member_pids], 120_000)
+
+    cond do
+      snapshot.total_deliveries >= expected_deliveries ->
+        snapshot
+
+      System.monotonic_time(:millisecond) > deadline ->
+        raise """
+        timed out waiting for pubsub deliveries:
+          expected=#{expected_deliveries}
+          last=#{inspect(snapshot)}
+          previous=#{inspect(last_snapshot)}
+        """
+
+      true ->
+        Process.sleep(25)
+        do_poll_pubsub_deliveries(node, member_pids, expected_deliveries, deadline, snapshot)
+    end
+  end
+
+  defp report_pubsub_single_shard_result(
+         kind,
+         member_count,
+         publisher_count,
+         total_messages,
+         expected_deliveries,
+         publish_wall_us,
+         total_wall_us,
+         snapshot
+       ) do
+    publish_ops_sec = round(total_messages * 1_000_000 / max(publish_wall_us, 1))
+    end_to_end_msg_sec = round(total_messages * 1_000_000 / max(total_wall_us, 1))
+    delivery_sec = round(snapshot.total_deliveries * 1_000_000 / max(total_wall_us, 1))
+
+    IO.puts(
+      "  #{kind} publishers=#{publisher_count}: " <>
+        "members=#{format_number(member_count)}, " <>
+        "messages=#{format_number(total_messages)}, " <>
+        "deliveries=#{format_number(snapshot.total_deliveries)}/#{format_number(expected_deliveries)}, " <>
+        "enqueue=#{format_number(publish_ops_sec)} msg/s, " <>
+        "e2e=#{format_number(end_to_end_msg_sec)} msg/s, " <>
+        "fanout=#{format_number(delivery_sec)} deliveries/s, " <>
+        "wall=#{format_number(div(total_wall_us, 1000))} ms, " <>
+        "publish=#{format_number(div(publish_wall_us, 1000))} ms, " <>
+        "per_member=#{snapshot.min_count}..#{snapshot.max_count}, " <>
+        "member_queue=max #{snapshot.max_member_queue_len}, total #{snapshot.total_member_queue_len}"
+    )
   end
 
   defp bench_local_load_sweep(

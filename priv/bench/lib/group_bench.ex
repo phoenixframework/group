@@ -18,12 +18,16 @@ defmodule GroupBench do
       ["distributed"] ->
         GroupBench.Distributed.run()
 
+      ["pubsub_single_shard"] ->
+        GroupBench.Distributed.run_pubsub_single_shard_only()
+
       _ ->
         IO.puts("""
-        Usage: GroupBench.main(["local" | "distributed"])
+        Usage: GroupBench.main(["local" | "distributed" | "pubsub_single_shard"])
 
-          local        — Run single-node benchmarks
-          distributed  — Coordinator: connects to replicas, drives benchmarks
+          local                — Run single-node benchmarks
+          distributed          — Coordinator: connects to replicas, drives benchmarks
+          pubsub_single_shard  — Focused dispatch/broadcast fan-out benchmark
         """)
     end
   end

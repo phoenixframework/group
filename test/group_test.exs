@@ -934,6 +934,20 @@ defmodule GroupTest do
       refute_receive {:test_message, :from_default}, 200
     end
 
+    test "broadcast works with cluster: option", %{name: name} do
+      cluster = "broadcast_all_cluster"
+      key = "broadcast_all/#{System.unique_integer([:positive])}"
+
+      :ok = Group.connect(name, cluster)
+      :ok = Group.join(name, key, %{}, cluster: cluster)
+
+      :ok = Group.broadcast(name, key, {:broadcast_message, :from_cluster}, cluster: cluster)
+      assert_receive {:broadcast_message, :from_cluster}, 1000
+
+      :ok = Group.broadcast(name, key, {:broadcast_message, :from_default})
+      refute_receive {:broadcast_message, :from_default}, 200
+    end
+
     test "dispatch_local only sends to local members", %{name: name} do
       key = "dispatch_local/#{System.unique_integer([:positive])}"
 
@@ -1356,7 +1370,7 @@ defmodule GroupTest do
 
       send(shard, replicated_pg_join(nil, remote_key1, remote_pid, %{remote: 1}, :join))
       send(shard, replicated_pg_join(nil, remote_key2, remote_pid, %{remote: 2}, :join))
-      send(shard, {:group_dispatch, [self()], {:quota_marker, shard}})
+      send(shard, {:group_flush_barrier, [self()], {:quota_marker, shard}})
 
       caller1 =
         spawn_requester(
@@ -2472,11 +2486,11 @@ defmodule GroupTest do
   end
 
   defp flush_replicated_pg_barrier(shard) do
-    send(shard, {:group_dispatch, [self()], {:replicated_pg_buffer_flushed, shard}})
+    send(shard, {:group_flush_barrier, [self()], {:replicated_pg_buffer_flushed, shard}})
   end
 
   defp flush_replicated_registry_barrier(shard) do
-    send(shard, {:group_dispatch, [self()], {:replicated_registry_buffer_flushed, shard}})
+    send(shard, {:group_flush_barrier, [self()], {:replicated_registry_buffer_flushed, shard}})
   end
 
   defp force_cluster_lease_sweep(name) do

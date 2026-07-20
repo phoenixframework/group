@@ -701,4 +701,136 @@ defmodule GroupBench.Replica do
 
     final_user_pids ++ room_pids
   end
+
+  @doc """
+  Starts `count` local members for one hot key. Each member counts deliveries
+  locally in process state so the benchmark does not add per-message coordinator
+  ack fan-in.
+  """
+  def start_counting_members(name, key, count, opts \\ []) do
+    parent = self()
+
+    pids =
+      Enum.map(1..count, fn _ ->
+        spawn(fn ->
+          :ok = Group.join(name, key, %{}, opts)
+          send(parent, {:counting_member_ready, self()})
+          counting_member_loop(0)
+        end)
+      end)
+
+    Enum.each(pids, fn pid ->
+      receive do
+        {:counting_member_ready, ^pid} -> :ok
+      after
+        30_000 -> raise "Timed out waiting for counting member"
+      end
+    end)
+
+    pids
+  end
+
+  @doc """
+  Starts `publisher_count` local publishers that concurrently call
+  `Group.dispatch/4` or `Group.broadcast/4` for one hot key until
+  `total_messages` logical publishes have been enqueued.
+  """
+  def pubsub_publish_load(name, kind, key, total_messages, publisher_count, opts \\ [])
+      when kind in [:broadcast, :dispatch] and total_messages > 0 and publisher_count > 0 do
+    parent = self()
+    ranges = publish_ranges(total_messages, publisher_count)
+    started_at = System.monotonic_time(:microsecond)
+
+    publishers =
+      Enum.map(ranges, fn range ->
+        spawn(fn ->
+          Enum.each(range, fn seq ->
+            :ok = apply(Group, kind, [name, key, {:bench_pubsub_delivery, kind, seq}, opts])
+          end)
+
+          send(parent, {:pubsub_publisher_done, self()})
+        end)
+      end)
+
+    Enum.each(publishers, fn pid ->
+      receive do
+        {:pubsub_publisher_done, ^pid} -> :ok
+      after
+        120_000 -> raise "Timed out waiting for pubsub publisher"
+      end
+    end)
+
+    %{publish_wall_us: System.monotonic_time(:microsecond) - started_at}
+  end
+
+  @doc """
+  Returns aggregate local delivery counts and subscriber mailbox pressure.
+  """
+  def counting_member_snapshot(pids) do
+    ref = make_ref()
+
+    Enum.each(pids, fn pid ->
+      send(pid, {:bench_pubsub_get_count, self(), ref})
+    end)
+
+    counts =
+      Enum.map(pids, fn pid ->
+        receive do
+          {:bench_pubsub_count, ^ref, ^pid, count} -> count
+        after
+          120_000 -> raise "Timed out waiting for counting member snapshot"
+        end
+      end)
+
+    queue_lens =
+      Enum.map(pids, fn pid ->
+        case Process.info(pid, :message_queue_len) do
+          {:message_queue_len, len} -> len
+          nil -> 0
+        end
+      end)
+
+    %{
+      total_deliveries: Enum.sum(counts),
+      min_count: Enum.min(counts, fn -> 0 end),
+      max_count: Enum.max(counts, fn -> 0 end),
+      max_member_queue_len: Enum.max(queue_lens, fn -> 0 end),
+      total_member_queue_len: Enum.sum(queue_lens)
+    }
+  end
+
+  defp counting_member_loop(count) do
+    receive do
+      {:bench_pubsub_delivery, _kind, _seq} ->
+        counting_member_loop(count + 1)
+
+      {:bench_pubsub_get_count, caller, ref} ->
+        send(caller, {:bench_pubsub_count, ref, self(), count})
+        counting_member_loop(count)
+
+      _ ->
+        counting_member_loop(count)
+    end
+  end
+
+  defp publish_ranges(total_messages, publisher_count) do
+    per_publisher = div(total_messages, publisher_count)
+    extra = rem(total_messages, publisher_count)
+
+    {ranges, _next_seq} =
+      Enum.map_reduce(1..publisher_count, 1, fn publisher_index, next_seq ->
+        count = per_publisher + if(publisher_index <= extra, do: 1, else: 0)
+
+        cond do
+          count <= 0 ->
+            {(next_seq - 1)..(next_seq - 2)//1, next_seq}
+
+          true ->
+            range = next_seq..(next_seq + count - 1)
+            {range, next_seq + count}
+        end
+      end)
+
+    Enum.reject(ranges, fn range -> Enum.empty?(range) end)
+  end
 end

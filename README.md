@@ -117,15 +117,35 @@ Single operations (register, join) produce one event per tuple. Bulk operations
 
 ### Dispatch
 
-Send a message to all members of a key:
+Send a message to members of a key:
 
 ```elixir
 :ok = Group.dispatch(:my_app, "chat/room/42", {:new_message, "hello"})
 :ok = Group.dispatch(:my_app, "chat/room/42", {:new_message, "hello"}, cluster: "servers_123")
+
+:ok = Group.broadcast(:my_app, "chat/room/42", {:new_message, "hello"})
+:ok = Group.broadcast(:my_app, "chat/room/42", {:new_message, "hello"}, cluster: "servers_123")
 ```
 
-Compared to `Phoenix.PubSub`, `dispatch` only broadcasts to nodes with at least
-one subscription and can also be tailored to a given cluster.
+`dispatch` uses this node's replicated member view for the selected cluster/key
+to decide which peer nodes to contact, then each receiver performs a fresh local
+lookup before delivery.
+`broadcast` behaves more like `Phoenix.PubSub.broadcast/3`: it sends a lookup
+request to every peer node in the selected cluster, even when this node cannot
+currently see members there.
+
+Remote dispatch and broadcast route through the source and receiver owning
+shards for the selected cluster/key as causal barriers before fan-out. The
+source shard flushes pending replication before sending the app message; the
+receiver shard flushes pending replication before forwarding to a per-shard
+dispatcher for local lookup and delivery.
+
+Those barriers are scoped to the same cluster and key. The default cluster and
+named clusters are independent: a join in `cluster: "servers_123"` only orders
+later dispatches or broadcasts using `cluster: "servers_123"` for the same key.
+
+Delivery is asynchronous: `dispatch` and `broadcast` return after enqueueing
+work on the local owning shard, not after recipients process the message.
 
 ### Named Clusters
 

@@ -27,6 +27,13 @@ Uses 3 separate BEAM VMs (coordinator + 2 replicas) as OS processes:
 ./run_distributed.sh
 ```
 
+Focused single-shard pubsub fan-out benchmark:
+
+```bash
+ERL_AFLAGS='+zdbbl 49152' ./run_distributed.sh --shards 1 \
+  --coordinator-expr 'GroupBench.Distributed.run_pubsub_single_shard_only()'
+```
+
 The script compiles once, starts both replicas in the background, then launches
 the coordinator. Replicas are killed automatically on exit.
 
@@ -135,6 +142,24 @@ convergence on replica2 via the `replicate_leave` path.
 
 All members hash to the same shard (single key), making this the worst case
 for shard contention during bulk cleanup.
+
+### 11. PubSub dispatch/broadcast single-shard fan-out
+
+Measures theoretical max throughput for one hot key on one shard under
+multi-caller publisher load. Replica1 runs concurrent publishers calling
+`Group.broadcast/4` or `Group.dispatch/4`; replica2 owns all subscribed
+members for that key.
+
+Subscriber processes count deliveries locally in process state. The coordinator
+only polls aggregate counts after publishing, so results are not bottlenecked
+by per-message test acknowledgements.
+
+Reports:
+
+- logical message enqueue throughput on replica1
+- end-to-end logical messages/sec after all subscriber deliveries are observed
+- raw fan-out deliveries/sec on replica2
+- per-member delivery count range and remaining subscriber mailbox pressure
 
 ## Architecture
 

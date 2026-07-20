@@ -29,7 +29,9 @@ defmodule Group.Replica do
   | `{:cluster_connect_ack, clusters, pid, cluster_data}`      | S→remote S     | Ack + bundled shard data         |
   | `{:cluster_disconnect, clusters, pid}`                     | shard 0→remote | Node leaving named clusters      |
   | `{:send_cluster_data, clusters, target_node}`              | local fan-out  | Notify siblings: send shard data |
-  | `{:group_dispatch, pids, message}`                         | caller→remote  | Per-node fan-out for dispatch    |
+  | `{:group_dispatch_request, cluster, key, message}`         | local caller   | Causal dispatch via source shard |
+  | `{:group_broadcast_request, cluster, key, message}`        | local caller   | Causal broadcast via source shard|
+  | `{:group_dispatch, cluster, key, message}`                 | shard→shard    | Causal remote dispatch barrier   |
 
   ## Protocol Flows
 
@@ -109,22 +111,30 @@ defmodule Group.Replica do
            │                                       │   (no overwrite conflict
            │                                       │    for PG)
            │                                       │
-      Group.dispatch(name, group, msg)               │
-           │── send directly to local pids           │
-           │── group remote pids by node             │
-           │── hash self() to pick shard j           │
-           │                                         │
-           │  {:group_dispatch, pids, msg}    Node B shard j
-           │────────────────────────────────────────>│
-           │                                         │── send msg to each local pid
-           │                                         │
+      Group.dispatch(name, group, msg)
+           │── send request to local owning shard
+           │
+      Node A owning shard                       Node B owning shard
+           │── flush outbound/inbound replication       │
+           │── local dispatcher lookup/fan-out          │
+           │── group target remote nodes                │
+           │                                            │
+           │  {:group_dispatch, cluster, group, msg}    │
+           │───────────────────────────────────────────>│
+           │                                            │── flush inbound replication
+           │                                            │── forward to local dispatcher
+           │                                            │── lookup local pids for group
+           │                                            │── send msg to each local pid
+           │                                            │
 
-  Dispatch groups remote PG members by node and sends one
-  `:group_dispatch` message per remote node, reducing cross-node
-  messages from O(members) to O(nodes). The target shard is chosen
-  by hashing the caller's pid (`phash2(self(), num_shards)`), so
-  back-to-back dispatches from the same caller always route through
-  the same shard, preserving per-sender message ordering.
+  Dispatch and broadcast use the owning shard as a causal barrier before
+  handing fan-out to `Group.Dispatcher`. The source shard flushes pending
+  outbound replication before sending the app message. The receiver shard
+  flushes pending inbound replication before forwarding to its dispatcher.
+  This keeps application delivery from doing ETS lookup/send work in the
+  replica shard while preserving the least-surprise guarantee that a remote
+  handler reading `members/2` can observe membership updates that happened
+  before the source dispatch/broadcast.
 
   ### 3. Named Cluster Connect (random shard S + fan-out)
 
@@ -427,6 +437,7 @@ defmodule Group.Replica do
 
   require Logger
 
+  alias Group.Dispatcher
   alias Group.Replica.Data
 
   defstruct [
@@ -995,7 +1006,36 @@ defmodule Group.Replica do
     {:noreply, state}
   end
 
-  def handle_info({:group_dispatch, pids, message}, state) do
+  def handle_info({:group_dispatch_request, cluster, key, message}, state) when is_binary(key) do
+    state =
+      state
+      |> flush_pending_replicated_message_barrier()
+      |> dispatch_group_locally(cluster, key, message)
+      |> dispatch_group_to_visible_remote_nodes(cluster, key, message)
+
+    {:noreply, state}
+  end
+
+  def handle_info({:group_broadcast_request, cluster, key, message}, state) when is_binary(key) do
+    state =
+      state
+      |> flush_pending_replicated_message_barrier()
+      |> dispatch_group_locally(cluster, key, message)
+      |> broadcast_group_to_remote_nodes(cluster, key, message)
+
+    {:noreply, state}
+  end
+
+  def handle_info({:group_dispatch, cluster, key, message}, state) when is_binary(key) do
+    state =
+      state
+      |> flush_pending_replicated_message_barrier()
+      |> dispatch_group_locally(cluster, key, message)
+
+    {:noreply, state}
+  end
+
+  def handle_info({:group_flush_barrier, pids, message}, state) when is_list(pids) do
     state = flush_pending_replicated_message_barrier(state)
     for pid <- pids, do: send(pid, message)
     {:noreply, state}
@@ -1057,6 +1097,54 @@ defmodule Group.Replica do
   # =====================================================================
   # Internal helpers
   # =====================================================================
+
+  defp dispatch_group_locally(state, cluster, key, message) do
+    send(
+      Dispatcher.dispatcher_name(state.name, state.shard_index),
+      {:group_dispatch, cluster, key, message}
+    )
+
+    state
+  end
+
+  defp dispatch_group_to_visible_remote_nodes(state, cluster, key, message) do
+    state
+    |> visible_group_remote_nodes(cluster, key)
+    |> Enum.each(fn target_node ->
+      send_remote_shard_message(state, target_node, {:group_dispatch, cluster, key, message})
+    end)
+
+    state
+  end
+
+  defp broadcast_group_to_remote_nodes(state, cluster, key, message) do
+    {target_nodes, _cache} = broadcast_targets(state, cluster, %{})
+
+    Enum.each(target_nodes, fn target_node ->
+      send_remote_shard_message(state, target_node, {:group_dispatch, cluster, key, message})
+    end)
+
+    state
+  end
+
+  defp visible_group_remote_nodes(state, cluster, key) do
+    %{name: name, shard_index: shard} = state
+    local = node()
+
+    remote_nodes =
+      case Data.registry_lookup(name, shard, cluster, key) do
+        {_pid, _meta, _time, ^local} -> MapSet.new()
+        {_pid, _meta, _time, remote_node} -> MapSet.new([remote_node])
+        nil -> MapSet.new()
+      end
+
+    Data.pg_members_with_node(name, shard, cluster, key)
+    |> Enum.reduce(remote_nodes, fn
+      {_pid, _meta, ^local}, acc -> acc
+      {_pid, _meta, member_node}, acc -> MapSet.put(acc, member_node)
+    end)
+    |> MapSet.to_list()
+  end
 
   defp do_local_request(pid, shard_name, request, :infinity) when is_pid(pid) do
     alias_ref = Process.alias()

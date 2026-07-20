@@ -2,7 +2,10 @@
 - Add bounded `Group.members/3` queries with `limit:` and local-owner process-group queries through `Group.local_members/3`
 
 ## 0.2.0 (2026-04-17)
-- remove deprecate message handling
+- Add `Group.broadcast/4` for fan-out to every peer node in a cluster
+- Change cross-node `dispatch/4` delivery to have the receiver perform a fresh local lookup for the key
+- Route remote dispatch/broadcast through source and receiver shard causal barriers before dispatcher fan-out
+- Remove deprecated message handling
 
 ## 0.1.8 (2026-04-17)
 - Use `send_nosuspend` for remote shard sends and add bounded reconnect retries after busy-link disconnects
