@@ -65,7 +65,7 @@ defmodule Group.Replica do
            ▼                               ▼        ▼                               ▼
       merge_remote_cluster_data       merge_remote_cluster_data
         ├─ no conflict: insert          ├─ no conflict: insert
-        ├─ local vs remote: resolve_conflict (kill loser, re-broadcast winner)
+        ├─ local vs remote: resolve_conflict (default kills loser; re-broadcast winner)
         └─ both remote: timestamp wins  └─ both remote: timestamp wins
 
   ### 2. Steady-State Replication
@@ -491,6 +491,22 @@ defmodule Group.Replica do
     end
   end
 
+  @doc false
+  def local_request_all(shard_names, request, timeout)
+      when is_list(shard_names) and (is_integer(timeout) or timeout == :infinity) do
+    requests = Enum.map(shard_names, &start_local_request(&1, request, timeout))
+
+    try do
+      Enum.each(requests, fn pending ->
+        :ok = await_local_request(pending, timeout)
+      end)
+    after
+      Enum.each(requests, &cancel_local_request/1)
+    end
+
+    :ok
+  end
+
   # =====================================================================
   # GenServer callbacks
   # =====================================================================
@@ -506,7 +522,7 @@ defmodule Group.Replica do
     :net_kernel.monitor_nodes(true)
 
     # Register self as nil cluster member
-    Data.add_cluster_node(name, nil, node())
+    Data.add_cluster_node(name, [nil], node())
 
     state = %__MODULE__{
       name: name,
@@ -639,17 +655,11 @@ defmodule Group.Replica do
     %{name: name, shard_index: shard} = state
     remote_node = node(remote_pid)
 
-    # Add remote node to nil cluster (all Group peers are in nil)
-    Data.add_cluster_node(name, nil, remote_node)
-
-    # Compute shared clusters
+    # Compute shared clusters and add the remote node to nil plus every shared
+    # named cluster in one serialized membership mutation.
     my_clusters = Data.my_clusters(name)
     shared = compute_shared_clusters(my_clusters, remote_clusters)
-
-    # Add remote node to shared named clusters
-    for cluster <- shared, cluster != nil do
-      Data.add_cluster_node(name, cluster, remote_node)
-    end
+    Data.add_cluster_node(name, [nil | Enum.reject(shared, &is_nil/1)], remote_node)
 
     already_known = Map.has_key?(state.remote_shards, remote_node)
 
@@ -699,17 +709,11 @@ defmodule Group.Replica do
     %{name: name} = state
     remote_node = node(remote_pid)
 
-    # Add remote node to nil cluster
-    Data.add_cluster_node(name, nil, remote_node)
-
-    # Compute shared clusters
+    # Compute shared clusters and add the remote node to nil plus every shared
+    # named cluster in one serialized membership mutation.
     my_clusters = Data.my_clusters(name)
     shared = compute_shared_clusters(my_clusters, remote_clusters)
-
-    # Add remote node to shared named clusters
-    for cluster <- shared, cluster != nil do
-      Data.add_cluster_node(name, cluster, remote_node)
-    end
+    Data.add_cluster_node(name, [nil | Enum.reject(shared, &is_nil/1)], remote_node)
 
     already_known = Map.has_key?(state.remote_shards, remote_node)
 
@@ -780,11 +784,9 @@ defmodule Group.Replica do
       "#{log_prefix(state)} #{remote_node} cluster_connect #{inspect(shared)} (#{length(shared)}/#{length(clusters)} shared)"
     end)
 
-    for cluster <- shared do
-      Data.add_cluster_node(name, cluster, remote_node)
-    end
-
     if shared != [] do
+      Data.add_cluster_node(name, shared, remote_node)
+
       # Bundle this shard's cluster data directly into the ack (one cross-node
       # message instead of ack + N separate cluster_state messages)
       {reg_by_cluster, pg_by_cluster} =
@@ -816,11 +818,9 @@ defmodule Group.Replica do
       if Map.has_key?(state.remote_shards, remote_node) do
         active = Enum.filter(clusters, fn c -> node() in Data.cluster_nodes(name, c) end)
 
-        for cluster <- active do
-          Data.add_cluster_node(name, cluster, remote_node)
-        end
-
         if active != [] do
+          Data.add_cluster_node(name, active, remote_node)
+
           # Merge the data bundled in the ack
           {new_state, events} =
             Enum.reduce(cluster_data, {state, []}, fn {cluster, reg_data, pg_data},
@@ -856,10 +856,7 @@ defmodule Group.Replica do
     end)
 
     if shard == 0 do
-      for cluster <- clusters do
-        Data.remove_cluster_node(name, cluster, remote_node)
-      end
-
+      Data.remove_cluster_node(name, clusters, remote_node)
       fan_out_to_siblings(state, {:cluster_disconnect, clusters, remote_pid})
     end
 
@@ -1057,6 +1054,71 @@ defmodule Group.Replica do
   # =====================================================================
   # Internal helpers
   # =====================================================================
+
+  defp start_local_request(shard_name, request, timeout) do
+    case GenServer.whereis(shard_name) do
+      nil ->
+        {:noproc, shard_name, request, timeout}
+
+      pid ->
+        alias_ref = Process.alias()
+        mref = Process.monitor(pid)
+        send(pid, {@local_request_tag, alias_ref, request})
+        {:pending, pid, shard_name, request, alias_ref, mref}
+    end
+  end
+
+  defp await_local_request({:noproc, shard_name, request, timeout}, _wait_timeout) do
+    exit({:noproc, {GenServer, :call, [shard_name, request, timeout]}})
+  end
+
+  defp await_local_request(
+         {:pending, pid, shard_name, request, alias_ref, mref},
+         :infinity
+       ) do
+    receive do
+      {@local_reply_tag, ^alias_ref, reply} ->
+        cancel_local_request({:pending, pid, shard_name, request, alias_ref, mref})
+        reply
+
+      {:DOWN, ^mref, :process, ^pid, reason} ->
+        Process.unalias(alias_ref)
+        exit({reason, {GenServer, :call, [shard_name, request, :infinity]}})
+    end
+  end
+
+  defp await_local_request(
+         {:pending, pid, shard_name, request, alias_ref, mref} = pending,
+         timeout
+       )
+       when is_integer(timeout) do
+    receive do
+      {@local_reply_tag, ^alias_ref, reply} ->
+        cancel_local_request(pending)
+        reply
+
+      {:DOWN, ^mref, :process, ^pid, reason} ->
+        Process.unalias(alias_ref)
+        exit({reason, {GenServer, :call, [shard_name, request, timeout]}})
+    after
+      timeout ->
+        cancel_local_request(pending)
+        exit({:timeout, {GenServer, :call, [shard_name, request, timeout]}})
+    end
+  end
+
+  defp cancel_local_request({:noproc, _shard_name, _request, _timeout}), do: :ok
+
+  defp cancel_local_request({:pending, _pid, _shard_name, _request, alias_ref, mref}) do
+    Process.demonitor(mref, [:flush])
+    Process.unalias(alias_ref)
+
+    receive do
+      {@local_reply_tag, ^alias_ref, _reply} -> :ok
+    after
+      0 -> :ok
+    end
+  end
 
   defp do_local_request(pid, shard_name, request, :infinity) when is_pid(pid) do
     alias_ref = Process.alias()
@@ -1763,10 +1825,26 @@ defmodule Group.Replica do
       "#{log_prefix(state)} cluster_disconnect #{inspect(clusters)}"
     end)
 
-    events =
-      Enum.reduce(clusters, [], fn cluster, acc ->
-        {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, node())
-        build_purged_events(name, purged_reg, purged_pg, :cluster_disconnect, acc)
+    {events, local_pids} =
+      Enum.reduce(clusters, {[], MapSet.new()}, fn cluster, {events, local_pids} ->
+        {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, :all)
+
+        local_pids =
+          Enum.reduce(purged_reg ++ purged_pg, local_pids, fn
+            {_cluster, _key, pid, _meta, _time}, acc when node(pid) == node() ->
+              MapSet.put(acc, pid)
+
+            _entry, acc ->
+              acc
+          end)
+
+        {build_purged_events(name, purged_reg, purged_pg, :cluster_disconnect, events),
+         local_pids}
+      end)
+
+    state =
+      Enum.reduce(local_pids, state, fn pid, acc ->
+        maybe_demonitor_pid(acc, name, shard, pid)
       end)
 
     if shard == 0 do
@@ -2192,6 +2270,11 @@ defmodule Group.Replica do
     %{name: name, shard_index: shard} = state
     local_node = node()
 
+    ops =
+      Enum.filter(ops, fn op ->
+        replicated_op_for_active_cluster?(name, op, &registry_op_cluster/1)
+      end)
+
     Enum.reduce(ops, {%{}, [], [], MapSet.new()}, fn
       {:register, cluster, key, pid, meta, time, entry_node},
       {entries, events, broadcasts, maybe_demonitor_pids} ->
@@ -2287,6 +2370,11 @@ defmodule Group.Replica do
   end
 
   defp apply_replicated_pg_ops(name, shard, ops) do
+    ops =
+      Enum.filter(ops, fn op ->
+        replicated_op_for_active_cluster?(name, op, &pg_op_cluster/1)
+      end)
+
     {entries, events} =
       Enum.reduce(ops, {%{}, []}, fn
         {:join, cluster, key, pid, meta, time, reason, entry_node}, {entries, events} ->
@@ -2455,6 +2543,14 @@ defmodule Group.Replica do
 
   defp registry_op_cluster({:unregister, cluster, _key, _pid, _meta, _reason}), do: cluster
 
+  defp replicated_op_for_active_cluster?(name, op, cluster_fun)
+       when is_function(cluster_fun, 1) do
+    case cluster_fun.(op) do
+      nil -> true
+      cluster -> cluster_member?(name, cluster)
+    end
+  end
+
   defp send_to_peer(state, target_node, message) do
     send_remote_shard_message(state, target_node, message)
   end
@@ -2497,11 +2593,10 @@ defmodule Group.Replica do
         end)
       end)
 
-    shard_name = shard_name(state.name, state.shard_index)
-
     Enum.each(messages, fn {target_node, {reg_entries, pg_entries}} ->
-      send(
-        {shard_name, target_node},
+      send_remote_shard_message(
+        state,
+        target_node,
         {:replicate_process_down_batch, Enum.reverse(reg_entries), Enum.reverse(pg_entries)}
       )
     end)
@@ -2711,7 +2806,7 @@ defmodule Group.Replica do
             {existing_pid, existing_meta, existing_time, existing_node}
             when existing_node == node() ->
               # Local entry vs incoming remote — use full conflict resolution
-              # (kills loser, re-broadcasts winner, invokes user's resolver)
+              # (runs the configured resolver and re-broadcasts the winner)
               {new_state, event} =
                 resolve_conflict(
                   acc_state,
@@ -2948,21 +3043,31 @@ defmodule Group.Replica do
     end
   end
 
-  defp default_resolve_conflict(_name, _cluster, key, {pid1, _meta1, time1}, {pid2, meta2, time2}) do
+  defp default_resolve_conflict(
+         _name,
+         _cluster,
+         key,
+         {pid1, meta1, time1},
+         {pid2, meta2, time2}
+       ) do
     # Tiebreaker must be deterministic regardless of which node is resolving.
     # Using `>=` would pick the remote on BOTH nodes when timestamps are equal,
     # causing mutual kill (both processes die, key becomes unregistered).
     # Erlang pids have a total order (by node name then id), so pid comparison
     # gives a consistent tiebreaker across all nodes.
-    {winner_pid, loser_pid} =
-      if time2 > time1 or (time2 == time1 and pid2 > pid1), do: {pid2, pid1}, else: {pid1, pid2}
+    {winner_pid, winner_meta, loser_pid} =
+      if time2 > time1 or (time2 == time1 and pid2 > pid1) do
+        {pid2, meta2, pid1}
+      else
+        {pid1, meta1, pid2}
+      end
 
     Logger.error(fn ->
       "#{inspect(__MODULE__)}: registry conflict detected: key=#{inspect(key)}, " <>
         "pid1=#{inspect(pid1)}, pid2=#{inspect(pid2)}, picking #{inspect(winner_pid)} as winner"
     end)
 
-    Process.exit(loser_pid, {:group_registry_conflict, key, meta2})
+    Process.exit(loser_pid, {:group_registry_conflict, key, winner_meta})
     winner_pid
   end
 
@@ -2992,14 +3097,16 @@ defmodule Group.Replica do
     MapSet.intersection(my_set, remote_set) |> MapSet.to_list()
   end
 
-  defp purge_cluster_entries(name, shard, cluster, target_node) do
-    # Remove entries for a specific cluster and node
+  defp purge_cluster_entries(name, shard, cluster, target) do
+    # Local disconnect uses :all to discard the complete replicated view.
+    # Remote disconnects remove only data owned by the departing node.
+    node_guard = if target == :all, do: [], else: [{:==, :"$5", target}]
     reg_table = Data.reg_by_key_table(name, shard)
     reg_pid_table = Data.reg_by_pid_table(name, shard)
 
     purged_reg =
       :ets.select(reg_table, [
-        {{{cluster, :"$1"}, :"$2", :"$3", :"$4", :"$5"}, [{:==, :"$5", target_node}],
+        {{{cluster, :"$1"}, :"$2", :"$3", :"$4", :"$5"}, node_guard,
          [{{:"$1", :"$2", :"$3", :"$4"}}]}
       ])
       |> Enum.map(fn {key, pid, meta, time} -> {cluster, key, pid, meta, time} end)
@@ -3014,7 +3121,7 @@ defmodule Group.Replica do
 
     purged_pg =
       :ets.select(pg_table, [
-        {{{cluster, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, [{:==, :"$5", target_node}],
+        {{{cluster, :"$1", :"$2"}, :"$3", :"$4", :"$5"}, node_guard,
          [{{:"$1", :"$2", :"$3", :"$4"}}]}
       ])
       |> Enum.map(fn {key, pid, meta, time} -> {cluster, key, pid, meta, time} end)
@@ -3063,6 +3170,7 @@ defmodule Group.Replica do
   defp extract_meta_fn(name) do
     case Group.get_config(name) do
       %{extract_meta: {mod, func, args}} -> fn meta -> apply(mod, func, [meta | args]) end
+      %{extract_meta: func} when is_function(func, 1) -> func
       _ -> & &1
     end
   end

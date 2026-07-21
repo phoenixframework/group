@@ -16,8 +16,9 @@ defmodule Group do
   - Writes (register, join, etc.) return immediately after local update
   - Other nodes receive updates asynchronously via Erlang distribution
   - During network partitions, nodes may have divergent views
-  - When partitions heal, conflicts are resolved. The losing process is killed
-    with `{:group_registry_conflict, key, meta}`
+  - When partitions heal, conflicts are resolved. The built-in resolver kills
+    the losing process with `{:group_registry_conflict, key, winner_meta}`;
+    custom resolvers control any process exits themselves
 
   ## Clusters
 
@@ -34,21 +35,13 @@ defmodule Group do
   local node has no cluster-scoped monitors, no local registrations, and no
   local group memberships in that named cluster.
 
-  ### Important: DurableServer Registration
-
-  DurableServers always register in the **default cluster** to ensure global uniqueness
-  via the distributed locking mechanism. Named clusters are purely for isolating your own
-  registries, process groups, and subscriptions to isolated subclusters. If a DurableServer
-  wants to participate in an isolated cluster, it can call `connect/2` and `join/4`
-  inside its `init` callback.
-
   ## Core Concepts
 
   ### Monitoring vs Memberships
 
   - **Monitoring** (`monitor/2`, `demonitor/2`): Receive events in your mailbox
-    when DurableServers or other processes register/join matching keys anywhere in the
-    cluster. Supports pattern matching on keys.
+    when processes register/join matching keys anywhere in the cluster. Supports
+    pattern matching on keys.
 
   - **Memberships** (`join/3`, `leave/2`): Make your process discoverable cluster-wide
     via `members/2`. Triggers `:joined`/`:left` events to monitors.
@@ -67,7 +60,7 @@ defmodule Group do
           cluster: cluster_name,  # nil for default cluster
           key: key,
           pid: pid,
-          meta: meta,             # always user-provided meta (internal keys stripped)
+          meta: meta,             # optionally transformed by extract_meta
           previous_meta: ...,     # nil for new, old meta for re-register/re-join
           reason: ...             # set on :unregistered/:left events
         }
@@ -83,8 +76,8 @@ defmodule Group do
   `:previous_meta` is `nil` for new registrations/joins, or the old
   metadata map when re-registering/re-joining.
 
-  DurableServers automatically register/unregister during their lifecycle, so these
-  events can be used to track DurableServer start/stop.
+  Registrations and memberships are automatically removed when their owning
+  process exits, so these events can track process lifecycles.
 
   ## Pattern Types
 
@@ -127,9 +120,9 @@ defmodule Group do
       def handle_info({:group, events, _info}, state) do
         Enum.each(events, fn
           %Group.Event{type: :registered, key: key} ->
-            IO.puts("DurableServer started: \#{key}")
+            IO.puts("Process registered: \#{key}")
           %Group.Event{type: :unregistered, key: key, reason: reason} ->
-            IO.puts("DurableServer stopped: \#{key}, reason: \#{inspect(reason)}")
+            IO.puts("Process unregistered: \#{key}, reason: \#{inspect(reason)}")
           _ -> :ok
         end)
         {:noreply, state}
@@ -167,14 +160,15 @@ defmodule Group do
 
   ## Architecture Notes
 
-  - **Events are cluster-wide**: Replication callbacks fire on ALL nodes in the cluster.
-    This means a monitor on Node A receives events when a DurableServer registers on Node B.
+  - **Events are cluster-wide**: Replicated operations fire lifecycle events on all
+    participating nodes. A monitor on Node A receives events when a process registers
+    on Node B.
 
   - **Monitors** are stored per-node in an Elixir `Registry`, enabling pattern matching
     and automatic cleanup when monitoring processes die.
 
-  - **Memberships** use built-in process groups for cluster-wide distribution and automatic
-    cleanup when member processes die.
+  - **Memberships** are stored in replicated, sharded ETS indexes and are
+    automatically cleaned up when member processes die.
   """
 
   alias Group.Replica
@@ -196,15 +190,19 @@ defmodule Group do
   - `:shards` — number of GenServer shards (default: 8). Must match across all nodes
   - `:log` — logging level. `:info` (default) logs peer discovery, node events,
     and cluster membership changes. `:verbose` additionally logs per-shard
-    replication messages. `false` disables all Group log output.
+    replication messages. `false` disables routine info/verbose logs; registry
+    conflicts and busy distribution links still emit error/warning logs.
   - `:resolve_registry_conflict` — `{module, function, extra_args}` callback invoked when
     two nodes hold the same registry key (partition heal or concurrent registration).
     Called as `apply(module, function, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
-    Must return the winner pid. The loser is killed with `{:group_registry_conflict, key, meta}`.
-    **Important:** This callback runs synchronously inside the shard GenServer — it must
+    Must return the winner pid and is responsible for any process exits it requires. When
+    no callback is configured, the built-in resolver kills the loser with
+    `{:group_registry_conflict, key, winner_meta}`. **Important:** This callback runs
+    synchronously inside the shard GenServer — it must
     return quickly and never block. Any information needed for the decision should be
     carried in the registration metadata, not fetched at resolution time.
-  - `:extract_meta` — `{module, function, args}` to transform metadata on reads
+  - `:extract_meta` — `{module, function, args}` or a one-argument function to
+    transform metadata on reads and lifecycle events
   - `:replicated_pg_receiver_buffer_size` — max buffered replicated PG join/leave ops
     per shard before the receiver flushes immediately (default: `64`)
   - `:replicated_pg_receiver_flush_interval` — max time in milliseconds a shard will
@@ -268,6 +266,7 @@ defmodule Group do
   def connect(name, cluster_or_clusters, opts \\ [])
       when is_atom(name) and is_list(opts) do
     clusters = List.wrap(cluster_or_clusters)
+    Enum.each(clusters, &validate_cluster_name!/1)
     local = node()
     ttl_ms = cluster_ttl(opts)
     new_clusters = Enum.reject(clusters, fn c -> local in Data.cluster_nodes(name, c) end)
@@ -307,6 +306,7 @@ defmodule Group do
   def disconnect(name, cluster_or_clusters, opts \\ [])
       when is_atom(name) and is_list(opts) do
     clusters = List.wrap(cluster_or_clusters)
+    Enum.each(clusters, &validate_cluster_name!/1)
     timeout = cluster_call_timeout(opts)
 
     if clusters != [] do
@@ -495,7 +495,14 @@ defmodule Group do
         num_shards = config.num_shards
         shard = Replica.shard_index_for(cluster, key, num_shards)
 
-        case Data.registry_lookup(name, shard, cluster, key) do
+        entry =
+          try do
+            Data.registry_lookup(name, shard, cluster, key)
+          rescue
+            ArgumentError -> nil
+          end
+
+        case entry do
           {pid, meta, _time, _node} ->
             {pid, extract_meta_fn.(meta)}
 
@@ -503,8 +510,6 @@ defmodule Group do
             nil
         end
     end
-  rescue
-    ArgumentError -> nil
   end
 
   # ===========================================================================
@@ -777,7 +782,7 @@ defmodule Group do
   @doc """
   Count processes registered in the local node's registry.
 
-  This counts only processes registered via `register/5` on the local node.
+  This counts only processes registered via `register/4` on the local node.
 
   ## Parameters
 
@@ -835,7 +840,8 @@ defmodule Group do
     if String.ends_with?(group, "/") do
       Data.pg_count_by_prefix(name, num_shards, cluster, group)
     else
-      Data.pg_count(name, num_shards, cluster, group)
+      shard = Replica.shard_index_for(cluster, group, num_shards)
+      Data.pg_count(name, shard, cluster, group)
     end
   end
 
@@ -869,7 +875,8 @@ defmodule Group do
     if String.ends_with?(group, "/") do
       Data.local_pg_count_by_prefix(name, num_shards, cluster, group)
     else
-      Data.local_pg_count(name, num_shards, cluster, group)
+      shard = Replica.shard_index_for(cluster, group, num_shards)
+      Data.local_pg_count(name, shard, cluster, group)
     end
   end
 
@@ -913,19 +920,18 @@ defmodule Group do
   Dispatch a message to all members of a key.
 
   Sends `message` to all processes that have joined the key via `join/3`, as well as
-  any DurableServer registered at that key. This is useful for application-level
-  messaging between a DurableServer and connected clients (e.g., Phoenix Channels).
+  the process registered at that key, if present.
 
   ## Dispatch vs Monitor
 
   There are two ways to receive messages in this module:
 
   - **`monitor/2`** - Receive *lifecycle events* (`:registered`, `:unregistered`, etc.)
-    when DurableServers or processes join/leave keys matching a pattern. These are
+    when processes register/join/leave keys matching a pattern. These are
     system-generated events.
 
   - **`dispatch/3`** - Receive *application messages* sent explicitly by your code.
-    Only members of the exact key receive the message.
+    The registered process and joined members of the exact key receive the message.
 
   Use `monitor` to react to lifecycle changes. Use `dispatch` to send your own
   messages to members.
@@ -956,10 +962,17 @@ defmodule Group do
     shard = Replica.shard_index_for(cluster, key, num_shards)
     local = node()
 
-    # Registry entry (one or none) — always direct send, even cross-node
+    # Registry entry (one or none) — send directly without allowing a remote
+    # distribution channel to suspend the caller or establish a new link.
     case Data.registry_lookup(name, shard, cluster, key) do
-      {pid, _meta, _time, _node} -> send(pid, message)
-      nil -> :ok
+      {pid, _meta, _time, ^local} ->
+        send(pid, message)
+
+      {pid, _meta, _time, target_node} ->
+        send_remote_nosuspend(name, target_node, pid, message)
+
+      nil ->
+        :ok
     end
 
     # PG members — group remote pids by node for batched fan-out
@@ -985,7 +998,12 @@ defmodule Group do
         shard_name = Replica.shard_name(name, dispatch_shard)
 
         for {target_node, pids} <- remote_by_node do
-          send({shard_name, target_node}, {:group_dispatch, pids, message})
+          send_remote_nosuspend(
+            name,
+            target_node,
+            {shard_name, target_node},
+            {:group_dispatch, pids, message}
+          )
         end
     end
 
@@ -1056,11 +1074,7 @@ defmodule Group do
   @doc false
   def connect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
-    local = node()
-
-    for cluster <- clusters do
-      Data.add_cluster_node(name, cluster, local)
-    end
+    Data.add_cluster_node(name, clusters, node())
 
     notify_shard = :rand.uniform(get_config(name).num_shards) - 1
 
@@ -1074,32 +1088,43 @@ defmodule Group do
   @doc false
   def disconnect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
-    for cluster <- clusters do
-      Data.remove_cluster_node(name, cluster, node())
-    end
+    Data.remove_cluster_node(name, clusters, node())
 
     num_shards = get_config(name).num_shards
 
-    for i <- 0..(num_shards - 1) do
-      Replica.local_request(
-        Replica.shard_name(name, i),
-        {:cluster_disconnect, clusters},
-        timeout
-      )
-    end
+    shard_names = for i <- 0..(num_shards - 1), do: Replica.shard_name(name, i)
 
-    :ok
+    Replica.local_request_all(
+      shard_names,
+      {:cluster_disconnect, clusters},
+      timeout
+    )
   end
 
   # ===========================================================================
   # Internal
   # ===========================================================================
 
+  defp send_remote_nosuspend(name, target_node, destination, message) do
+    case :erlang.send_nosuspend(destination, message, [:noconnect]) do
+      true -> :ok
+      false -> Group.PeerReconnect.busy_link(name, target_node)
+    end
+  end
+
   defp validate_key!(key) do
     if String.ends_with?(key, "/") do
       raise ArgumentError,
             "key #{inspect(key)} must not end with \"/\" — trailing slash is reserved for prefix queries"
     end
+  end
+
+  defp validate_cluster_name!(cluster) when is_binary(cluster), do: :ok
+
+  defp validate_cluster_name!(other) do
+    raise ArgumentError,
+          "cluster name must be a binary, got: #{inspect(other)} — " <>
+            "the nil default cluster cannot be connected or disconnected"
   end
 
   defp call_timeout(opts), do: Keyword.get(opts, :timeout, @default_call_timeout)
@@ -1180,6 +1205,7 @@ defmodule Group do
       nil ->
         case :persistent_term.get({__MODULE__, name}, nil) do
           %{extract_meta: {mod, func, args}} -> fn meta -> apply(mod, func, [meta | args]) end
+          %{extract_meta: func} when is_function(func, 1) -> func
           _ -> & &1
         end
 

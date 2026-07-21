@@ -12,7 +12,7 @@ defmodule Group.Event do
   - `:cluster` - The cluster name (`nil` for default cluster)
   - `:key` - The key that triggered the event
   - `:pid` - The process involved
-  - `:meta` - User-provided metadata (internal keys stripped)
+  - `:meta` - User-provided metadata, optionally transformed by `:extract_meta`
   - `:previous_meta` - Previous metadata on re-register/re-join (`nil` if new)
   - `:reason` - Exit reason on `:unregistered`/`:left` events
   """

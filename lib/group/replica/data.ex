@@ -670,17 +670,12 @@ defmodule Group.Replica.Data do
     end)
   end
 
-  def pg_count(name, num_shards, cluster, key) do
-    Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
-      table = pg_by_key_table(name, shard)
+  def pg_count(name, shard, cluster, key) do
+    table = pg_by_key_table(name, shard)
 
-      count =
-        :ets.select_count(table, [
-          {{{cluster, key, :_}, :_, :_, :_}, [], [true]}
-        ])
-
-      acc + count
-    end)
+    :ets.select_count(table, [
+      {{{cluster, key, :_}, :_, :_, :_}, [], [true]}
+    ])
   end
 
   def pg_count_by_prefix(name, num_shards, cluster, prefix) do
@@ -720,25 +715,19 @@ defmodule Group.Replica.Data do
     Enum.any?(0..(num_shards - 1), fn shard ->
       table = reg_by_key_table(name, shard)
 
-      :ets.select_count(table, [
+      select_exists?(table, [
         {{{cluster, :_}, :_, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
-      ]) > 0
+      ])
     end)
   end
 
-  def local_pg_count(name, num_shards, cluster, key) do
+  def local_pg_count(name, shard, cluster, key) do
     local_node = node()
+    table = pg_by_key_table(name, shard)
 
-    Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
-      table = pg_by_key_table(name, shard)
-
-      count =
-        :ets.select_count(table, [
-          {{{cluster, key, :_}, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
-        ])
-
-      acc + count
-    end)
+    :ets.select_count(table, [
+      {{{cluster, key, :_}, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
+    ])
   end
 
   def local_pg_present?(name, num_shards, cluster) do
@@ -747,9 +736,9 @@ defmodule Group.Replica.Data do
     Enum.any?(0..(num_shards - 1), fn shard ->
       table = pg_by_key_table(name, shard)
 
-      :ets.select_count(table, [
+      select_exists?(table, [
         {{{cluster, :_, :_}, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
-      ]) > 0
+      ])
     end)
   end
 
@@ -773,6 +762,13 @@ defmodule Group.Replica.Data do
     end)
   end
 
+  defp select_exists?(table, match_spec) do
+    case :ets.select(table, match_spec, 1) do
+      {[_match], _continuation} -> true
+      :"$end_of_table" -> false
+    end
+  end
+
   # =====================================================================
   # Cluster membership (dual-index: cluster_nodes + node_clusters)
   # =====================================================================
@@ -782,16 +778,12 @@ defmodule Group.Replica.Data do
     :ets.lookup(table, cluster) |> Enum.map(&elem(&1, 1))
   end
 
-  def add_cluster_node(name, cluster, node) do
-    :ets.insert(cluster_nodes_table(name), {cluster, node})
-    :ets.insert(node_clusters_table(name), {node, cluster})
-    :ok
+  def add_cluster_node(name, clusters, node) when is_list(clusters) do
+    GenServer.call(data_name(name), {:add_cluster_node, clusters, node}, :infinity)
   end
 
-  def remove_cluster_node(name, cluster, node) do
-    :ets.delete_object(cluster_nodes_table(name), {cluster, node})
-    :ets.delete_object(node_clusters_table(name), {node, cluster})
-    :ok
+  def remove_cluster_node(name, clusters, node) when is_list(clusters) do
+    GenServer.call(data_name(name), {:remove_cluster_node, clusters, node}, :infinity)
   end
 
   def all_clusters(name) do
@@ -805,15 +797,7 @@ defmodule Group.Replica.Data do
   end
 
   def purge_cluster_node(name, dead_node) do
-    reverse = node_clusters_table(name)
-    forward = cluster_nodes_table(name)
-
-    for {^dead_node, cluster} <- :ets.lookup(reverse, dead_node) do
-      :ets.delete_object(forward, {cluster, dead_node})
-    end
-
-    :ets.delete(reverse, dead_node)
-    :ok
+    GenServer.call(data_name(name), {:purge_cluster_node, dead_node}, :infinity)
   end
 
   # =====================================================================
@@ -866,6 +850,33 @@ defmodule Group.Replica.Data do
   # =====================================================================
   # GenServer callbacks
   # =====================================================================
+
+  @impl true
+  def handle_call({:add_cluster_node, clusters, node}, _from, state) do
+    :ets.insert(cluster_nodes_table(state.name), Enum.map(clusters, &{&1, node}))
+    :ets.insert(node_clusters_table(state.name), Enum.map(clusters, &{node, &1}))
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:remove_cluster_node, clusters, node}, _from, state) do
+    Enum.each(clusters, fn cluster ->
+      :ets.delete_object(cluster_nodes_table(state.name), {cluster, node})
+      :ets.delete_object(node_clusters_table(state.name), {node, cluster})
+    end)
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:purge_cluster_node, dead_node}, _from, state) do
+    # Scan the forward index directly so this also repairs a one-sided row left
+    # by an interrupted or older dual-index mutation.
+    :ets.select_delete(cluster_nodes_table(state.name), [
+      {{:_, dead_node}, [], [true]}
+    ])
+
+    :ets.delete(node_clusters_table(state.name), dead_node)
+    {:reply, :ok, state}
+  end
 
   @impl true
   def init({name, num_shards}) do

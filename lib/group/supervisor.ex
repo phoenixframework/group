@@ -10,9 +10,8 @@ defmodule Group.Supervisor do
   @impl true
   def init(opts) do
     name = Keyword.fetch!(opts, :name)
-    num_shards = Keyword.get(opts, :shards, 8)
-    callbacks = Keyword.get(opts, :callbacks, %{})
-    extract_meta = Keyword.get(opts, :extract_meta)
+    num_shards = positive_integer_opt(opts, :shards, 8)
+    extract_meta = validate_extract_meta!(Keyword.get(opts, :extract_meta))
     resolve_registry_conflict = Keyword.get(opts, :resolve_registry_conflict)
     log = Keyword.get(opts, :log, :info)
 
@@ -45,7 +44,6 @@ defmodule Group.Supervisor do
 
     # persistent_term config — must be set before children start (Replica reads it)
     config = %{
-      callbacks: callbacks,
       num_shards: num_shards,
       log: log,
       replicated_pg_receiver_buffer_size: replicated_pg_receiver_buffer_size,
@@ -82,6 +80,20 @@ defmodule Group.Supervisor do
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)
+  end
+
+  defp validate_extract_meta!(nil), do: nil
+
+  defp validate_extract_meta!({mod, fun, args} = mfa)
+       when is_atom(mod) and is_atom(fun) and is_list(args),
+       do: mfa
+
+  defp validate_extract_meta!(fun) when is_function(fun, 1), do: fun
+
+  defp validate_extract_meta!(other) do
+    raise ArgumentError,
+          "expected :extract_meta to be a {module, function, extra_args} tuple " <>
+            "or a one-argument function, got: #{inspect(other)}"
   end
 
   defp positive_integer_opt(opts, key, default) do

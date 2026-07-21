@@ -29,6 +29,26 @@ defmodule GroupTest do
     {:ok, name: name}
   end
 
+  describe "startup options" do
+    test "runtime config omits unused callback state", %{name: name} do
+      refute Map.has_key?(Group.get_config(name), :callbacks)
+    end
+
+    test "rejects invalid shard counts" do
+      for shards <- [0, -1, 1.5, :many] do
+        name = :"invalid_shards_#{System.unique_integer([:positive])}"
+
+        error =
+          assert_raise ArgumentError, fn ->
+            Group.Supervisor.init(name: name, shards: shards, log: false)
+          end
+
+        assert error.message =~ ":shards"
+        assert error.message =~ "positive integer"
+      end
+    end
+  end
+
   describe "join/3 and leave/2" do
     test "joined process appears in members/2", %{name: name} do
       key = "chat/room/#{System.unique_integer([:positive])}"
@@ -172,6 +192,17 @@ defmodule GroupTest do
       {pid, meta} = Group.lookup(name, key)
       assert pid == self()
       assert meta == %{module: :test}
+    end
+
+    test "lookup propagates ArgumentError from metadata extraction", %{name: name} do
+      key = "user/extractor-error/#{System.unique_integer([:positive])}"
+      :ok = Group.register(name, key, %{module: :test})
+
+      assert_raise ArgumentError, "extractor failed", fn ->
+        Group.lookup(name, key,
+          extract_meta: fn _meta -> raise ArgumentError, "extractor failed" end
+        )
+      end
     end
 
     test "register triggers :registered event", %{name: name} do
@@ -621,6 +652,126 @@ defmodule GroupTest do
   end
 
   describe "named clusters" do
+    test "connect and disconnect reject non-binary cluster names", %{name: name} do
+      cluster = "validated/#{System.unique_integer([:positive])}"
+      key = "cluster-validation/#{System.unique_integer([:positive])}"
+      :ok = Group.register(name, key, %{})
+
+      for bad <- [nil, :default, 42] do
+        assert_raise ArgumentError, ~r/cluster name must be a binary/, fn ->
+          Group.connect(name, [bad])
+        end
+
+        assert_raise ArgumentError, ~r/cluster name must be a binary/, fn ->
+          Group.disconnect(name, [bad])
+        end
+      end
+
+      # The rejected disconnects must not have purged the default cluster view.
+      assert Group.lookup(name, key) == {self(), %{}}
+
+      assert :ok = Group.connect(name, cluster)
+      assert Group.connected?(name, cluster)
+      assert :ok = Group.disconnect(name, cluster)
+      refute Group.connected?(name, cluster)
+    end
+
+    test "purging a node removes a forward-only membership row", %{name: name} do
+      cluster = "orphaned/#{System.unique_integer([:positive])}"
+      dead_node = :"dead_#{System.unique_integer([:positive])}@127.0.0.1"
+      forward = Group.Replica.Data.cluster_nodes_table(name)
+      reverse = Group.Replica.Data.node_clusters_table(name)
+
+      :ok = Group.Replica.Data.add_cluster_node(name, [cluster], dead_node)
+
+      # Reproduce the one-sided state possible when add/remove/purge operations
+      # on the two public ETS indexes interleave.
+      :ets.delete_object(reverse, {dead_node, cluster})
+      assert {cluster, dead_node} in :ets.lookup(forward, cluster)
+      assert :ets.lookup(reverse, dead_node) == []
+
+      :ok = Group.Replica.Data.purge_cluster_node(name, dead_node)
+
+      refute {cluster, dead_node} in :ets.lookup(forward, cluster)
+      assert :ets.lookup(reverse, dead_node) == []
+    end
+
+    test "concurrent membership mutations keep both indexes consistent", %{name: name} do
+      cluster = "concurrent/#{System.unique_integer([:positive])}"
+      remote_node = :"remote_#{System.unique_integer([:positive])}@127.0.0.1"
+      forward = Group.Replica.Data.cluster_nodes_table(name)
+      reverse = Group.Replica.Data.node_clusters_table(name)
+
+      1..200
+      |> Task.async_stream(
+        fn i ->
+          if rem(i, 2) == 0 do
+            Group.Replica.Data.add_cluster_node(name, [cluster], remote_node)
+          else
+            Group.Replica.Data.remove_cluster_node(name, [cluster], remote_node)
+          end
+        end,
+        max_concurrency: 20,
+        ordered: false
+      )
+      |> Stream.run()
+
+      forward? = {cluster, remote_node} in :ets.lookup(forward, cluster)
+      reverse? = {remote_node, cluster} in :ets.lookup(reverse, remote_node)
+      assert forward? == reverse?
+    end
+
+    test "replication queued after disconnect cannot repopulate the cluster" do
+      name =
+        start_single_shard_group(
+          replicated_pg_receiver_buffer_size: 1,
+          replicated_registry_receiver_buffer_size: 1
+        )
+
+      cluster = "disconnect/race/#{System.unique_integer([:positive])}"
+      registry_key = "late/registry"
+      pg_key = "late/pg"
+      remote_pid = spawn_forever()
+      shard = Group.Replica.shard_name(name, 0)
+
+      on_exit(fn ->
+        resume_shard_if_alive(shard)
+        kill_if_alive(remote_pid)
+      end)
+
+      assert :ok = Group.connect(name, cluster)
+      :ok = :sys.suspend(shard)
+
+      disconnect_caller =
+        spawn_requester(fn -> Group.disconnect(name, cluster) end, :disconnect_result)
+
+      on_exit(fn -> kill_if_alive(disconnect_caller) end)
+
+      wait_until(fn ->
+        {:messages, messages} = Process.info(Process.whereis(shard), :messages)
+
+        disconnect_queued? =
+          Enum.any?(messages, fn
+            {:group_local_request, _alias, {:cluster_disconnect, [^cluster]}} -> true
+            {:group_local_request, _caller, _ref, {:cluster_disconnect, [^cluster]}} -> true
+            _ -> false
+          end)
+
+        not Group.connected?(name, cluster) and disconnect_queued?
+      end)
+
+      send(shard, replicated_register(cluster, registry_key, remote_pid, %{}, :register))
+      send(shard, replicated_pg_join(cluster, pg_key, remote_pid, %{}, :join))
+      :ok = :sys.resume(shard)
+
+      assert_receive {:disconnect_result, ^disconnect_caller, :ok}, 1_000
+      :sys.get_state(shard)
+
+      refute Group.connected?(name, cluster)
+      assert Group.lookup(name, registry_key, cluster: cluster) == nil
+      assert Group.members(name, pg_key, cluster: cluster) == []
+    end
+
     test "connect/disconnect/connected? manage cluster lifecycle", %{name: name} do
       cluster = "game_servers"
 
@@ -934,6 +1085,58 @@ defmodule GroupTest do
       refute_receive {:test_message, :from_default}, 200
     end
 
+    test "remote dispatch uses a non-suspending send without connecting", %{name: name} do
+      key = "dispatch/nonblocking/#{System.unique_integer([:positive])}"
+      remote_node = :"missing_#{System.unique_integer([:positive])}@127.0.0.1"
+      member = spawn_forever()
+      num_shards = Group.get_config(name).num_shards
+      key_shard = Group.Replica.shard_index_for(nil, key, num_shards)
+
+      on_exit(fn -> kill_if_alive(member) end)
+
+      now = System.system_time()
+      Group.Replica.Data.registry_insert(name, key_shard, nil, key, member, %{}, now, remote_node)
+      Group.Replica.Data.pg_insert(name, key_shard, nil, key, member, %{}, now, remote_node)
+
+      test_pid = self()
+
+      dispatcher =
+        spawn(fn ->
+          receive do
+            :dispatch ->
+              send(test_pid, {:dispatch_result, self(), Group.dispatch(name, key, :hello)})
+          end
+        end)
+
+      on_exit(fn -> kill_if_alive(dispatcher) end)
+      :erlang.trace(dispatcher, true, [:call])
+      :erlang.trace_pattern({:erlang, :send_nosuspend, 3}, true, [:local])
+
+      on_exit(fn ->
+        if Process.alive?(dispatcher), do: :erlang.trace(dispatcher, false, [:call])
+        :erlang.trace_pattern({:erlang, :send_nosuspend, 3}, false, [:local])
+      end)
+
+      send(dispatcher, :dispatch)
+      assert_receive {:dispatch_result, ^dispatcher, :ok}, 1_000
+
+      assert_receive {:trace, ^dispatcher, :call,
+                      {:erlang, :send_nosuspend, [^member, :hello, [:noconnect]]}},
+                     1_000
+
+      dispatch_shard = :erlang.phash2(dispatcher, num_shards)
+      shard_name = Group.Replica.shard_name(name, dispatch_shard)
+
+      assert_receive {:trace, ^dispatcher, :call,
+                      {:erlang, :send_nosuspend,
+                       [
+                         {^shard_name, ^remote_node},
+                         {:group_dispatch, [^member], :hello},
+                         [:noconnect]
+                       ]}},
+                     1_000
+    end
+
     test "dispatch_local only sends to local members", %{name: name} do
       key = "dispatch_local/#{System.unique_integer([:positive])}"
 
@@ -1110,6 +1313,36 @@ defmodule GroupTest do
       after
         resume_shard_if_alive(shard)
       end
+    end
+
+    test "disconnect timeout still fans cleanup out to every shard" do
+      name = :"test_disconnect_timeout_#{System.unique_integer([:positive])}"
+      cluster = "timeout_cluster"
+      start_supervised!({Group, name: name, shards: 2, log: false})
+
+      key =
+        Stream.iterate(0, &(&1 + 1))
+        |> Stream.map(&"timeout/shard-one/#{&1}")
+        |> Enum.find(fn key -> Group.Replica.shard_index_for(cluster, key, 2) == 1 end)
+
+      assert :ok = Group.connect(name, cluster)
+      assert :ok = Group.join(name, key, %{}, cluster: cluster)
+      assert Group.members(name, key, cluster: cluster) == [{self(), %{}}]
+
+      shard_zero = Group.Replica.shard_name(name, 0)
+      :ok = :sys.suspend(shard_zero)
+
+      try do
+        assert_genserver_call_timeout(fn ->
+          Group.disconnect(name, cluster, timeout: 10)
+        end)
+      after
+        resume_shard_if_alive(shard_zero)
+      end
+
+      :sys.get_state(shard_zero)
+      refute Group.connected?(name, cluster)
+      assert Group.members(name, key, cluster: cluster) == []
     end
   end
 
@@ -1609,6 +1842,46 @@ defmodule GroupTest do
   end
 
   describe "local_registry_count/1" do
+    test "local activity checks use bounded ETS selects", %{name: name} do
+      registry_key = "presence/registry/#{System.unique_integer([:positive])}"
+      pg_key = "presence/pg/#{System.unique_integer([:positive])}"
+      :ok = Group.register(name, registry_key, %{})
+      :ok = Group.join(name, pg_key, %{})
+      num_shards = Group.get_config(name).num_shards
+      parent = self()
+
+      :erlang.trace_pattern({:ets, :select, 3}, true, [:local])
+      :erlang.trace_pattern({:ets, :select_count, 2}, true, [:local])
+
+      on_exit(fn ->
+        :erlang.trace_pattern({:ets, :select, 3}, false, [:local])
+        :erlang.trace_pattern({:ets, :select_count, 2}, false, [:local])
+      end)
+
+      checks = [
+        registry: fn -> Group.Replica.Data.local_registry_present?(name, num_shards, nil) end,
+        pg: fn -> Group.Replica.Data.local_pg_present?(name, num_shards, nil) end
+      ]
+
+      for {kind, check} <- checks do
+        worker =
+          spawn(fn ->
+            receive do
+              :check -> send(parent, {:presence_result, kind, check.()})
+            end
+          end)
+
+        :erlang.trace(worker, true, [:call])
+        send(worker, :check)
+
+        assert_receive {:trace, ^worker, :call, {:ets, :select, [_table, _match_spec, 1]}},
+                       1_000
+
+        refute_receive {:trace, ^worker, :call, {:ets, :select_count, _args}}, 20
+        assert_receive {:presence_result, ^kind, true}, 1_000
+      end
+    end
+
     test "counts registered processes", %{name: name} do
       assert Group.local_registry_count(name) == 0
 
@@ -1634,6 +1907,52 @@ defmodule GroupTest do
   end
 
   describe "local_member_count/2" do
+    test "exact member counts query only the owning shard", %{name: name} do
+      num_shards = Group.get_config(name).num_shards
+      target_shard = num_shards - 1
+
+      key =
+        Stream.iterate(0, &(&1 + 1))
+        |> Stream.map(&"count/exact/#{&1}")
+        |> Enum.find(fn key ->
+          Group.Replica.shard_index_for(nil, key, num_shards) == target_shard
+        end)
+
+      :ok = Group.join(name, key, %{})
+      expected_table = Group.Replica.Data.pg_by_key_table(name, target_shard)
+      parent = self()
+
+      :erlang.trace_pattern({:ets, :select_count, 2}, true, [:local])
+
+      on_exit(fn ->
+        :erlang.trace_pattern({:ets, :select_count, 2}, false, [:local])
+      end)
+
+      checks = [
+        total: fn -> Group.member_count(name, key) end,
+        local: fn -> Group.local_member_count(name, key) end
+      ]
+
+      for {kind, check} <- checks do
+        worker =
+          spawn(fn ->
+            receive do
+              :count -> send(parent, {:count_result, kind, check.()})
+            end
+          end)
+
+        :erlang.trace(worker, true, [:call])
+        send(worker, :count)
+
+        assert_receive {:trace, ^worker, :call,
+                        {:ets, :select_count, [^expected_table, _match_spec]}},
+                       1_000
+
+        assert_receive {:count_result, ^kind, 1}, 1_000
+        refute_receive {:trace, ^worker, :call, {:ets, :select_count, _args}}, 20
+      end
+    end
+
     test "counts local group members", %{name: name} do
       group = "my_group"
       assert Group.local_member_count(name, group) == 0
@@ -1789,6 +2108,50 @@ defmodule GroupTest do
                {:registry, nil, "users/self", self(), %{public: :keep}}
              ]
     end
+
+    test "rejects invalid extract_meta configuration at startup" do
+      for bad <- ["nope", {Map, :take}, fn a, b -> {a, b} end] do
+        name = :"invalid_extract_meta_#{System.unique_integer([:positive])}"
+
+        error =
+          assert_raise ArgumentError, fn ->
+            Group.Supervisor.init(name: name, extract_meta: bad, log: false)
+          end
+
+        assert error.message =~ ":extract_meta"
+      end
+    end
+
+    test "applies a configured extract_meta function to reads and events" do
+      name = :"test_group_extract_fun_#{System.unique_integer([:positive])}"
+      extract_meta = fn meta -> Map.take(meta, [:public]) end
+      start_supervised!({Group, name: name, shards: 1, log: false, extract_meta: extract_meta})
+
+      registry_key = "users/function"
+      pg_key = "rooms/function"
+      :ok = Group.monitor(name, :all)
+
+      :ok = Group.register(name, registry_key, %{public: :registry, private: :drop})
+      :ok = Group.join(name, pg_key, %{public: :pg, private: :drop})
+
+      assert_receive {:group,
+                      [%Group.Event{type: :registered, key: ^registry_key} = registry_event], _},
+                     1_000
+
+      assert registry_event.meta == %{public: :registry}
+
+      assert_receive {:group, [%Group.Event{type: :joined, key: ^pg_key} = pg_event], _}, 1_000
+      assert pg_event.meta == %{public: :pg}
+
+      assert Group.lookup(name, registry_key) == {self(), %{public: :registry}}
+      assert Group.members(name, pg_key) == [{self(), %{public: :pg}}]
+
+      assert Enum.sort(Group.local_entries(name)) ==
+               Enum.sort([
+                 {:registry, nil, registry_key, self(), %{public: :registry}},
+                 {:pg, nil, pg_key, self(), %{public: :pg}}
+               ])
+    end
   end
 
   describe "concurrent operations" do
@@ -1886,6 +2249,52 @@ defmodule GroupTest do
       assert types == [:left, :unregistered]
       assert Enum.all?(events, &(&1.key == key))
       assert Enum.all?(events, &(&1.pid == pid))
+    end
+
+    test "process death replication uses the non-suspending remote send path", %{name: name} do
+      key = "batch/nonblocking/#{System.unique_integer([:positive])}"
+      parent = self()
+
+      owner =
+        spawn(fn ->
+          :ok = Group.register(name, key, %{})
+          send(parent, {:nonblocking_owner_ready, self()})
+          Process.sleep(:infinity)
+        end)
+
+      on_exit(fn -> kill_if_alive(owner) end)
+      assert_receive {:nonblocking_owner_ready, ^owner}, 1_000
+
+      shard_name = Group.Replica.shard_for(name, nil, key)
+      shard_pid = Process.whereis(shard_name)
+
+      # Flush the registration sender buffer before tracing the DOWN path.
+      flush_replicated_registry_barrier(shard_name)
+      assert_receive {:replicated_registry_buffer_flushed, ^shard_name}, 1_000
+
+      :sys.replace_state(shard_pid, fn state ->
+        %{state | remote_shards: Map.put(state.remote_shards, node(), self())}
+      end)
+
+      :erlang.trace(shard_pid, true, [:call])
+      :erlang.trace_pattern({:erlang, :send_nosuspend, 3}, true, [:local])
+
+      on_exit(fn ->
+        if Process.alive?(shard_pid), do: :erlang.trace(shard_pid, false, [:call])
+        :erlang.trace_pattern({:erlang, :send_nosuspend, 3}, false, [:local])
+      end)
+
+      Process.exit(owner, :kill)
+      local_node = node()
+
+      assert_receive {:trace, ^shard_pid, :call,
+                      {:erlang, :send_nosuspend,
+                       [
+                         {^shard_name, ^local_node},
+                         {:replicate_process_down_batch, _reg_entries, _pg_entries},
+                         [:noconnect]
+                       ]}},
+                     1_000
     end
 
     test "process death batches multiple :left events for same-shard keys", %{name: name} do
@@ -2268,6 +2677,55 @@ defmodule GroupTest do
 
       assert [{nil, ^key, %{v: 2}, ^time2, _entry_node}] =
                Group.Replica.Data.registry_lookup_by_pid(name, 0, new_pid)
+    end
+
+    test "custom conflict resolver controls the losing registry owner's lifecycle" do
+      key = "replicated-registry/custom-loser/#{System.unique_integer([:positive])}"
+
+      name =
+        start_single_shard_group(
+          replicated_registry_receiver_buffer_size: 1,
+          resolve_registry_conflict: {GroupTest.ResolveRegistryConflict, :pick, [:remote]}
+        )
+
+      parent = self()
+
+      local_owner =
+        spawn(fn ->
+          :ok = Group.register(name, key, %{owner: :local})
+          send(parent, {:custom_conflict_owner_ready, self()})
+          Process.sleep(:infinity)
+        end)
+
+      remote_pid = spawn_forever()
+
+      on_exit(fn ->
+        kill_if_alive(local_owner)
+        kill_if_alive(remote_pid)
+      end)
+
+      assert_receive {:custom_conflict_owner_ready, ^local_owner}, 1_000
+      owner_ref = Process.monitor(local_owner)
+      shard = Group.Replica.shard_name(name, 0)
+
+      send(
+        shard,
+        replicated_register(
+          nil,
+          key,
+          remote_pid,
+          %{owner: :remote},
+          :register,
+          System.system_time()
+        )
+      )
+
+      wait_until(fn ->
+        Group.lookup(name, key) == {remote_pid, %{owner: :remote}}
+      end)
+
+      refute_receive {:DOWN, ^owner_ref, :process, ^local_owner, _reason}, 50
+      assert Process.alive?(local_owner)
     end
 
     test "batched remote conflict keeps the staged local winner when later unregister arrives" do

@@ -1,3 +1,25 @@
+## Unreleased
+- **Breaking**: `Group.disconnect/3` now discards the complete local view of each departed
+  cluster — remote entries included, and monitors receive `:unregistered`/`:left` events for
+  them — instead of removing only locally owned rows. Reconnecting resyncs through the normal
+  snapshot exchange. `connect`/`disconnect` also raise `ArgumentError` for non-binary cluster
+  names instead of silently tolerating them.
+- The built-in registry conflict resolver now consistently includes the winner's metadata in
+  the losing process's `{:group_registry_conflict, key, winner_meta}` exit reason. Custom
+  `resolve_registry_conflict` callbacks remain responsible for any process exits they require.
+- **Breaking**: `Group.dispatch/4` remote sends and process-DOWN replication are now
+  non-suspending and never auto-connect — on a busy or disconnected distribution link the
+  message is dropped, the link is force-disconnected, and bounded reconnect retries begin (the
+  same policy replication lanes have used since 0.1.8). Previously dispatch could block the
+  caller and initiate new connections.
+- Configured function-form `extract_meta` callbacks are now applied on reads and lifecycle
+  events (previously they were silently ignored and full metadata was exposed), and invalid
+  `:extract_meta` values raise `ArgumentError` at startup.
+- `Group.lookup/3` no longer converts `ArgumentError` raised by metadata extraction callbacks
+  into a `nil` miss; extractor errors now propagate to the caller.
+- Invalid `:shards` values (zero, negative, non-integer) raise `ArgumentError` at startup
+  instead of failing later during key routing.
+
 ## 0.2.1 (2026-07-17)
 - Add bounded `Group.members/3` queries with `limit:` and local-owner process-group queries through `Group.local_members/3`
 
