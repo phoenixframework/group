@@ -49,6 +49,21 @@ defmodule GroupTest do
     end
   end
 
+  describe "monitor_generation/1" do
+    test "notifies long-lived owners when local membership storage exits", %{name: name} do
+      assert {:ok, generation_pid, monitor_ref} = Group.monitor_generation(name)
+
+      Process.exit(generation_pid, :kill)
+
+      assert_receive {:DOWN, ^monitor_ref, :process, ^generation_pid, :killed}
+    end
+
+    test "returns not_running for an unknown Group" do
+      name = :"missing_group_#{System.unique_integer([:positive])}"
+      assert {:error, :not_running} = Group.monitor_generation(name)
+    end
+  end
+
   describe "join/3 and leave/2" do
     test "joined process appears in members/2", %{name: name} do
       key = "chat/room/#{System.unique_integer([:positive])}"

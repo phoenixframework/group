@@ -233,6 +233,26 @@ defmodule Group do
 
   def start_link(opts), do: Group.Supervisor.start_link(opts)
 
+  @doc """
+  Monitors the process that owns the local Group membership generation.
+
+  All local registry and process-group entries are stored in ETS tables owned
+  by this process. If it exits, those entries no longer exist even when their
+  owner processes remain alive. Long-lived owners can use this monitor to
+  terminate and re-register against the next Group generation.
+
+  A generation that exits between lookup and monitor creation still produces
+  the normal immediate `:DOWN` message for the returned monitor reference.
+
+  Returns `{:ok, pid, monitor_ref}` or `{:error, :not_running}`.
+  """
+  def monitor_generation(name) when is_atom(name) do
+    case GenServer.whereis(Data.data_name(name)) do
+      pid when is_pid(pid) -> {:ok, pid, Process.monitor(pid)}
+      nil -> {:error, :not_running}
+    end
+  end
+
   # ===========================================================================
   # Cluster Management (Node <-> Cluster)
   # ===========================================================================

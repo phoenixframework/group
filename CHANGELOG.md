@@ -1,4 +1,6 @@
 ## Unreleased
+- Add `Group.monitor_generation/1` so long-lived registration owners can
+  terminate and re-register when the local membership ETS generation is lost.
 - **Breaking**: `Group.disconnect/3` now discards the complete local view of each departed
   cluster — remote entries included, and monitors receive `:unregistered`/`:left` events for
   them — instead of removing only locally owned rows. Reconnecting resyncs through the normal
