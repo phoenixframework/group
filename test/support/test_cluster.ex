@@ -299,6 +299,92 @@ defmodule Group.TestCluster do
     end)
   end
 
+  @doc "Spawn a process on a remote node that joins in a named cluster and sleeps."
+  def spawn_join_in_cluster(node, name, key, meta, cluster) do
+    :erpc.call(node, fn ->
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :ok = Group.join(name, key, meta, cluster: cluster)
+          send(parent, {:joined, self()})
+          Process.sleep(:infinity)
+        end)
+
+      receive do
+        {:joined, ^pid} -> pid
+      after
+        5000 -> raise "spawn_join_in_cluster timed out"
+      end
+    end)
+  end
+
+  @doc "Connects every cluster through an independent concurrent caller."
+  def connect_many_concurrently(node, name, clusters) do
+    :erpc.call(node, __MODULE__, :do_connect_many_concurrently, [name, clusters], 60_000)
+  end
+
+  @doc false
+  def do_connect_many_concurrently(name, clusters) do
+    clusters
+    |> Task.async_stream(
+      fn cluster -> Group.connect(name, cluster) end,
+      max_concurrency: 64,
+      ordered: false,
+      timeout: 30_000
+    )
+    |> Enum.each(fn {:ok, :ok} -> :ok end)
+
+    :ok
+  end
+
+  @doc "Spawns one long-lived registration owner in each named cluster."
+  def spawn_register_many_clusters(node, name, clusters, key_prefix) do
+    :erpc.call(
+      node,
+      __MODULE__,
+      :do_spawn_register_many_clusters,
+      [name, clusters, key_prefix],
+      60_000
+    )
+  end
+
+  @doc false
+  def do_spawn_register_many_clusters(name, clusters, key_prefix) do
+    parent = self()
+
+    entries =
+      Enum.map(clusters, fn cluster ->
+        key = "#{key_prefix}/#{cluster}"
+
+        pid =
+          spawn(fn ->
+            :ok = Group.register(name, key, %{cluster: cluster}, cluster: cluster)
+            send(parent, {:registered_many, self()})
+            Process.sleep(:infinity)
+          end)
+
+        {cluster, key, pid}
+      end)
+
+    Enum.each(entries, fn {_cluster, _key, pid} ->
+      receive do
+        {:registered_many, ^pid} -> :ok
+      after
+        30_000 -> raise "spawn_register_many_clusters timed out"
+      end
+    end)
+
+    entries
+  end
+
+  @doc false
+  def registry_entries_present?(name, entries) do
+    Enum.all?(entries, fn {cluster, key, pid} ->
+      match?({^pid, %{cluster: ^cluster}}, Group.lookup(name, key, cluster: cluster))
+    end)
+  end
+
   @doc "Monitor nodedown events from a remote node, forwarding to caller"
   def monitor_nodes_on(node, target_pid) do
     :erpc.call(node, fn ->
@@ -551,6 +637,193 @@ defmodule Group.TestCluster do
     end
 
     :ok
+  end
+
+  @doc """
+  Asserts the replica-only authority and journal invariants in addition to the
+  public dual-index invariants checked by `assert_ets_consistent/1`.
+
+  This is intended for quiescent convergence points in adversarial tests.
+  """
+  def assert_replica_consistent(name) do
+    :ok = assert_ets_consistent(name)
+    num_shards = Group.get_config(name).num_shards
+
+    for shard <- 0..(num_shards - 1) do
+      assert_registry_claim_indexes(name, shard)
+      assert_registry_projection_has_authority(name, shard)
+      assert_oplog_indexes(name, shard)
+      assert_replica_cursor_authority(name, shard)
+    end
+
+    :ok
+  end
+
+  @doc """
+  Returns every PID currently retained as replica authority or visible PG state.
+
+  Adversarial tests use this at a quiescent convergence point to prove that no
+  dead owner remains hidden behind otherwise-consistent dual indexes.
+  """
+  def replica_owner_pids(name) do
+    num_shards = Group.get_config(name).num_shards
+
+    0..(num_shards - 1)
+    |> Enum.flat_map(fn shard ->
+      registry_pids =
+        Group.Replica.Data.reg_claim_by_key_table(name, shard)
+        |> :ets.tab2list()
+        |> Enum.map(fn {{_cluster, _key, _origin, _generation, _epoch}, pid, _meta, _time, _seq} ->
+          pid
+        end)
+
+      pg_pids =
+        Group.Replica.Data.pg_by_key_table(name, shard)
+        |> :ets.tab2list()
+        |> Enum.map(fn {{_cluster, _key, pid}, _meta, _time, _node} -> pid end)
+
+      registry_pids ++ pg_pids
+    end)
+    |> Enum.uniq()
+  end
+
+  @doc false
+  def replica_protocol_state(name) do
+    num_shards = Group.get_config(name).num_shards
+
+    for shard <- 0..(num_shards - 1) do
+      %{
+        shard: shard,
+        heads: Group.Replica.Data.replica_stream_heads(name, shard),
+        cursors:
+          Group.Replica.Data.replica_cursor_table(name, shard)
+          |> :ets.tab2list()
+          |> Enum.sort()
+      }
+    end
+  end
+
+  defp assert_registry_claim_indexes(name, shard) do
+    by_key = Group.Replica.Data.reg_claim_by_key_table(name, shard)
+    by_pid = Group.Replica.Data.reg_claim_by_pid_table(name, shard)
+
+    key_set =
+      :ets.tab2list(by_key)
+      |> MapSet.new(fn
+        {{cluster, key, origin, generation, epoch}, pid, meta, time, seq} ->
+          {cluster, key, pid, meta, time, origin, generation, epoch, seq}
+      end)
+
+    pid_set =
+      :ets.tab2list(by_pid)
+      |> MapSet.new(fn
+        {{pid, cluster, key, origin, generation, epoch}, meta, time, seq} ->
+          {cluster, key, pid, meta, time, origin, generation, epoch, seq}
+      end)
+
+    if key_set != pid_set do
+      raise "registry claim index inconsistency in #{name} shard #{shard}: " <>
+              "by_key_only=#{inspect(MapSet.difference(key_set, pid_set) |> MapSet.to_list())} " <>
+              "by_pid_only=#{inspect(MapSet.difference(pid_set, key_set) |> MapSet.to_list())}"
+    end
+
+    case Enum.find(key_set, fn {_cluster, _key, pid, _meta, _time, origin, _gen, _epoch, _seq} ->
+           node(pid) != origin
+         end) do
+      nil -> :ok
+      invalid -> raise "registry claim has invalid origin authority: #{inspect(invalid)}"
+    end
+  end
+
+  defp assert_registry_projection_has_authority(name, shard) do
+    claims =
+      Group.Replica.Data.reg_claim_by_key_table(name, shard)
+      |> :ets.tab2list()
+      |> MapSet.new(fn
+        {{cluster, key, origin, _generation, _epoch}, pid, meta, time, _seq} ->
+          {cluster, key, pid, meta, time, origin}
+      end)
+
+    visible =
+      Group.Replica.Data.reg_by_key_table(name, shard)
+      |> :ets.tab2list()
+      |> MapSet.new(fn {{cluster, key}, pid, meta, time, origin} ->
+        {cluster, key, pid, meta, time, origin}
+      end)
+
+    missing_authority = MapSet.difference(visible, claims)
+
+    if MapSet.size(missing_authority) > 0 do
+      raise "visible registry rows without an authoritative claim in #{name} shard #{shard}: " <>
+              inspect(MapSet.to_list(missing_authority))
+    end
+  end
+
+  defp assert_oplog_indexes(name, shard) do
+    oplog =
+      Group.Replica.Data.replica_oplog_table(name, shard)
+      |> :ets.tab2list()
+      |> MapSet.new(fn {{stream_id, seq}, append_id, _mutations} ->
+        {append_id, stream_id, seq}
+      end)
+
+    order =
+      Group.Replica.Data.replica_oplog_order_table(name, shard)
+      |> :ets.tab2list()
+      |> MapSet.new()
+
+    if oplog != order do
+      raise "oplog/order index inconsistency in #{name} shard #{shard}: " <>
+              "oplog_only=#{inspect(MapSet.difference(oplog, order) |> MapSet.to_list())} " <>
+              "order_only=#{inspect(MapSet.difference(order, oplog) |> MapSet.to_list())}"
+    end
+
+    Group.Replica.Data.replica_stream_meta_table(name, shard)
+    |> :ets.tab2list()
+    |> Enum.each(fn {stream_id, head, floor, applied} ->
+      unless floor >= 1 and floor <= head + 1 and applied >= 0 and applied <= head do
+        raise "invalid stream bounds in #{name} shard #{shard}: " <>
+                inspect({stream_id, head, floor, applied})
+      end
+
+      retained =
+        oplog
+        |> Enum.filter(fn {_append_id, row_stream, _seq} -> row_stream == stream_id end)
+        |> Enum.map(&elem(&1, 2))
+        |> Enum.sort()
+
+      expected = if floor <= head, do: Enum.to_list(floor..head), else: []
+
+      if retained != expected do
+        raise "non-contiguous retained oplog in #{name} shard #{shard}: " <>
+                "stream=#{inspect(stream_id)} retained=#{inspect(retained)} " <>
+                "expected=#{inspect(expected)}"
+      end
+    end)
+  end
+
+  defp assert_replica_cursor_authority(name, shard) do
+    Group.Replica.Data.replica_cursor_table(name, shard)
+    |> :ets.tab2list()
+    |> Enum.each(fn {stream_id, seq} ->
+      origin = Group.Replica.Protocol.stream_origin(stream_id)
+      generation = Group.Replica.Protocol.stream_generation(stream_id)
+      cluster = Group.Replica.Protocol.stream_cluster(stream_id)
+      epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+
+      valid? =
+        Group.Replica.Protocol.stream_name(stream_id) == name and
+          Group.Replica.Protocol.stream_shard(stream_id) == shard and
+          origin != node() and
+          generation == Group.Replica.Data.remote_generation(name, origin) and
+          epoch == Group.Replica.Data.remote_cluster_epoch(name, origin, cluster) and
+          seq >= 0
+
+      unless valid? do
+        raise "replica cursor is not fenced by current authority in #{name} shard #{shard}: " <>
+                inspect({stream_id, seq})
+      end
+    end)
   end
 
   @doc "Wait for a condition to become true, with retries"

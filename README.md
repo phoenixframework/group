@@ -212,14 +212,16 @@ delivers an event with `previous_meta` set to the old value.
 All operations are **eventually consistent**:
 
 - Writes (`register`, `join`, etc.) return immediately after updating local ETS.
-- Changes replicate to other nodes asynchronously over Erlang distribution.
+- Changes replicate asynchronously over a configurable, nonblocking replica
+  transport. Erlang distribution remains the membership/control plane.
 - During network partitions, nodes may have divergent views.
-- When partitions heal, state is re-synced via `cluster_state` messages.
+- When connectivity returns, per-origin stream heads repair missing sequence
+  ranges from a bounded oplog; a lag beyond the retained prefix falls back to
+  an exact snapshot of that origin's shard/cluster slice.
 - Registry conflicts (same key registered on two nodes during a partition) can
   be resolved with a configurable `resolve_registry_conflict` callback. The
-  built-in resolver kills the losing process with
-  `{:group_registry_conflict, key, winner_meta}`; custom resolvers control any
-  process exits themselves.
+  callback selects a winner; each origin retires and terminates only its own
+  losing process with `{:group_registry_conflict, key, winner_meta}`.
 
 ## Configuration
 
@@ -238,7 +240,11 @@ All operations are **eventually consistent**:
   replicated_sender_flush_interval: 5,
   busy_dist_retry_attempts: 300,
   busy_dist_retry_interval: 1_000,
-  replicated_pg_receiver_local_request_quota: 8
+  replicated_pg_receiver_local_request_quota: 8,
+  replica_transport: Group.Replica.Transport.Distribution,
+  replicated_oplog_max_entries: 65_536,
+  replicated_anti_entropy_interval: 1_000,
+  replicated_peer_lease_timeout: 15_000
 }
 ```
 
@@ -257,9 +263,10 @@ All operations are **eventually consistent**:
 - **`resolve_registry_conflict`** — `{module, function, extra_args}` callback
   invoked as `apply(mod, fun, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
   Called when partition healing or concurrent registration finds the same key
-  registered on two nodes. Must return the winning pid and is responsible for
-  any process exits it requires. Runs synchronously inside the shard GenServer —
-  must return quickly and never block.
+  registered on two nodes. Must return the winning pid (or neither pid to
+  reject both). Group records an authoritative delete and terminates a losing
+  owner only on that owner's local node. The callback runs synchronously inside
+  the shard GenServer, so it must return quickly and never block.
 - **`extract_meta`** — `{module, function, args}` or `fun(meta)` applied to
   metadata on reads and lifecycle events. Useful for stripping internal fields.
 - **`replicated_pg_receiver_buffer_size`** — max buffered replicated PG
@@ -275,18 +282,35 @@ All operations are **eventually consistent**:
 - **`replicated_sender_flush_interval`** — max outbound buffer age in
   milliseconds. Defaults to 5.
 - **`busy_dist_retry_attempts`** — reconnect attempts after a non-suspending
-  remote send reports a busy link. Defaults to 300.
-- **`busy_dist_retry_interval`** — milliseconds between busy-link reconnect
-  attempts. Defaults to 1,000.
-- **`replicated_pg_receiver_local_request_quota`** — local PG requests drained
-  after each replicated receiver turn. Defaults to 8.
+  remote dispatch reports a busy dist link. Defaults to 300. Replica transport
+  frames are simply dropped and repaired instead of forcing a disconnect.
+- **`busy_dist_retry_interval`** — milliseconds between dispatch busy-link
+  reconnect attempts. Defaults to 1,000.
+- **`replicated_pg_receiver_local_request_quota`** — legacy-named quota for
+  queued local shard requests drained per fairness turn while replica data or
+  cluster controls are busy. Defaults to 8.
+- **`replica_transport`** — a module implementing
+  `Group.Replica.Transport`, or `{module, opts}`. The default adapter uses
+  `:erlang.send_nosuspend/3`; adapters must return promptly with `:ok`, `:busy`,
+  or `:disconnected`. Dropped and busy frames are repaired by anti-entropy.
+- **`replicated_oplog_max_entries`** — maximum retained replica records per
+  shard across all local streams. Defaults to 65,536. Pruning never waits for
+  peer acknowledgements; a peer behind the retained floor receives an exact
+  snapshot.
+- **`replicated_anti_entropy_interval`** — interval in milliseconds for stream
+  head advertisements and nonblocking control heartbeats. Defaults to 1,000.
+- **`replicated_peer_lease_timeout`** — time without a dist-Erlang control
+  heartbeat before state owned by that Group peer is purged. Defaults to 15,000
+  and must exceed the anti-entropy interval. Probes continue after expiry so a
+  Group restart on a still-connected VM recovers automatically.
 
 ## Architecture
 
 ```
 Group.Supervisor (:"my_app_group_sup")
-├── Group.Replica.Data        — owns ETS tables and serializes membership writes
-├── Group.PeerReconnect       — bounded recovery after busy distribution links
+├── optional transport child  — sideband adapter listener/pool
+├── Group.Replica.Data        — owns ETS, journal, generations, and epochs
+├── Group.PeerReconnect       — bounded recovery after busy remote dispatch
 ├── Group.Replica.Supervisor  — supervises N shard GenServers
 │   ├── Group.Replica (shard 0)
 │   ├── Group.Replica (shard 1)
@@ -310,7 +334,7 @@ contention for unrelated keys.
 
 ### ETS Tables
 
-Each shard owns 4 ETS tables:
+Each shard has materialized read indexes plus authority/recovery indexes:
 
 | Table | Type | Key | Purpose |
 |---|---|---|---|
@@ -318,6 +342,12 @@ Each shard owns 4 ETS tables:
 | `reg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | Reverse index for death cleanup |
 | `pg_by_key` | `:ordered_set` | `{cluster, key, pid}` | Group membership lookup |
 | `pg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | Reverse index for death cleanup |
+
+Registry claim tables retain one authoritative claim per origin independently
+of the visible winner. Stream metadata, oplog, append-order, and receive-cursor
+tables support crash replay and gap repair. Keeping claims separate from the
+single visible `reg_by_key` projection prevents a losing-but-still-live remote
+claim from being forgotten before its owner emits an authoritative delete.
 
 Plus 3 shared tables:
 
@@ -340,28 +370,65 @@ nodes. This handshake:
 
 1. Validates that shard counts match (raises on mismatch).
 2. Exchanges cluster membership lists.
-3. Each shard sends its locally owned registry and group slice in a
-   `cluster_state` message for each shared cluster.
+3. Shard 0 exchanges protocol version, origin generation, and one complete
+   active named-cluster epoch snapshot per node. Matching data shards exchange
+   only constant-size lane/transport descriptors tied to that authority
+   revision.
 
-This is how a new node catches up to the existing cluster state.
+Constant-size heartbeats renew the peer lease. If an origin generation or
+cluster-epoch revision changes, the receiver requests a fresh authoritative
+hello; if heartbeats stop, lease expiry purges that origin's complete local
+view and discovery probes allow it to rejoin later.
+
+Incremental cluster open/close controls are generation fenced, receiver
+batched, and installed by shard 0 into one node-wide authority table. The
+highest observed revision keeps heartbeats constant-size during a burst; after
+the burst becomes quiet, one authoritative hello closes any gaps left by
+dropped or reordered controls. Per-shard view rows record only constant-size
+lane readiness; they do not copy the epoch map. Snapshot capture is serialized
+with local epoch activation, so its revision and epoch rows are one coherent
+point-in-time value. The highest observed incremental revision is tracked
+separately and can never promote a partial view to exact authority. Discovery
+hints never mutate membership on their own. Authority installation fans a
+local fence to every lane, which sweeps only that lane's retained receive
+streams. Because PG rows intentionally do not carry protocol epochs, a
+superseded origin/cluster slice is cleared and its current cursor reset so the
+next head reconstructs it from retained deltas or an exact snapshot.
+
+Replica state itself does not travel on the control plane. Once the hello is
+fenced, stream-head exchange on the replica transport catches the peer up.
 
 ### Replication
 
-After the initial sync, steady-state changes propagate through separate sender
-and receiver batching lanes:
+Every local mutation is first appended to a stream identified by
+`{group, origin_node, origin_generation, shard, cluster, cluster_epoch}` and a
+strictly increasing sequence number. It is then applied to the materialized
+ETS view and batched into one delta frame per target. Process-death registry
+and PG removals can share one record and retain their one-event-batch behavior.
 
-- local writes enqueue outbound registry or PG replication in shard-local sender
-  buffers
-- sender flushes group those ops by target node and send one
-  `replicate_registry_batch` or `replicate_pg_batch` message per remote node
-- remote shards buffer those replicated registry / PG ops receiver-side, apply
-  them in FIFO order with bulk ETS operations, then take a bounded fairness turn
-  before yielding back to the mailbox
+Receivers advance a cursor only across a contiguous sequence prefix. A gap
+requests the missing suffix. Repeated head advertisements recover a dropped
+tail even when no later write occurs. If the requested sequence is older than
+the bounded oplog floor, the origin sends an exact snapshot of only its own
+registry claims and PG memberships; absence from that snapshot is a delete.
 
-The sender flush timer is mainly a fallback for idle periods. Outbound buffers
-also flush immediately when they hit the configured size, when a new enqueue
+There are no leaders, quorum acknowledgements, tombstones, or known-membership
+retention barriers. Oplog memory is bounded locally and independently of slow
+peers. Deletes are normal ordered records while retained, and exact snapshots
+close gaps after pruning.
+
+The sender flush timer is mainly a fallback for idle periods. The unified
+outbound buffer also flushes immediately when it hits the configured size, when a new enqueue
 finds the buffer already past its flush interval, and before control or
 routing work such as cluster connect/disconnect or peer-protocol handling.
+
+Transport ordering is not required for correctness: each shard serializes
+writes, each stream numbers them, and receivers reject gaps and duplicates.
+Per-shard ordered delivery is still a useful fast path. Cross-stream order is
+not a correctness dependency; cluster epochs reject data racing a disconnect
+or reconnect, and generation fencing rejects data from a restarted origin.
+An alternative sideband adapter authenticates the peer as a dist-Erlang node
+and calls `Group.Replica.Transport.deliver/4` locally.
 
 ### Named Cluster TTL Leases
 
@@ -383,7 +450,8 @@ no longer care about a cluster.
 Shards monitor all registered/joined processes. On `DOWN`, the shard:
 
 1. Removes entries from both the primary and reverse-index ETS tables.
-2. Groups removed entries by peer and sends one non-suspending process-down batch per peer.
+2. Appends authoritative unregister/leave mutations before deleting the rows,
+   then sends one non-suspending sequenced delta batch per peer.
 3. Fires `:unregistered` / `:left` events to local monitors.
 
 ### Node Disconnect

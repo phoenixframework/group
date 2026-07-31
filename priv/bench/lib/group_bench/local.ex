@@ -6,11 +6,14 @@ defmodule GroupBench.Local do
   import GroupBench.Helpers
 
   @name :bench
-  @default_shards System.schedulers_online()
+  @default_shards 8
+  @shard_counts [1, 2, 4, 8, 16, 32, 64]
 
   def run do
     header("Local Benchmarks")
     IO.puts("  schedulers_online: #{System.schedulers_online()}")
+    IO.puts("  default_shards:    #{@default_shards}")
+    IO.puts("  shard_sweep:       #{Enum.join(@shard_counts, ", ")}")
 
     bench_lookup()
     bench_members()
@@ -36,21 +39,26 @@ defmodule GroupBench.Local do
         measure_count = 100_000
 
         # Each process registers itself
-        register_from_spawned_processes(key_count, fn i ->
-          Group.register(@name, "key-#{i}", %{i: i}, cluster_opts(cluster_opt))
-        end)
-
-        # warmup
-        warmup(1_000, fn -> Group.lookup(@name, "key-1", cluster_opts(cluster_opt)) end)
-
-        # measure
-        samples =
-          collect_samples(measure_count, fn ->
-            i = :rand.uniform(key_count)
-            Group.lookup(@name, "key-#{i}", cluster_opts(cluster_opt))
+        pids =
+          register_from_spawned_processes(key_count, fn i ->
+            Group.register(@name, "key-#{i}", %{i: i}, cluster_opts(cluster_opt))
           end)
 
-        report_latency("Group.lookup/3", samples)
+        try do
+          # warmup
+          warmup(1_000, fn -> Group.lookup(@name, "key-1", cluster_opts(cluster_opt)) end)
+
+          # measure
+          samples =
+            collect_samples(measure_count, fn ->
+              i = :rand.uniform(key_count)
+              Group.lookup(@name, "key-#{i}", cluster_opts(cluster_opt))
+            end)
+
+          report_latency("Group.lookup/3", samples)
+        after
+          stop_spawned_processes(pids)
+        end
       end)
     end
   end
@@ -72,20 +80,25 @@ defmodule GroupBench.Local do
         total = group_count * members_per_group
 
         # Each process joins a group
-        register_from_spawned_processes(total, fn i ->
-          gi = rem(i - 1, group_count) + 1
-          Group.join(@name, "group-#{gi}", %{}, cluster_opts(cluster_opt))
-        end)
-
-        warmup(1_000, fn -> Group.members(@name, "group-1", cluster_opts(cluster_opt)) end)
-
-        samples =
-          collect_samples(measure_count, fn ->
-            gi = :rand.uniform(group_count)
-            Group.members(@name, "group-#{gi}", cluster_opts(cluster_opt))
+        pids =
+          register_from_spawned_processes(total, fn i ->
+            gi = rem(i - 1, group_count) + 1
+            Group.join(@name, "group-#{gi}", %{}, cluster_opts(cluster_opt))
           end)
 
-        report_latency("Group.members/3", samples)
+        try do
+          warmup(1_000, fn -> Group.members(@name, "group-1", cluster_opts(cluster_opt)) end)
+
+          samples =
+            collect_samples(measure_count, fn ->
+              gi = :rand.uniform(group_count)
+              Group.members(@name, "group-#{gi}", cluster_opts(cluster_opt))
+            end)
+
+          report_latency("Group.members/3", samples)
+        after
+          stop_spawned_processes(pids)
+        end
       end)
     end
   end
@@ -96,23 +109,26 @@ defmodule GroupBench.Local do
     header("3. Register Throughput (shard scaling)")
 
     n = 10_000
-    shard_counts = Enum.uniq([1, 2, 4, @default_shards])
 
     for {cluster_label, cluster_opt} <- clusters() do
       subheader("cluster: #{cluster_label}")
 
-      for shards <- shard_counts do
+      for shards <- @shard_counts do
         with_group([name: @name, shards: shards], fn ->
           maybe_connect_cluster(cluster_opt)
 
-          {wall_us, _} =
+          {wall_us, pids} =
             time_us(fn ->
               register_from_spawned_processes(n, fn i ->
                 Group.register(@name, "reg-#{i}", %{}, cluster_opts(cluster_opt))
               end)
             end)
 
-          report_throughput("shards=#{shards}", n, wall_us)
+          try do
+            report_throughput("shards=#{shards}", n, wall_us)
+          after
+            stop_spawned_processes(pids)
+          end
         end)
       end
     end
@@ -151,23 +167,26 @@ defmodule GroupBench.Local do
     header("5. Join Throughput (shard scaling)")
 
     n = 10_000
-    shard_counts = Enum.uniq([1, 2, 4, @default_shards])
 
     for {cluster_label, cluster_opt} <- clusters() do
       subheader("cluster: #{cluster_label}")
 
-      for shards <- shard_counts do
+      for shards <- @shard_counts do
         with_group([name: @name, shards: shards], fn ->
           maybe_connect_cluster(cluster_opt)
 
-          {wall_us, _} =
+          {wall_us, pids} =
             time_us(fn ->
               register_from_spawned_processes(n, fn i ->
                 Group.join(@name, "join-group-#{rem(i, 100)}", %{}, cluster_opts(cluster_opt))
               end)
             end)
 
-          report_throughput("shards=#{shards}", n, wall_us)
+          try do
+            report_throughput("shards=#{shards}", n, wall_us)
+          after
+            stop_spawned_processes(pids)
+          end
         end)
       end
     end
@@ -186,18 +205,25 @@ defmodule GroupBench.Local do
       with_group([name: @name, shards: @default_shards], fn ->
         maybe_connect_cluster(cluster_opt)
         :ok = Group.monitor(@name, :all, cluster_opts(cluster_opt))
+        drain_stale_group_events()
 
-        {wall_us, _} =
+        {wall_us, pids} =
           time_us(fn ->
-            register_from_spawned_processes(n, fn i ->
-              Group.register(@name, "mon-#{i}", %{}, cluster_opts(cluster_opt))
-            end)
+            pids =
+              register_from_spawned_processes(n, fn i ->
+                Group.register(@name, "mon-#{i}", %{}, cluster_opts(cluster_opt))
+              end)
 
             # drain all N events
             drain_events(n)
+            pids
           end)
 
-        report_throughput("events (register → receive)", n, wall_us)
+        try do
+          report_throughput("events (register → receive)", n, wall_us)
+        after
+          stop_spawned_processes(pids)
+        end
       end)
     end
   end
@@ -243,6 +269,19 @@ defmodule GroupBench.Local do
     pids
   end
 
+  defp stop_spawned_processes(pids) do
+    refs = Enum.map(pids, &{&1, Process.monitor(&1)})
+    Enum.each(pids, &Process.exit(&1, :kill))
+
+    Enum.each(refs, fn {pid, ref} ->
+      receive do
+        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+      after
+        5_000 -> raise "Timed out stopping #{inspect(pid)}"
+      end
+    end)
+  end
+
   defp drain_events(0), do: :ok
 
   defp drain_events(remaining) do
@@ -252,6 +291,14 @@ defmodule GroupBench.Local do
         drain_events(remaining - count)
     after
       5_000 -> IO.puts("    WARNING: timed out waiting for events, #{remaining} remaining")
+    end
+  end
+
+  defp drain_stale_group_events do
+    receive do
+      {:group, _events, _info} -> drain_stale_group_events()
+    after
+      0 -> :ok
     end
   end
 end

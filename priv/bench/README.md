@@ -7,7 +7,7 @@ separate BEAM VMs.
 ## Running
 
 ```bash
-cd priv/group/priv/bench
+cd priv/bench
 mix deps.get
 ```
 
@@ -30,10 +30,19 @@ Uses 3 separate BEAM VMs (coordinator + 2 replicas) as OS processes:
 The script compiles once, starts both replicas in the background, then launches
 the coordinator. Replicas are killed automatically on exit.
 
+To isolate the 10,000-cluster lifecycle scenario:
+
+```bash
+./run_distributed.sh --shards 4 \
+  --coordinator-expr 'GroupBench.Distributed.run_many_clusters_only(shards: 4)'
+```
+
 ## Local Scenarios
 
 All local benchmarks run for both the default (nil) cluster and a named cluster
 (`"game"`) to verify there's no performance difference between the two paths.
+Each spawned process cohort is stopped after its measurement and before the
+next case; cohort teardown is outside the measured interval.
 
 ### 1. Lookup throughput
 
@@ -52,8 +61,10 @@ Slower than lookup because each call copies a 100-element list out of ETS.
 ### 3. Register throughput (shard scaling)
 
 Measures concurrent `Group.register/4` calls — each of 10K spawned processes
-registers itself in parallel. Varies shard count (1, 2, 4, schedulers_online)
-to show how write throughput scales with sharding.
+registers itself in parallel. Uses the library default of 8 shards for the
+non-scaling scenarios and a fixed 1, 2, 4, 8, 16, 32, 64 shard sweep. The
+fixed sweep keeps results comparable across machines and avoids treating BEAM
+scheduler count as a shard-count recommendation.
 
 ### 4. Register/unregister cycle
 
@@ -84,7 +95,8 @@ The core distributed measurement. Registers a key on replica1, then spin-polls
 `Group.lookup` on replica2 until it appears. Repeats 1,000 times.
 
 Reports p50/p99/max latency covering the full path: GenServer call on replica1,
-Erlang distribution message, GenServer cast on replica2, ETS insert.
+write-ahead append, nonblocking replica transport, receiver application, and
+ETS projection on replica2.
 
 ### 2. Bulk sync (new peer catches up)
 
@@ -92,8 +104,10 @@ Measures how fast a new node catches up to an existing peer's state. Registers
 N keys on replica1 (1K and 10K), then starts Group on replica2 and polls until
 all N entries are visible.
 
-Group sends all data in a single `cluster_state` message on peer discovery, so
-this is bounded by serialization + network, not per-key round-trips.
+Group advertises stream heads on peer discovery. A new peer requests the
+missing range; if the bounded oplog no longer contains the prefix, Group sends
+an exact per-origin snapshot. The measurement therefore covers the normal
+catch-up decision as well as serialization and network transfer.
 
 ### 3. Concurrent cross-node writes
 
@@ -115,8 +129,8 @@ compared to the default nil cluster.
 
 The critical distributed cleanup path. Registers 1K and 5K processes on
 replica1, kills them all, then measures how long until replica2 sees zero
-entries. Exercises: local DOWN handler → `replicate_unregister` broadcast →
-remote ETS cleanup.
+entries. Exercises: local DOWN handler → authoritative sequenced unregister
+records → nonblocking delta batch → remote ETS cleanup.
 
 This scenario catches O(N²) message amplification bugs where remote nodes
 redundantly monitor pids and re-broadcast cleanup messages.
@@ -136,10 +150,42 @@ convergence on replica2 via the `replicate_leave` path.
 All members hash to the same shard (single key), making this the worst case
 for shard contention during bulk cleanup.
 
+### 8. Many-cluster lifecycle
+
+Connects 10K named clusters, registers one process in each, forces peer
+re-discovery, then disconnects and verifies cleanup. This exposes control-plane
+message amplification and epoch-fence costs.
+
+The connect phase reports local `Group.connect/2` completion separately from
+full remote control convergence. Full convergence checks the reverse cluster
+index on both nodes for all 10K named clusters plus the default cluster; seeing
+only the last submitted cluster is insufficient because controls may be
+reordered or repaired asynchronously. On generation/epoch-aware builds the
+barrier also requires every replica shard to hold the source's current control
+revision and all 10K remote epoch rows. Registration starts only after this
+barrier, so its result does not inherit unfinished connect work.
+
+Registration reports local completion, the remote count at that handoff, and
+the remaining data-convergence tail separately. Re-discovery similarly splits
+restart, local reconnect, control convergence, and data convergence; disconnect
+splits local completion from remote cleanup.
+
+### 9. Busy application convergence
+
+Runs registry and PG churn across 50 clusters and 40K initial pids. Reports
+application throughput and then verifies the replicas agree exactly. A fast
+wall-clock result is not considered successful unless convergence completes.
+
+### 10. Local writes under replicated PG pressure
+
+Floods one receiver shard with remote membership updates while measuring local
+register and join calls at increasing concurrency. This checks that bounded
+replica turns preserve local control-plane progress.
+
 ## Architecture
 
 ```
-priv/group/priv/bench/
+priv/bench/
 ├── mix.exs                          # depends on :group via path: "../../"
 ├── run_distributed.sh               # starts 3 VMs, cleans up on exit
 ├── README.md
@@ -147,7 +193,7 @@ priv/group/priv/bench/
 │   ├── group_bench.ex               # CLI entry — dispatches local/distributed
 │   ├── group_bench/
 │   │   ├── local.ex                 # 6 local benchmarks
-│   │   ├── distributed.ex           # coordinator: connects + drives 7 benchmarks
+│   │   ├── distributed.ex           # coordinator: connects + drives 10 benchmarks
 │   │   ├── replica.ex               # helpers called by coordinator via :erpc
 │   │   └── helpers.ex               # timing, formatting, percentile math
 ```

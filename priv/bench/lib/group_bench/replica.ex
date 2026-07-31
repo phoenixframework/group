@@ -73,6 +73,25 @@ defmodule GroupBench.Replica do
     end)
   end
 
+  @doc false
+  def registry_counts_by_shard(name) do
+    for shard <- 0..(Group.get_config(name).num_shards - 1) do
+      {shard, :ets.info(Group.Replica.Data.reg_by_key_table(name, shard), :size)}
+    end
+  end
+
+  def registry_sample(name, limit \\ 10) do
+    shards = Group.get_config(name).num_shards
+
+    0..(shards - 1)
+    |> Enum.flat_map(fn shard ->
+      Group.Replica.Data.reg_by_key_table(name, shard)
+      |> :ets.tab2list()
+      |> Enum.take(limit)
+    end)
+    |> Enum.take(limit)
+  end
+
   @doc """
   Registers a single key from a spawned process. Returns after registration.
   """
@@ -577,21 +596,76 @@ defmodule GroupBench.Replica do
     pids =
       Enum.map(1..n, fn i ->
         spawn(fn ->
-          :ok = Group.register(name, "key", %{}, cluster: "#{prefix}#{i}")
-          send(parent, {:done, self()})
-          Process.sleep(:infinity)
+          try do
+            :ok = Group.register(name, "key", %{}, cluster: "#{prefix}#{i}")
+            send(parent, {:done, self()})
+            Process.sleep(:infinity)
+          catch
+            kind, reason ->
+              send(
+                parent,
+                {:failed, self(), kind, {reason, replica_process_diagnostics(name)},
+                 __STACKTRACE__}
+              )
+          end
         end)
       end)
 
     Enum.each(pids, fn pid ->
       receive do
-        {:done, ^pid} -> :ok
+        {:done, ^pid} ->
+          :ok
+
+        {:failed, ^pid, kind, reason, stacktrace} ->
+          :erlang.raise(kind, reason, stacktrace)
       after
-        60_000 -> raise "Timed out waiting for bulk_register_per_cluster"
+        60_000 ->
+          awaited_pid =
+            {pid,
+             Process.info(pid, [
+               :status,
+               :current_function,
+               :message_queue_len,
+               :reductions
+             ])}
+
+          registry_count = total_registry_count(name)
+
+          raise "Timed out waiting for bulk_register_per_cluster: " <>
+                  "replica=#{inspect(replica_process_diagnostics(name))} " <>
+                  "awaited=#{inspect(awaited_pid)} registry_count=#{registry_count}"
       end
     end)
 
     pids
+  end
+
+  @doc false
+  def replica_process_diagnostics(name) do
+    shards =
+      for shard <- 0..(Group.get_config(name).num_shards - 1) do
+        shard_pid = Process.whereis(Group.Replica.shard_name(name, shard))
+
+        {shard,
+         Process.info(shard_pid, [
+           :status,
+           :current_function,
+           :message_queue_len,
+           :reductions
+         ])}
+      end
+
+    data_pid = Process.whereis(Group.Replica.Data.data_name(name))
+
+    data =
+      Process.info(data_pid, [
+        :status,
+        :current_function,
+        :message_queue_len,
+        :reductions
+      ])
+
+    %{shards: shards, data: data}
   end
 
   @doc """
@@ -599,6 +673,95 @@ defmodule GroupBench.Replica do
   """
   def my_cluster_count(name) do
     length(Group.Replica.Data.my_clusters(name))
+  end
+
+  @doc """
+  Returns the number of clusters currently associated with `target_node`.
+
+  The many-cluster benchmark uses the reverse index instead of checking one
+  sentinel cluster: replica control messages may be reordered, so observing
+  the last submitted cluster does not prove that every earlier cluster has
+  converged.
+  """
+  def cluster_count_for_node(name, target_node) do
+    name
+    |> Group.Replica.Data.node_clusters_table()
+    |> :ets.lookup(target_node)
+    |> length()
+  end
+
+  @doc false
+  def cluster_control_revision(name) do
+    if function_exported?(Group.Replica.Data, :local_cluster_epoch_revision, 1) do
+      apply(Group.Replica.Data, :local_cluster_epoch_revision, [name])
+    else
+      :legacy
+    end
+  end
+
+  @doc false
+  def cluster_control_converged?(name, target_node, expected_cluster_count, source_revision) do
+    membership_converged? =
+      cluster_count_for_node(name, target_node) >= expected_cluster_count
+
+    if source_revision == :legacy or
+         not function_exported?(Group.Replica.Data, :remote_view_generation, 3) do
+      membership_converged?
+    else
+      shards = Group.get_config(name).num_shards
+      data = Group.Replica.Data
+      generation = apply(data, :remote_generation, [name, target_node])
+      revision = apply(data, :remote_cluster_epoch_revision, [name, target_node])
+      epoch_table = apply(data, :remote_cluster_epochs_table, [name])
+
+      epoch_count =
+        :ets.select_count(epoch_table, [
+          {{{target_node, :_}, :_}, [], [true]}
+        ])
+
+      shard_views_converged? =
+        Enum.all?(0..(shards - 1), fn shard ->
+          apply(data, :remote_view_generation, [name, shard, target_node]) == generation and
+            apply(data, :remote_view_cluster_epoch_revision, [name, shard, target_node]) ==
+              source_revision and
+            apply(data, :remote_view_observed_revision, [name, shard, target_node]) ==
+              source_revision
+        end)
+
+      membership_converged? and not is_nil(generation) and revision == source_revision and
+        epoch_count >= expected_cluster_count - 1 and shard_views_converged?
+    end
+  end
+
+  @doc false
+  def cluster_control_status(name, target_node) do
+    data = Group.Replica.Data
+    shards = Group.get_config(name).num_shards
+    epoch_table = data.remote_cluster_epochs_table(name)
+
+    %{
+      local_revision: data.local_cluster_epoch_revision(name),
+      local_epoch_count: :ets.info(data.local_cluster_epochs_table(name), :size),
+      membership_count: cluster_count_for_node(name, target_node),
+      remote_generation: data.remote_generation(name, target_node),
+      remote_revision: data.remote_cluster_epoch_revision(name, target_node),
+      remote_exact_revision: data.remote_cluster_epoch_exact_revision(name, target_node),
+      remote_observed: data.remote_cluster_epoch_observed_revision(name, target_node),
+      remote_epoch_count:
+        :ets.select_count(epoch_table, [
+          {{{target_node, :_}, :_}, [], [true]}
+        ]),
+      authority_installs: data.remote_authority_install_count(name, target_node),
+      views:
+        for(
+          shard <- 0..(shards - 1),
+          do:
+            {shard, data.remote_view_generation(name, shard, target_node),
+             data.remote_view_cluster_epoch_revision(name, shard, target_node),
+             data.remote_view_observed_revision(name, shard, target_node)}
+        ),
+      replica: replica_process_diagnostics(name)
+    }
   end
 
   @doc """

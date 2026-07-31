@@ -6,6 +6,7 @@
 mix test                           # all tests
 mix test test/group_test.exs       # local only
 mix test test/distributed_test.exs # distributed only
+mix test test/replica_adversarial_test.exs # seeded transport chaos
 ```
 
 ## Test files
@@ -13,7 +14,8 @@ mix test test/distributed_test.exs # distributed only
 | File | What it tests |
 |------|---------------|
 | `group_test.exs` | Single-node: register/unregister, join/leave, members, monitor/demonitor, named clusters, concurrent operations |
-| `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts |
+| `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts, and adversarial replica-transport loss/busy/snapshot recovery |
+| `replica_adversarial_test.exs` | Reproducible mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
 
 ## How distribution works
 
@@ -193,6 +195,34 @@ TestCluster.start_group(
 
 The resolver uses "most recent wins" — keeps the registration with the higher
 timestamp.
+
+### Replica transport fault injection
+
+`Group.TestReplicaTransport` implements the production transport behaviour but
+can return `:busy`, drop selected frame types, duplicate or delay frames, and
+capture frames for explicit stale-generation/epoch replay. Its `{:chaos, opts}`
+mode is deterministic for a given frame, which makes failures reproducible.
+
+The distributed anti-entropy tests cover dropped creates and deletes, cursor
+gaps, globally pruned multi-stream oplogs, exact snapshot fallback, malformed
+authority, stale frame replay, lease expiry on a live VM, and multi-shard
+generation recovery. They also restart a suspended data lane after deliberately
+losing its cluster-close fence and require the lane to sweep the stale registry
+and PG slices from shared authority. Authority topology tests suspend every
+receiver shard and inspect the queued protocol: only shard 0 may receive/install
+the full epoch snapshot, nonzero shards receive constant-size lane hellos, and
+incremental opens stay on their matching shard. Separate tests suspend a
+backlogged authority shard while other replica lanes continue converging and
+deliver data before authority to prove rejection does not advance the cursor
+and the same frame applies after authority repair. Concurrent snapshot tests
+require every advertised revision to contain exactly that many unique named
+epochs, and heartbeat tests prove observed revisions cannot advance the exact
+authority marker.
+
+`Group.TestCluster.assert_replica_consistent/1` checks the
+public dual indexes plus registry claim authority, oplog/order equivalence, and
+contiguous retained stream ranges. Seeded tests additionally require every PID
+retained as authority to still be alive after convergence.
 
 ## Typical test patterns
 

@@ -42,6 +42,27 @@ defmodule Group.Supervisor do
     replicated_pg_receiver_local_request_quota =
       positive_integer_opt(opts, :replicated_pg_receiver_local_request_quota, 8)
 
+    replica_transport =
+      opts
+      |> Keyword.get(:replica_transport, Group.Replica.Transport.Distribution)
+      |> Group.Replica.Transport.normalize()
+      |> Group.Replica.Transport.validate!()
+
+    replicated_oplog_max_entries =
+      positive_integer_opt(opts, :replicated_oplog_max_entries, 65_536)
+
+    replicated_anti_entropy_interval =
+      positive_integer_opt(opts, :replicated_anti_entropy_interval, 1_000)
+
+    replicated_peer_lease_timeout =
+      positive_integer_opt(opts, :replicated_peer_lease_timeout, 15_000)
+
+    if replicated_peer_lease_timeout <= replicated_anti_entropy_interval do
+      raise ArgumentError,
+            ":replicated_peer_lease_timeout must be greater than " <>
+              ":replicated_anti_entropy_interval"
+    end
+
     # persistent_term config — must be set before children start (Replica reads it)
     config = %{
       num_shards: num_shards,
@@ -54,7 +75,11 @@ defmodule Group.Supervisor do
       replicated_sender_flush_interval: replicated_sender_flush_interval,
       busy_dist_retry_attempts: busy_dist_retry_attempts,
       busy_dist_retry_interval: busy_dist_retry_interval,
-      replicated_pg_receiver_local_request_quota: replicated_pg_receiver_local_request_quota
+      replicated_pg_receiver_local_request_quota: replicated_pg_receiver_local_request_quota,
+      replica_transport: replica_transport,
+      replicated_oplog_max_entries: replicated_oplog_max_entries,
+      replicated_anti_entropy_interval: replicated_anti_entropy_interval,
+      replicated_peer_lease_timeout: replicated_peer_lease_timeout
     }
 
     config = if extract_meta, do: Map.put(config, :extract_meta, extract_meta), else: config
@@ -66,18 +91,33 @@ defmodule Group.Supervisor do
 
     :persistent_term.put({Group, name}, config)
 
-    children = [
-      {Group.Replica.Data, name: name, num_shards: num_shards},
-      {
-        Group.PeerReconnect,
-        name: name,
-        busy_dist_retry_attempts: busy_dist_retry_attempts,
-        busy_dist_retry_interval: busy_dist_retry_interval
-      },
-      {Group.Replica.Supervisor, name: name, num_shards: num_shards},
-      {Registry, keys: :duplicate, name: Group.registry_name(name)},
-      {Group.ClusterLease, name: name, num_shards: num_shards}
-    ]
+    transport_children =
+      case replica_transport do
+        {module, transport_opts} ->
+          if function_exported?(module, :child_spec, 1) do
+            case module.child_spec([name: name, num_shards: num_shards] ++ transport_opts) do
+              :ignore -> []
+              child_spec -> [child_spec]
+            end
+          else
+            []
+          end
+      end
+
+    children =
+      transport_children ++
+        [
+          {Group.Replica.Data, name: name, num_shards: num_shards},
+          {
+            Group.PeerReconnect,
+            name: name,
+            busy_dist_retry_attempts: busy_dist_retry_attempts,
+            busy_dist_retry_interval: busy_dist_retry_interval
+          },
+          {Group.Replica.Supervisor, name: name, num_shards: num_shards},
+          {Registry, keys: :duplicate, name: Group.registry_name(name)},
+          {Group.ClusterLease, name: name, num_shards: num_shards}
+        ]
 
     Supervisor.init(children, strategy: :rest_for_one)
   end

@@ -52,6 +52,21 @@ defmodule GroupBench.Distributed do
     IO.puts("\n  Done.\n")
   end
 
+  def run_many_clusters_only(opts \\ []) do
+    shards = Keyword.get(opts, :shards, 4)
+    Process.put(:bench_shards, shards)
+
+    header("Distributed Many-Clusters Benchmark")
+    IO.puts("  coordinator: #{node()}")
+    IO.puts("  shards:      #{shards}")
+    IO.puts("  schedulers:  #{System.schedulers_online()}")
+
+    connect_replicas()
+    bench_many_clusters(@replicas)
+
+    IO.puts("\n  Done.\n")
+  end
+
   # ── Connection ────────────────────────────────────────────────────────
 
   defp connect_replicas do
@@ -428,7 +443,7 @@ defmodule GroupBench.Distributed do
     start_group_on(r2)
     wait_for_peer_discovery(replicas)
 
-    {connect_us, _} =
+    {local_connect_us, _} =
       :timer.tc(fn ->
         t1 =
           Task.async(fn ->
@@ -453,48 +468,84 @@ defmodule GroupBench.Distributed do
           end)
 
         Task.await_many([t1, t2], 120_000)
-
-        # Wait for convergence — both nodes see each other in the last cluster
-        poll_until(
-          fn ->
-            n1 = :erpc.call(r1, Group, :nodes, [@name, "#{prefix}#{num_clusters}"])
-            n2 = :erpc.call(r2, Group, :nodes, [@name, "#{prefix}#{num_clusters}"])
-            length(n1) >= 1 and length(n2) >= 1
-          end,
-          60_000
-        )
       end)
 
-    IO.puts("  connect:       #{format_number(div(connect_us, 1000))} ms")
-    IO.puts("  clusters/sec:  #{format_number(round(num_clusters * 1_000_000 / connect_us))}")
+    # Local completion only means both nodes accepted all Group.connect calls.
+    # Controls may be reordered or repaired asynchronously, so seeing one
+    # sentinel cluster cannot prove that the other 9,999 have converged.
+    expected_cluster_count = num_clusters + 1
+
+    {control_convergence_us, _} =
+      try do
+        :timer.tc(fn ->
+          wait_for_cluster_control_convergence(r1, r2, expected_cluster_count)
+        end)
+      rescue
+        error ->
+          r1_status = :erpc.call(r1, GroupBench.Replica, :cluster_control_status, [@name, r2])
+          r2_status = :erpc.call(r2, GroupBench.Replica, :cluster_control_status, [@name, r1])
+
+          reraise RuntimeError,
+                  [
+                    message:
+                      "#{Exception.message(error)}; r1=#{inspect(r1_status)} " <>
+                        "r2=#{inspect(r2_status)}"
+                  ],
+                  __STACKTRACE__
+      end
+
+    connect_total_us = local_connect_us + control_convergence_us
+
+    IO.puts("  local calls:          #{format_number(div(local_connect_us, 1000))} ms")
+    IO.puts("  control convergence:  #{format_number(div(control_convergence_us, 1000))} ms")
+    IO.puts("  end-to-end connect:    #{format_number(div(connect_total_us, 1000))} ms")
+
+    IO.puts(
+      "  local clusters/sec:   #{format_number(round(num_clusters * 1_000_000 / local_connect_us))}"
+    )
+
+    IO.puts(
+      "  converged clusters/sec: #{format_number(round(num_clusters * 1_000_000 / connect_total_us))}"
+    )
 
     # -- 8b. Register 1 key per cluster --
 
     subheader("register across #{format_number(num_clusters)} clusters")
 
-    {reg_us, pids} =
+    {local_reg_us, pids} =
       :timer.tc(fn ->
-        pids =
-          :erpc.call(
-            r1,
-            GroupBench.Replica,
-            :bulk_register_per_cluster,
-            [@name, num_clusters, prefix],
-            120_000
-          )
+        :erpc.call(
+          r1,
+          GroupBench.Replica,
+          :bulk_register_per_cluster,
+          [@name, num_clusters, prefix],
+          120_000
+        )
+      end)
 
+    remote_count_at_handoff =
+      :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name])
+
+    {reg_convergence_us, _} =
+      :timer.tc(fn ->
         poll_until(
           fn ->
             :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) >= num_clusters
           end,
           60_000
         )
-
-        pids
       end)
 
-    IO.puts("  register+converge: #{format_number(div(reg_us, 1000))} ms")
-    IO.puts("  ops/sec:           #{format_number(round(num_clusters * 1_000_000 / reg_us))}")
+    reg_total_us = local_reg_us + reg_convergence_us
+
+    IO.puts("  local registration:  #{format_number(div(local_reg_us, 1000))} ms")
+    IO.puts("  remote at handoff:    #{format_number(remote_count_at_handoff)} / 10,000")
+    IO.puts("  data convergence:     #{format_number(div(reg_convergence_us, 1000))} ms")
+    IO.puts("  register end-to-end:  #{format_number(div(reg_total_us, 1000))} ms")
+
+    IO.puts(
+      "  converged ops/sec:    #{format_number(round(num_clusters * 1_000_000 / reg_total_us))}"
+    )
 
     # -- 8c. Peer re-discovery with many clusters --
 
@@ -504,28 +555,75 @@ defmodule GroupBench.Distributed do
     stop_group_on(r2)
     Process.sleep(500)
 
-    {rediscovery_us, _} =
+    {restart_us, _} =
       :timer.tc(fn ->
         start_group_on(r2)
         wait_for_peer_discovery(replicas)
-
-        :erpc.call(r2, GroupBench.Replica, :bulk_connect, [@name, num_clusters, prefix], 120_000)
-
-        poll_until(
-          fn ->
-            :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) >= num_clusters
-          end,
-          120_000
-        )
       end)
 
-    IO.puts("  re-discovery:  #{format_number(div(rediscovery_us, 1000))} ms")
+    {local_reconnect_us, _} =
+      :timer.tc(fn ->
+        :erpc.call(r2, GroupBench.Replica, :bulk_connect, [@name, num_clusters, prefix], 120_000)
+      end)
+
+    {reconnect_control_us, _} =
+      :timer.tc(fn ->
+        wait_for_cluster_control_convergence(r1, r2, expected_cluster_count)
+      end)
+
+    {rediscovery_data_us, _} =
+      try do
+        :timer.tc(fn ->
+          poll_until(
+            fn ->
+              :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) >= num_clusters
+            end,
+            120_000
+          )
+        end)
+      rescue
+        error ->
+          counts =
+            :erpc.call(r2, GroupBench.Replica, :registry_counts_by_shard, [@name])
+
+          diagnostics =
+            :erpc.call(r2, GroupBench.Replica, :replica_process_diagnostics, [@name])
+
+          r1_revision =
+            :erpc.call(r1, Group.Replica.Data, :local_cluster_epoch_revision, [@name])
+
+          r2_remote_revision =
+            :erpc.call(r2, Group.Replica.Data, :remote_cluster_epoch_revision, [@name, r1])
+
+          r1_remote_revision =
+            :erpc.call(r1, Group.Replica.Data, :remote_cluster_epoch_revision, [@name, r2])
+
+          reraise RuntimeError,
+                  [
+                    message:
+                      "#{Exception.message(error)}; rediscovery_counts=#{inspect(counts)} " <>
+                        "r1_revision=#{r1_revision} " <>
+                        "r2_remote_revision=#{inspect(r2_remote_revision)} " <>
+                        "r1_remote_revision=#{inspect(r1_remote_revision)} " <>
+                        "replica=#{inspect(diagnostics)}"
+                  ],
+                  __STACKTRACE__
+      end
+
+    rediscovery_total_us =
+      restart_us + local_reconnect_us + reconnect_control_us + rediscovery_data_us
+
+    IO.puts("  restart + discovery:  #{format_number(div(restart_us, 1000))} ms")
+    IO.puts("  local reconnect:      #{format_number(div(local_reconnect_us, 1000))} ms")
+    IO.puts("  control convergence:  #{format_number(div(reconnect_control_us, 1000))} ms")
+    IO.puts("  data convergence:     #{format_number(div(rediscovery_data_us, 1000))} ms")
+    IO.puts("  re-discovery total:    #{format_number(div(rediscovery_total_us, 1000))} ms")
 
     # -- 8d. Disconnect cleanup --
 
     subheader("disconnect #{format_number(num_clusters)} clusters")
 
-    {disconnect_us, _} =
+    {local_disconnect_us, _} =
       :timer.tc(fn ->
         :erpc.call(
           r1,
@@ -534,25 +632,94 @@ defmodule GroupBench.Distributed do
           [@name, num_clusters, prefix],
           120_000
         )
-
-        # Wait for r2 to see r1's entries cleaned from all clusters
-        poll_until(
-          fn ->
-            :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) == 0
-          end,
-          60_000
-        )
       end)
 
-    IO.puts("  disconnect+cleanup: #{format_number(div(disconnect_us, 1000))} ms")
+    {cleanup_us, _} =
+      :timer.tc(fn ->
+        # Wait for r2 to see r1's entries cleaned from all clusters
+        try do
+          poll_until(
+            fn ->
+              :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) == 0
+            end,
+            60_000
+          )
+        rescue
+          error ->
+            count = :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name])
+            sample = :erpc.call(r2, GroupBench.Replica, :registry_sample, [@name])
+
+            local_revision =
+              :erpc.call(r1, Group.Replica.Data, :local_cluster_epoch_revision, [@name])
+
+            remote_revision =
+              :erpc.call(r2, Group.Replica.Data, :remote_cluster_epoch_revision, [@name, r1])
+
+            observed_revision =
+              :erpc.call(
+                r2,
+                Group.Replica.Data,
+                :remote_cluster_epoch_observed_revision,
+                [@name, r1]
+              )
+
+            reraise RuntimeError,
+                    [
+                      message:
+                        "#{Exception.message(error)}; remaining=#{count} " <>
+                          "local_revision=#{local_revision} " <>
+                          "remote_revision=#{inspect(remote_revision)} " <>
+                          "observed_revision=#{inspect(observed_revision)} " <>
+                          "sample=#{inspect(sample)}"
+                    ],
+                    __STACKTRACE__
+        end
+      end)
+
+    disconnect_total_us = local_disconnect_us + cleanup_us
+
+    IO.puts("  local disconnect:    #{format_number(div(local_disconnect_us, 1000))} ms")
+    IO.puts("  remote cleanup:      #{format_number(div(cleanup_us, 1000))} ms")
+    IO.puts("  disconnect total:    #{format_number(div(disconnect_total_us, 1000))} ms")
 
     IO.puts(
-      "  clusters/sec:       #{format_number(round(num_clusters * 1_000_000 / disconnect_us))}"
+      "  converged clusters/sec: #{format_number(round(num_clusters * 1_000_000 / disconnect_total_us))}"
     )
 
     # Kill leftover processes
     :erpc.call(r1, GroupBench.Replica, :kill_processes, [pids])
     stop_groups(replicas)
+  end
+
+  defp wait_for_cluster_control_convergence(r1, r2, expected_cluster_count) do
+    r1_revision =
+      :erpc.call(r1, GroupBench.Replica, :cluster_control_revision, [@name])
+
+    r2_revision =
+      :erpc.call(r2, GroupBench.Replica, :cluster_control_revision, [@name])
+
+    poll_until(
+      fn ->
+        r1_converged? =
+          :erpc.call(
+            r1,
+            GroupBench.Replica,
+            :cluster_control_converged?,
+            [@name, r2, expected_cluster_count, r2_revision]
+          )
+
+        r2_converged? =
+          :erpc.call(
+            r2,
+            GroupBench.Replica,
+            :cluster_control_converged?,
+            [@name, r1, expected_cluster_count, r1_revision]
+          )
+
+        r1_converged? and r2_converged?
+      end,
+      120_000
+    )
   end
 
   # ── 9. Busy app simulation ──────────────────────────────────────────

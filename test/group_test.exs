@@ -2288,7 +2288,12 @@ defmodule GroupTest do
       assert_receive {:replicated_registry_buffer_flushed, ^shard_name}, 1_000
 
       :sys.replace_state(shard_pid, fn state ->
-        %{state | remote_shards: Map.put(state.remote_shards, node(), self())}
+        %{
+          state
+          | remote_shards: Map.put(state.remote_shards, node(), self()),
+            peer_last_seen:
+              Map.put(state.peer_last_seen, node(), System.monotonic_time(:millisecond))
+        }
       end)
 
       :erlang.trace(shard_pid, true, [:call])
@@ -2306,10 +2311,16 @@ defmodule GroupTest do
                       {:erlang, :send_nosuspend,
                        [
                          {^shard_name, ^local_node},
-                         {:replicate_process_down_batch, _reg_entries, _pg_entries},
+                         {:group_replica_frame, ^local_node, {:delta_batch, 1, runs}},
                          [:noconnect]
                        ]}},
                      1_000
+
+      assert Enum.any?(runs, fn {_stream_id, _first_seq, records, _head} ->
+               Enum.any?(records, fn {_seq, mutations} ->
+                 {:unregister, nil, key, owner, %{}, :killed} in mutations
+               end)
+             end)
     end
 
     test "process death batches multiple :left events for same-shard keys", %{name: name} do
@@ -2694,7 +2705,7 @@ defmodule GroupTest do
                Group.Replica.Data.registry_lookup_by_pid(name, 0, new_pid)
     end
 
-    test "custom conflict resolver controls the losing registry owner's lifecycle" do
+    test "custom conflict resolver selects winner and Group terminates only the local loser" do
       key = "replicated-registry/custom-loser/#{System.unique_integer([:positive])}"
 
       name =
@@ -2739,8 +2750,9 @@ defmodule GroupTest do
         Group.lookup(name, key) == {remote_pid, %{owner: :remote}}
       end)
 
-      refute_receive {:DOWN, ^owner_ref, :process, ^local_owner, _reason}, 50
-      assert Process.alive?(local_owner)
+      assert_receive {:DOWN, ^owner_ref, :process, ^local_owner,
+                      {:group_registry_conflict, ^key, %{owner: :remote}}},
+                     1_000
     end
 
     test "batched remote conflict keeps the staged local winner when later unregister arrives" do
@@ -2869,11 +2881,169 @@ defmodule GroupTest do
     end
   end
 
+  describe "replica write-ahead journal" do
+    test "concurrent shards retain independent append order", %{name: name} do
+      named_cluster = "journal/append-order"
+      operations_per_shard = 100
+      :ok = Group.connect(name, named_cluster)
+
+      parent = self()
+
+      owners =
+        for shard <- 0..3 do
+          nil_keys =
+            keys_for_shard(nil, "journal/append-order/nil/#{shard}", 4, shard, 50)
+
+          named_keys =
+            keys_for_shard(
+              named_cluster,
+              "journal/append-order/named/#{shard}",
+              4,
+              shard,
+              50
+            )
+
+          spawn(fn ->
+            nil_keys
+            |> Enum.zip(named_keys)
+            |> Enum.each(fn {nil_key, named_key} ->
+              :ok = Group.register(name, nil_key, %{})
+              :ok = Group.register(name, named_key, %{}, cluster: named_cluster)
+            end)
+
+            send(parent, {:append_order_complete, shard, self()})
+            Process.sleep(:infinity)
+          end)
+        end
+
+      on_exit(fn -> Enum.each(owners, &kill_if_alive/1) end)
+
+      Enum.with_index(owners)
+      |> Enum.each(fn {owner, shard} ->
+        assert_receive {:append_order_complete, ^shard, ^owner}, 10_000
+      end)
+
+      metadata = Group.Replica.Data.replication_meta_table(name)
+      assert :ets.info(metadata, :write_concurrency) == :auto
+
+      for shard <- 0..3 do
+        assert [{{:append_counter, shard}, operations_per_shard}] ==
+                 :ets.lookup(metadata, {:append_counter, shard})
+
+        order_rows =
+          name
+          |> Group.Replica.Data.replica_oplog_order_table(shard)
+          |> :ets.tab2list()
+          |> Enum.sort()
+
+        assert Enum.map(order_rows, &elem(&1, 0)) ==
+                 Enum.to_list(1..operations_per_shard)
+
+        assert Enum.all?(order_rows, fn {_append_id, stream_id, _seq} ->
+                 Group.Replica.Protocol.stream_shard(stream_id) == shard
+               end)
+
+        oplog_rows =
+          name
+          |> Group.Replica.Data.replica_oplog_table(shard)
+          |> :ets.tab2list()
+          |> MapSet.new(fn {{stream_id, seq}, append_id, _mutations} ->
+            {append_id, stream_id, seq}
+          end)
+
+        assert MapSet.new(order_rows) == oplog_rows
+
+        order_rows
+        |> Enum.group_by(fn {_append_id, stream_id, _seq} -> stream_id end)
+        |> Enum.each(fn {_stream_id, rows} ->
+          assert Enum.map(rows, &elem(&1, 2)) == Enum.to_list(1..50)
+        end)
+      end
+    end
+
+    test "a shard restart replays an appended mixed record and later cleans its owner" do
+      name = start_single_shard_group(replicated_oplog_max_entries: 16)
+      key = "journal/replay/#{System.unique_integer([:positive])}"
+      owner = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> kill_if_alive(owner) end)
+
+      stream_id = Group.Replica.Data.local_stream_id(name, 0, nil)
+      time = System.system_time()
+
+      {seq, _mutations} =
+        Group.Replica.Data.append_replica_record(name, 0, stream_id, [
+          {:register, nil, key, owner, %{kind: :registry}, time, node()},
+          {:join, nil, key, owner, %{kind: :pg}, time, :join, node()}
+        ])
+
+      old_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+      Process.exit(old_shard, :kill)
+
+      Group.TestCluster.assert_eventually(fn ->
+        new_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+
+        is_pid(new_shard) and new_shard != old_shard and
+          Group.lookup(name, key) == {owner, %{kind: :registry}} and
+          Group.members(name, key) == [{owner, %{kind: :pg}}]
+      end)
+
+      assert {_floor, ^seq, ^seq} =
+               Group.Replica.Data.replica_stream_head(name, 0, stream_id)
+
+      Process.exit(owner, :kill)
+
+      Group.TestCluster.assert_eventually(fn ->
+        Group.lookup(name, key) == nil and Group.members(name, key) == []
+      end)
+    end
+  end
+
+  describe "replica authority snapshots" do
+    test "revision and epoch rows remain coherent during concurrent activation", %{name: name} do
+      clusters = for i <- 1..1_000, do: "authority/#{i}"
+
+      activators =
+        clusters
+        |> Enum.chunk_every(125)
+        |> Enum.map(fn chunk ->
+          Task.async(fn ->
+            Enum.each(chunk, fn cluster ->
+              [{^cluster, _epoch}] =
+                Group.Replica.Data.activate_local_clusters(name, [cluster])
+            end)
+          end)
+        end)
+
+      for _ <- 1..200 do
+        {generation, revision, epochs} =
+          Group.Replica.Data.local_replica_authority(name)
+
+        assert {nil, generation} in epochs
+        assert revision == Enum.count(epochs, &(not is_nil(elem(&1, 0))))
+      end
+
+      Task.await_many(activators, 10_000)
+
+      {generation, 1_000, epochs} = Group.Replica.Data.local_replica_authority(name)
+      assert {nil, generation} in epochs
+      assert length(epochs) == 1_001
+      assert Map.new(epochs) |> map_size() == 1_001
+    end
+  end
+
   defp start_single_shard_group(opts \\ []) do
     name = :"test_timeout_group_#{System.unique_integer([:positive])}"
     opts = Keyword.merge([name: name, shards: 1, log: false], opts)
     start_supervised!({Group, opts})
     name
+  end
+
+  defp keys_for_shard(cluster, prefix, num_shards, shard, count) do
+    1
+    |> Stream.iterate(&(&1 + 1))
+    |> Stream.map(&"#{prefix}/#{&1}")
+    |> Stream.filter(&(Group.Replica.shard_index_for(cluster, &1, num_shards) == shard))
+    |> Enum.take(count)
   end
 
   defp suspend_only_shard(name) do

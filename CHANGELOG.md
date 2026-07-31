@@ -1,4 +1,23 @@
 ## Unreleased
+- Replace replica state sends/snapshots with per-origin, generation- and
+  cluster-epoch-fenced streams: sequenced deltas repair gaps from a bounded
+  oplog and fall back to exact origin snapshots after pruning. Replica data now
+  uses a pluggable nonblocking transport (dist Erlang by default via
+  `send_nosuspend`), while dist Erlang remains the control plane. Nonblocking
+  control heartbeats lease peer state, requesting a fresh authoritative hello
+  on generation or epoch-revision changes, so a stopped Group on a connected
+  VM cannot leave permanent registry or membership rows. Reconnects also sweep
+  superseded per-shard receive cursors and reconstruct epochless PG rows, so
+  reordered cluster controls cannot strand live rows from an older epoch. Full
+  epoch authority is installed once by shard 0; matching data shards exchange
+  constant-size lane hellos and retain shard-to-shard transport ordering.
+  Authority capture is serialized with epoch activation, and exact versus
+  incrementally observed revisions are tracked separately so a concurrent
+  partial snapshot cannot be mistaken for complete authority.
+- Registry authority is retained per origin separately from the visible
+  winner. Conflict callbacks select the winner; Group now records and
+  propagates an authoritative loser delete, and each owner node terminates only
+  its own losing process. This also applies to custom conflict callbacks.
 - Add `Group.monitor_generation/1` so long-lived registration owners can
   terminate and re-register when the local membership ETS generation is lost.
 - **Breaking**: `Group.disconnect/3` now discards the complete local view of each departed
@@ -6,14 +25,13 @@
   them — instead of removing only locally owned rows. Reconnecting resyncs through the normal
   snapshot exchange. `connect`/`disconnect` also raise `ArgumentError` for non-binary cluster
   names instead of silently tolerating them.
-- The built-in registry conflict resolver now consistently includes the winner's metadata in
-  the losing process's `{:group_registry_conflict, key, winner_meta}` exit reason. Custom
-  `resolve_registry_conflict` callbacks remain responsible for any process exits they require.
+- The registry conflict resolver now consistently includes the winner's metadata in
+  the losing process's `{:group_registry_conflict, key, winner_meta}` exit reason.
 - **Breaking**: `Group.dispatch/4` remote sends and process-DOWN replication are now
-  non-suspending and never auto-connect — on a busy or disconnected distribution link the
-  message is dropped, the link is force-disconnected, and bounded reconnect retries begin (the
-  same policy replication lanes have used since 0.1.8). Previously dispatch could block the
-  caller and initiate new connections.
+  non-suspending and never auto-connect. Busy dispatch drops still force a disconnect and
+  bounded reconnect retry; replica frames are dropped and repaired by anti-entropy without
+  disturbing the dist-Erlang control connection. Previously dispatch could block the caller
+  and initiate new connections.
 - Configured function-form `extract_meta` callbacks are now applied on reads and lifecycle
   events (previously they were silently ignored and full metadata was exposed), and invalid
   `:extract_meta` values raise `ArgumentError` at startup.

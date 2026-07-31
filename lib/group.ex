@@ -10,15 +10,16 @@ defmodule Group do
 
   ## Consistency Model
 
-  All operations are **eventually consistent**. The built-in replication layer uses
-  Erlang distribution to propagate state across nodes, which means:
+  All operations are **eventually consistent**. Erlang distribution remains
+  the membership/control plane; replica state uses a configurable nonblocking
+  transport with sequenced anti-entropy streams. This means:
 
   - Writes (register, join, etc.) return immediately after local update
-  - Other nodes receive updates asynchronously via Erlang distribution
+  - Other nodes receive updates asynchronously over the replica transport
   - During network partitions, nodes may have divergent views
   - When partitions heal, conflicts are resolved. The built-in resolver kills
-    the losing process with `{:group_registry_conflict, key, winner_meta}`;
-    custom resolvers control any process exits themselves
+    each losing origin records an authoritative delete and terminates only its
+    own local process with `{:group_registry_conflict, key, winner_meta}`
 
   ## Clusters
 
@@ -195,10 +196,9 @@ defmodule Group do
   - `:resolve_registry_conflict` — `{module, function, extra_args}` callback invoked when
     two nodes hold the same registry key (partition heal or concurrent registration).
     Called as `apply(module, function, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
-    Must return the winner pid and is responsible for any process exits it requires. When
-    no callback is configured, the built-in resolver kills the loser with
-    `{:group_registry_conflict, key, winner_meta}`. **Important:** This callback runs
-    synchronously inside the shard GenServer — it must
+    Must return the winner pid (or neither contender to reject both). Group records
+    an authoritative delete and terminates a losing process only on its owner node.
+    **Important:** This callback runs synchronously inside the shard GenServer — it must
     return quickly and never block. Any information needed for the decision should be
     carried in the registration metadata, not fetched at resolution time.
   - `:extract_meta` — `{module, function, args}` or a one-argument function to
@@ -218,13 +218,26 @@ defmodule Group do
     buffer replicated outbound ops before flushing during idle periods. Sender
     buffers also flush on size, overdue enqueue, and control/routing barriers
     (default: `5`)
-  - `:busy_dist_retry_attempts` — max reconnect attempts after a shard hits
-    `send_nosuspend == false` to a remote node and forces a disconnect
+  - `:busy_dist_retry_attempts` — max reconnect attempts after a remote
+    `Group.dispatch/4` send reports a busy dist link and forces a disconnect
     (default: `300`)
-  - `:busy_dist_retry_interval` — interval in milliseconds between reconnect
-    attempts after a busy-dist disconnect (default: `1_000`)
-  - `:replicated_pg_receiver_local_request_quota` — max queued local PG shard requests
-    drained after each replicated PG flush before yielding (default: `8`)
+  - `:busy_dist_retry_interval` — interval in milliseconds between dispatch
+    busy-link reconnect attempts (default: `1_000`)
+  - `:replicated_pg_receiver_local_request_quota` — legacy-named quota for queued
+    local shard requests drained in each fairness turn, including while replica
+    data or cluster controls are busy (default: `8`)
+  - `:replica_transport` — replica data transport module or `{module, opts}` tuple.
+    Defaults to `Group.Replica.Transport.Distribution`. The transport must be
+    nonblocking and may return `:busy`; anti-entropy repairs dropped frames.
+  - `:replicated_oplog_max_entries` — maximum retained replica records per shard
+    before old prefixes are pruned and lagging peers require a snapshot
+    (default: `65_536`)
+  - `:replicated_anti_entropy_interval` — milliseconds between repeated stream
+    head advertisements (default: `1_000`)
+  - `:replicated_peer_lease_timeout` — milliseconds without a dist-Erlang
+    replica heartbeat before remote Group state is purged (default: `15_000`).
+    Must be greater than `:replicated_anti_entropy_interval`. Discovery probes
+    an expired peer so a restarted Group can recover automatically.
   """
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -1094,6 +1107,7 @@ defmodule Group do
   @doc false
   def connect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
+    _epochs = Data.activate_local_clusters(name, clusters)
     Data.add_cluster_node(name, clusters, node())
 
     notify_shard = :rand.uniform(get_config(name).num_shards) - 1
@@ -1108,17 +1122,25 @@ defmodule Group do
   @doc false
   def disconnect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
+    _epochs = Data.deactivate_local_clusters(name, clusters)
     Data.remove_cluster_node(name, clusters, node())
 
     num_shards = get_config(name).num_shards
 
     shard_names = for i <- 0..(num_shards - 1), do: Replica.shard_name(name, i)
 
-    Replica.local_request_all(
-      shard_names,
-      {:cluster_disconnect, clusters},
-      timeout
-    )
+    result =
+      Replica.local_request_all(
+        shard_names,
+        {:cluster_disconnect, clusters},
+        timeout
+      )
+
+    # Keep the remote routing rows through the shard barrier so any buffered
+    # records are dispatched before the cluster-close control message. Once
+    # every shard has crossed the barrier, no cluster rows may remain locally.
+    Data.remove_clusters(name, clusters)
+    result
   end
 
   # ===========================================================================
