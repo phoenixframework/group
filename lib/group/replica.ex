@@ -248,9 +248,17 @@ defmodule Group.Replica do
 
     state = schedule_anti_entropy(state)
 
-    # Complete any write-ahead record left unapplied by a shard crash, then
-    # rebuild local process monitors from the surviving materialized tables.
+    # Repair any interrupted multi-table journal/index mutation, complete
+    # write-ahead records left unapplied by a shard crash, then rebuild local
+    # process monitors from the surviving materialized tables.
+    :ok = Data.repair_local_replica_journal(name, shard_index)
     state = replay_local_journal(state)
+    :ok = Data.repair_shard_indexes(name, shard_index)
+
+    completed_clusters =
+      Data.mark_closed_cluster_shard(name, Data.closed_local_clusters(name), shard_index)
+
+    if completed_clusters != [], do: Data.remove_clusters(name, completed_clusters)
 
     # Rebuild monitors from any surviving ETS data (after shard crash/restart)
     state = rebuild_monitors(state)
@@ -452,27 +460,25 @@ defmodule Group.Replica do
             Map.put(state.peer_transports, remote_node, {transport_id, transport_descriptor})
       }
 
-      if replica_authority_current?(state, remote_node, generation, epoch_revision) do
-        :ok =
-          Data.put_remote_view_info(
-            state.name,
-            state.shard_index,
-            remote_node,
-            generation,
-            Data.remote_cluster_epoch_exact_revision(state.name, remote_node),
-            epoch_revision
-          )
+      cond do
+        replica_authority_current?(state, remote_node, generation, epoch_revision) and
+            replica_view_current?(state, remote_node) ->
+          state =
+            state
+            |> purge_remote_streams_outside_authority(remote_node)
+            |> touch_replica_peer(remote_node)
+            |> Map.update!(:cluster_control_dirty, &Map.delete(&1, remote_node))
+            |> send_replica_heads(remote_node)
 
-        state =
-          state
-          |> purge_remote_streams_outside_authority(remote_node)
-          |> touch_replica_peer(remote_node)
-          |> Map.update!(:cluster_control_dirty, &Map.delete(&1, remote_node))
-          |> send_replica_heads(remote_node)
+          {:noreply, state}
 
-        {:noreply, state}
-      else
-        {:noreply, request_replica_authority(state, remote_node)}
+        replica_authority_current?(state, remote_node, generation, epoch_revision) ->
+          # Shared authority arrived first; its local fanout is already the
+          # ordered marker that will purge and install this lane's view.
+          {:noreply, state}
+
+        true ->
+          {:noreply, request_replica_authority(state, remote_node)}
       end
     else
       Logger.error(
@@ -501,6 +507,8 @@ defmodule Group.Replica do
         else
           state
         end
+
+      :ok = install_replica_view(state, remote_node, generation)
 
       state = %{
         state
@@ -574,6 +582,7 @@ defmodule Group.Replica do
           |> purge_closed_remote_epochs(remote_node, stale)
           |> purge_superseded_remote_streams(remote_node, epochs)
 
+        :ok = install_replica_view(state, remote_node, generation)
         state = send_replica_heads(state, remote_node, Enum.map(shared, &elem(&1, 0)))
         {:noreply, take_one_local_request_turn(state)}
 
@@ -606,10 +615,13 @@ defmodule Group.Replica do
 
     state =
       if replica_authority_current?(state, remote_node, generation, revision) do
-        state
-        |> purge_closed_remote_epochs(remote_node, stale)
-        |> purge_superseded_remote_streams(remote_node, epochs)
-        |> send_replica_heads(remote_node, shared)
+        state =
+          state
+          |> purge_closed_remote_epochs(remote_node, stale)
+          |> purge_superseded_remote_streams(remote_node, epochs)
+
+        :ok = install_replica_view(state, remote_node, generation)
+        send_replica_heads(state, remote_node, shared)
       else
         state
       end
@@ -665,6 +677,7 @@ defmodule Group.Replica do
           |> mark_cluster_control_dirty(remote_node)
           |> purge_closed_remote_epochs(remote_node, closed)
 
+        :ok = install_replica_view(state, remote_node, generation)
         {:noreply, take_one_local_request_turn(state)}
 
       :stale ->
@@ -690,7 +703,9 @@ defmodule Group.Replica do
 
     state =
       if replica_authority_current?(state, remote_node, generation, revision) do
-        purge_closed_remote_epochs(state, remote_node, closed)
+        state = purge_closed_remote_epochs(state, remote_node, closed)
+        :ok = install_replica_view(state, remote_node, generation)
+        state
       else
         state
       end
@@ -714,23 +729,20 @@ defmodule Group.Replica do
     remote_node = node(remote_pid)
 
     state =
-      if version == Protocol.version() and
-           replica_authority_current?(state, remote_node, generation, epoch_revision) do
-        :ok =
-          Data.put_remote_view_info(
-            state.name,
-            state.shard_index,
-            remote_node,
-            generation,
-            Data.remote_cluster_epoch_exact_revision(state.name, remote_node),
-            epoch_revision
-          )
+      cond do
+        version == Protocol.version() and
+          replica_authority_current?(state, remote_node, generation, epoch_revision) and
+            replica_view_current?(state, remote_node) ->
+          state
+          |> put_remote_shard(remote_node, remote_pid)
+          |> touch_replica_peer(remote_node)
 
-        state
-        |> put_remote_shard(remote_node, remote_pid)
-        |> touch_replica_peer(remote_node)
-      else
-        request_replica_authority(state, remote_node)
+        version == Protocol.version() and
+            replica_authority_current?(state, remote_node, generation, epoch_revision) ->
+          state
+
+        true ->
+          request_replica_authority(state, remote_node)
       end
 
     {:noreply, state}
@@ -2061,6 +2073,8 @@ defmodule Group.Replica do
         :ok
     end)
 
+    completed_clusters = Data.mark_closed_cluster_shard(name, clusters, shard)
+    if completed_clusters != [], do: Data.remove_clusters(name, completed_clusters)
     notify_monitors(name, events)
     {:ok, state}
   end
@@ -2849,6 +2863,8 @@ defmodule Group.Replica do
         state
       end
 
+    :ok = install_replica_view(state, remote_node, generation)
+
     state = %{
       state
       | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid),
@@ -2914,6 +2930,26 @@ defmodule Group.Replica do
   defp replica_authority_current?(state, remote_node, generation, epoch_revision) do
     Data.remote_generation(state.name, remote_node) == generation and
       Data.remote_cluster_epoch_observed_revision(state.name, remote_node) == epoch_revision
+  end
+
+  defp replica_view_current?(state, remote_node) do
+    Data.remote_view_generation(state.name, state.shard_index, remote_node) ==
+      Data.remote_generation(state.name, remote_node) and
+      Data.remote_view_cluster_epoch_revision(state.name, state.shard_index, remote_node) ==
+        Data.remote_cluster_epoch_exact_revision(state.name, remote_node) and
+      Data.remote_view_observed_revision(state.name, state.shard_index, remote_node) ==
+        Data.remote_cluster_epoch_observed_revision(state.name, remote_node)
+  end
+
+  defp install_replica_view(state, remote_node, generation) do
+    Data.put_remote_view_info(
+      state.name,
+      state.shard_index,
+      remote_node,
+      generation,
+      Data.remote_cluster_epoch_exact_revision(state.name, remote_node),
+      Data.remote_cluster_epoch_observed_revision(state.name, remote_node)
+    )
   end
 
   defp schedule_anti_entropy(state) do
@@ -3178,6 +3214,7 @@ defmodule Group.Replica do
     Protocol.stream_name(stream_id) == state.name and
       Protocol.stream_origin(stream_id) == source_node and
       Protocol.stream_shard(stream_id) == state.shard_index and
+      replica_view_current?(state, source_node) and
       Protocol.stream_generation(stream_id) == Data.remote_generation(state.name, source_node) and
       Protocol.stream_epoch(stream_id) ==
         Data.remote_cluster_epoch(state.name, source_node, cluster) and

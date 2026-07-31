@@ -1107,6 +1107,7 @@ defmodule Group do
   @doc false
   def connect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
+    timeout = Data.await_closed_local_clusters(name, clusters, timeout)
     _epochs = Data.activate_local_clusters(name, clusters)
     Data.add_cluster_node(name, clusters, node())
 

@@ -7,6 +7,7 @@ mix test                           # all tests
 mix test test/group_test.exs       # local only
 mix test test/distributed_test.exs # distributed only
 mix test test/replica_adversarial_test.exs # seeded transport chaos
+mix test test/replica_model_property_test.exs # shrinkable model-based histories
 ```
 
 ## Test files
@@ -16,6 +17,32 @@ mix test test/replica_adversarial_test.exs # seeded transport chaos
 | `group_test.exs` | Single-node: register/unregister, join/leave, members, monitor/demonitor, named clusters, concurrent operations |
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts, and adversarial replica-transport loss/busy/snapshot recovery |
 | `replica_adversarial_test.exs` | Reproducible mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
+| `replica_model_property_test.exs` | StreamData-generated and shrunk owner histories against an independent lifecycle oracle and scheduler-controlled replica transport |
+
+## Model-based and formal checks
+
+`replica_model_property_test.exs` runs real Group instances on three peer VMs.
+The controlled transport queues each replica frame so generated commands can
+deliver, duplicate, drop, reorder, or strand it. After the bounded-fault
+prefix, the test enables fair delivery and compares every tracked registry and
+PG key against an independent application-level lifecycle oracle. It also
+requires internal replica indexes to be consistent, every retained owner to be
+alive, and registry conflict losers to be dead. Restart, pruning, and named
+cluster histories retain independent C-owned state while A recovers, so repair
+cannot pass merely by making one origin and one receiver agree.
+
+StreamData reports the ExUnit seed and shrinks a failure to its smallest command
+history. Local defaults are intentionally quick. Increase the budgets without
+changing the generator:
+
+```bash
+GROUP_MODEL_RUNS=1000 GROUP_MODEL_COMMANDS=100 \
+  mix test test/replica_model_property_test.exs
+```
+
+The independent TLA+ model and TLC configuration live in `test/formal/`.
+See [`formal/README.md`](formal/README.md) for its checked invariants, finite
+model bounds, and run command.
 
 ## How distribution works
 
@@ -203,6 +230,12 @@ can return `:busy`, drop selected frame types, duplicate or delay frames, and
 capture frames for explicit stale-generation/epoch replay. Its `{:chaos, opts}`
 mode is deterministic for a given frame, which makes failures reproducible.
 
+`Group.ControlledReplicaTransport` is the model-test transport. It queues frames
+at the test process without scheduling timers; `Group.ReplicaModelScheduler`
+then owns the exact delivery schedule. These roles are separate so the existing
+timing-oriented regressions retain their original mechanics while property
+failures can be replayed and shrunk exactly.
+
 The distributed anti-entropy tests cover dropped creates and deletes, cursor
 gaps, globally pruned multi-stream oplogs, exact snapshot fallback, malformed
 authority, stale frame replay, lease expiry on a live VM, and multi-shard
@@ -217,12 +250,21 @@ deliver data before authority to prove rejection does not advance the cursor
 and the same frame applies after authority repair. Concurrent snapshot tests
 require every advertised revision to contain exactly that many unique named
 epochs, and heartbeat tests prove observed revisions cannot advance the exact
-authority marker.
+authority marker. Crash-window tests interrupt journal, dual-index, receive
+cursor, and named-cluster close updates, then require startup repair to remove
+every invisible row and temporary close barrier. A three-node sideband TCP test
+disconnects one origin's real socket, prunes its oplog, reconnects it, and
+requires snapshot recovery without changing the third node's independent
+registry or PG state.
 
 `Group.TestCluster.assert_replica_consistent/1` checks the
 public dual indexes plus registry claim authority, oplog/order equivalence, and
 contiguous retained stream ranges. Seeded tests additionally require every PID
 retained as authority to still be alive after convergence.
+
+The isolated mutation runner in `test/mutation/` disables individual protocol
+guards and repair steps only in copied checkouts. See
+[`mutation/README.md`](mutation/README.md) for the command and artifact format.
 
 ## Typical test patterns
 

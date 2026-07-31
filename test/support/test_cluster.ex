@@ -5,16 +5,36 @@ defmodule Group.TestCluster do
   def start_peers(count, opts \\ []) do
     cookie = Keyword.get(opts, :cookie, Node.get_cookie())
     code_paths = :code.get_path()
+    schedulers = Keyword.get(opts, :schedulers)
+
+    scheduler_args =
+      if schedulers, do: [~c"+S", ~c"#{schedulers}:#{schedulers}"], else: []
 
     args =
-      [~c"-setcookie", ~c"#{cookie}", ~c"-kernel", ~c"prevent_overlapping_partitions", ~c"false"] ++
+      scheduler_args ++
+        [
+          ~c"-setcookie",
+          ~c"#{cookie}",
+          ~c"-kernel",
+          ~c"prevent_overlapping_partitions",
+          ~c"false"
+        ] ++
         Enum.flat_map(code_paths, fn p -> [~c"-pa", p] end)
 
     for _i <- 1..count do
       name = :"peer#{System.unique_integer([:positive])}"
 
+      # A fixed inet_dist_listen_min/max inherited through ERL_AFLAGS makes
+      # every child contend for the parent VM's distribution port. Peer args
+      # above carry every setting the test nodes require explicitly.
       {:ok, pid, node} =
-        :peer.start(%{name: name, host: ~c"127.0.0.1", longnames: true, args: args})
+        :peer.start(%{
+          name: name,
+          host: ~c"127.0.0.1",
+          longnames: true,
+          args: args,
+          env: [{~c"ERL_AFLAGS", ~c""}]
+        })
 
       {:ok, _} = :rpc.call(node, :application, :ensure_all_started, [:elixir])
       {:ok, _} = :rpc.call(node, :application, :ensure_all_started, [:group])
@@ -659,6 +679,59 @@ defmodule Group.TestCluster do
     :ok
   end
 
+  @doc false
+  def assert_replica_origin_purged(name, origin) do
+    num_shards = Group.get_config(name).num_shards
+
+    for shard <- 0..(num_shards - 1) do
+      retained_claims =
+        Group.Replica.Data.reg_claim_by_key_table(name, shard)
+        |> :ets.tab2list()
+        |> Enum.filter(fn {{_cluster, _key, row_origin, _generation, _epoch}, _pid, _meta, _time,
+                           _seq} ->
+          row_origin == origin
+        end)
+
+      retained_registry =
+        Group.Replica.Data.reg_by_key_table(name, shard)
+        |> :ets.tab2list()
+        |> Enum.filter(fn {_key, _pid, _meta, _time, entry_node} -> entry_node == origin end)
+
+      retained_pg =
+        Group.Replica.Data.pg_by_key_table(name, shard)
+        |> :ets.tab2list()
+        |> Enum.filter(fn {_key, _meta, _time, entry_node} -> entry_node == origin end)
+
+      retained_cursors =
+        Group.Replica.Data.replica_cursor_table(name, shard)
+        |> :ets.tab2list()
+        |> Enum.filter(fn {stream_id, _seq} ->
+          Group.Replica.Protocol.stream_origin(stream_id) == origin
+        end)
+
+      retained_view = Group.Replica.Data.remote_view_generation(name, shard, origin)
+
+      unless retained_claims == [] and retained_registry == [] and retained_pg == [] and
+               retained_cursors == [] and is_nil(retained_view) do
+        raise "replica origin was not fully purged from #{name} shard #{shard}: " <>
+                inspect(%{
+                  claims: retained_claims,
+                  registry: retained_registry,
+                  pg: retained_pg,
+                  cursors: retained_cursors,
+                  view_generation: retained_view
+                })
+      end
+    end
+
+    unless is_nil(Group.Replica.Data.remote_generation(name, origin)) and
+             Group.Replica.Data.clusters_for_node(name, origin) == [] do
+      raise "replica origin retained shared authority after purge: #{inspect(origin)}"
+    end
+
+    :ok
+  end
+
   @doc """
   Returns every PID currently retained as replica authority or visible PG state.
 
@@ -776,6 +849,13 @@ defmodule Group.TestCluster do
       raise "oplog/order index inconsistency in #{name} shard #{shard}: " <>
               "oplog_only=#{inspect(MapSet.difference(oplog, order) |> MapSet.to_list())} " <>
               "order_only=#{inspect(MapSet.difference(order, oplog) |> MapSet.to_list())}"
+    end
+
+    max_entries = Group.get_config(name).replicated_oplog_max_entries
+
+    if MapSet.size(order) > max_entries do
+      raise "oplog bound exceeded in #{name} shard #{shard}: " <>
+              "size=#{MapSet.size(order)} max=#{max_entries}"
     end
 
     Group.Replica.Data.replica_stream_meta_table(name, shard)

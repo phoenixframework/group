@@ -1344,6 +1344,9 @@ defmodule GroupTest do
       assert :ok = Group.join(name, key, %{}, cluster: cluster)
       assert Group.members(name, key, cluster: cluster) == [{self(), %{}}]
 
+      remote_route = :"disconnect-timeout@remote"
+      :ok = Group.Replica.Data.add_cluster_node(name, [cluster], remote_route)
+
       shard_zero = Group.Replica.shard_name(name, 0)
       :ok = :sys.suspend(shard_zero)
 
@@ -1358,6 +1361,48 @@ defmodule GroupTest do
       :sys.get_state(shard_zero)
       refute Group.connected?(name, cluster)
       assert Group.members(name, key, cluster: cluster) == []
+
+      wait_until(fn ->
+        Group.Replica.Data.closed_local_clusters(name) == [] and
+          Group.Replica.Data.cluster_nodes(name, cluster) == []
+      end)
+    end
+
+    test "reconnect waits for every old-epoch shard cleanup before admitting new writes" do
+      name = :"test_reconnect_barrier_#{System.unique_integer([:positive])}"
+      cluster = "reconnect_barrier"
+      key = "reconnect/barrier/#{System.unique_integer([:positive])}"
+      start_supervised!({Group, name: name, shards: 2, log: false})
+
+      assert :ok = Group.connect(name, cluster)
+      shard_zero = Group.Replica.shard_name(name, 0)
+      :ok = :sys.suspend(shard_zero)
+
+      reconnect_caller =
+        try do
+          assert_genserver_call_timeout(fn ->
+            Group.disconnect(name, cluster, timeout: 10)
+          end)
+
+          caller =
+            spawn_requester(
+              fn -> Group.connect(name, cluster) end,
+              :reconnect_barrier_result
+            )
+
+          refute_receive {:reconnect_barrier_result, ^caller, _result}, 50
+          caller
+        after
+          resume_shard_if_alive(shard_zero)
+        end
+
+      on_exit(fn -> kill_if_alive(reconnect_caller) end)
+      assert_receive {:reconnect_barrier_result, ^reconnect_caller, :ok}, 1_000
+
+      assert Group.Replica.Data.closed_local_clusters(name) == []
+      assert :ok = Group.join(name, key, %{epoch: :new}, cluster: cluster)
+      assert Group.members(name, key, cluster: cluster) == [{self(), %{epoch: :new}}]
+      assert :ok = Group.TestCluster.assert_replica_consistent(name)
     end
   end
 
@@ -2995,6 +3040,146 @@ defmodule GroupTest do
       Group.TestCluster.assert_eventually(fn ->
         Group.lookup(name, key) == nil and Group.members(name, key) == []
       end)
+    end
+
+    test "a shard restart repairs an interrupted append tail and interrupted prune floor" do
+      name = start_single_shard_group(replicated_oplog_max_entries: 16)
+      stream_id = Group.Replica.Data.local_stream_id(name, 0, nil)
+      first_key = "journal/crash-window/first/#{System.unique_integer([:positive])}"
+      second_key = "journal/crash-window/second/#{System.unique_integer([:positive])}"
+      third_key = "journal/crash-window/third/#{System.unique_integer([:positive])}"
+
+      :ok = Group.register(name, first_key, %{seq: 1})
+      :ok = Group.register(name, second_key, %{seq: 2})
+
+      oplog = Group.Replica.Data.replica_oplog_table(name, 0)
+      order = Group.Replica.Data.replica_oplog_order_table(name, 0)
+      stream_meta = Group.Replica.Data.replica_stream_meta_table(name, 0)
+
+      [{{^stream_id, 1}, first_append_id, _mutations}] = :ets.lookup(oplog, {stream_id, 1})
+
+      # Pruning removes order -> record -> advances floor. Model a kill after
+      # the first two writes but before the floor update.
+      :ets.delete(order, first_append_id)
+      :ets.delete(oplog, {stream_id, 1})
+
+      # Appending advances head -> append counter -> record -> order. Model a
+      # kill after the head update but before the record exists.
+      assert 3 = :ets.update_counter(stream_meta, stream_id, {2, 1})
+
+      old_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+      Process.exit(old_shard, :kill)
+
+      Group.TestCluster.assert_eventually(fn ->
+        new_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+        is_pid(new_shard) and new_shard != old_shard
+      end)
+
+      :sys.get_state(Group.Replica.shard_name(name, 0))
+      assert {2, 2, 2} = Group.Replica.Data.replica_stream_head(name, 0, stream_id)
+      assert :ok = Group.TestCluster.assert_replica_consistent(name)
+
+      :ok = Group.register(name, third_key, %{seq: 3})
+      assert {2, 3, 3} = Group.Replica.Data.replica_stream_head(name, 0, stream_id)
+
+      assert Group.lookup(name, first_key) == {self(), %{seq: 1}}
+      assert Group.lookup(name, second_key) == {self(), %{seq: 2}}
+      assert Group.lookup(name, third_key) == {self(), %{seq: 3}}
+      assert :ok = Group.TestCluster.assert_replica_consistent(name)
+    end
+
+    test "a shard restart rebuilds every one-sided materialized index" do
+      name = start_single_shard_group(replicated_oplog_max_entries: 16)
+      reg_key = "indexes/crash-window/reg/#{System.unique_integer([:positive])}"
+      pg_key = "indexes/crash-window/pg/#{System.unique_integer([:positive])}"
+
+      :ok = Group.register(name, reg_key, %{kind: :registry})
+      :ok = Group.join(name, pg_key, %{kind: :pg})
+
+      stream_id = Group.Replica.Data.local_stream_id(name, 0, nil)
+      generation = Group.Replica.Protocol.stream_generation(stream_id)
+      epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+
+      :ets.delete(Group.Replica.Data.reg_by_pid_table(name, 0), {self(), nil, reg_key})
+      :ets.delete(Group.Replica.Data.pg_by_pid_table(name, 0), {self(), nil, pg_key})
+
+      :ets.delete(
+        Group.Replica.Data.reg_claim_by_pid_table(name, 0),
+        {self(), nil, reg_key, node(), generation, epoch}
+      )
+
+      orphan = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> kill_if_alive(orphan) end)
+
+      :ets.insert(
+        Group.Replica.Data.reg_by_pid_table(name, 0),
+        {{orphan, nil, "indexes/orphan/reg"}, %{}, 0, node()}
+      )
+
+      :ets.insert(
+        Group.Replica.Data.pg_by_pid_table(name, 0),
+        {{orphan, nil, "indexes/orphan/pg"}, %{}, 0, node()}
+      )
+
+      :ets.insert(
+        Group.Replica.Data.reg_claim_by_pid_table(name, 0),
+        {{orphan, nil, "indexes/orphan/claim", node(), generation, epoch}, %{}, 0, 1}
+      )
+
+      old_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+      Process.exit(old_shard, :kill)
+
+      Group.TestCluster.assert_eventually(fn ->
+        new_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+        is_pid(new_shard) and new_shard != old_shard
+      end)
+
+      :sys.get_state(Group.Replica.shard_name(name, 0))
+      assert Group.lookup(name, reg_key) == {self(), %{kind: :registry}}
+      assert Group.members(name, pg_key) == [{self(), %{kind: :pg}}]
+      assert Group.Replica.Data.registry_lookup_by_pid(name, 0, orphan) == []
+      assert Group.Replica.Data.entries_by_pid(name, 0, orphan) == []
+      assert :ok = Group.TestCluster.assert_replica_consistent(name)
+    end
+
+    test "a shard restart completes an interrupted named-cluster close without retained rows" do
+      name = start_single_shard_group(replicated_oplog_max_entries: 16)
+      cluster = "close/crash-window/#{System.unique_integer([:positive])}"
+      reg_key = "close/crash-window/reg/#{System.unique_integer([:positive])}"
+      pg_key = "close/crash-window/pg/#{System.unique_integer([:positive])}"
+      remote_route = :"close-crash-window@remote"
+
+      :ok = Group.connect(name, cluster)
+      :ok = Group.register(name, reg_key, %{kind: :registry}, cluster: cluster)
+      :ok = Group.join(name, pg_key, %{kind: :pg}, cluster: cluster)
+      :ok = Group.Replica.Data.add_cluster_node(name, [cluster], remote_route)
+
+      stream_id = Group.Replica.Data.local_stream_id(name, 0, cluster)
+      old_epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+
+      # Group.disconnect/3 closes authority and routing before its request
+      # reaches every shard. Model a shard kill in that exact window.
+      assert [{^cluster, ^old_epoch}] =
+               Group.Replica.Data.deactivate_local_clusters(name, [cluster])
+
+      :ok = Group.Replica.Data.remove_cluster_node(name, [cluster], node())
+      assert Group.Replica.Data.closed_local_clusters(name) == [cluster]
+
+      old_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+      Process.exit(old_shard, :kill)
+
+      Group.TestCluster.assert_eventually(fn ->
+        new_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+
+        is_pid(new_shard) and new_shard != old_shard and
+          Group.lookup(name, reg_key, cluster: cluster) == nil and
+          Group.members(name, pg_key, cluster: cluster) == [] and
+          Group.Replica.Data.closed_local_clusters(name) == [] and
+          Group.Replica.Data.cluster_nodes(name, cluster) == []
+      end)
+
+      assert :ets.lookup(Group.Replica.Data.replica_stream_meta_table(name, 0), stream_id) == []
+      assert :ok = Group.TestCluster.assert_replica_consistent(name)
     end
   end
 

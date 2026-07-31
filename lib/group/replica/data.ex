@@ -2,6 +2,8 @@ defmodule Group.Replica.Data do
   @moduledoc false
   use GenServer
 
+  alias Group.Replica.Protocol
+
   _archdoc = """
   GenServer that owns ETS tables for all shards.
 
@@ -183,9 +185,21 @@ defmodule Group.Replica.Data do
 
   def closed_local_cluster_epoch(name, cluster) do
     case :ets.lookup(closed_local_cluster_epochs_table(name), cluster) do
-      [{^cluster, epoch}] -> epoch
+      [{^cluster, epoch, _pending_shards}] -> epoch
       [] -> nil
     end
+  end
+
+  def closed_local_clusters(name) do
+    closed_local_cluster_epochs_table(name)
+    |> :ets.tab2list()
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  def await_closed_local_clusters(name, clusters, timeout)
+      when is_list(clusters) and is_integer(timeout) and timeout >= 0 do
+    started_at = System.monotonic_time(:millisecond)
+    await_closed_local_clusters(name, clusters, timeout, started_at)
   end
 
   def remote_generation(name, remote_node) do
@@ -319,6 +333,10 @@ defmodule Group.Replica.Data do
     GenServer.call(data_name(name), {:deactivate_local_clusters, clusters}, :infinity)
   end
 
+  def mark_closed_cluster_shard(name, clusters, shard) do
+    GenServer.call(data_name(name), {:mark_closed_cluster_shard, clusters, shard}, :infinity)
+  end
+
   def local_stream_id(name, shard, cluster) do
     case local_cluster_epoch(name, cluster) do
       nil ->
@@ -378,9 +396,207 @@ defmodule Group.Replica.Data do
     end)
   end
 
+  @doc false
+  def repair_local_replica_journal(name, shard) do
+    stream_table = replica_stream_meta_table(name, shard)
+    oplog_table = replica_oplog_table(name, shard)
+    order_table = replica_oplog_order_table(name, shard)
+
+    stream_table
+    |> :ets.tab2list()
+    |> Enum.each(fn {stream_id, head, floor, applied} ->
+      if current_local_stream?(name, shard, stream_id) do
+        present =
+          oplog_table
+          |> :ets.select([
+            {{{stream_id, :"$1"}, :_, :_}, [], [:"$1"]}
+          ])
+          |> MapSet.new()
+
+        repaired_floor =
+          floor
+          |> missing_applied_sequences(applied, present)
+          |> case do
+            [] -> floor
+            missing -> Enum.max(missing) + 1
+          end
+
+        repaired_head = contiguous_unapplied_head(applied, head, present)
+
+        if repaired_head < head do
+          :ets.select_delete(oplog_table, [
+            {{{stream_id, :"$1"}, :_, :_}, [{:>, :"$1", repaired_head}], [true]}
+          ])
+        end
+
+        repaired_floor = min(repaired_floor, repaired_head + 1)
+        repaired_applied = min(applied, repaired_head)
+
+        :ets.insert(
+          stream_table,
+          {stream_id, repaired_head, repaired_floor, repaired_applied}
+        )
+      else
+        drop_local_stream(
+          name,
+          shard,
+          Protocol.stream_cluster(stream_id),
+          Protocol.stream_epoch(stream_id)
+        )
+      end
+    end)
+
+    :ets.delete_all_objects(order_table)
+
+    oplog_table
+    |> :ets.tab2list()
+    |> Enum.each(fn {{stream_id, seq}, append_id, _mutations} ->
+      :ets.insert(order_table, {append_id, stream_id, seq})
+    end)
+
+    :ok
+  end
+
+  @doc false
+  def repair_shard_indexes(name, shard) do
+    purge_inactive_cluster_rows(name, shard)
+    rebuild_registry_reverse_index(name, shard)
+    rebuild_registry_claim_reverse_index(name, shard)
+    rebuild_pg_reverse_index(name, shard)
+    :ok
+  end
+
   def replica_stream_heads(name, shard) do
     :ets.tab2list(replica_stream_meta_table(name, shard))
     |> Enum.map(fn {stream_id, head, floor, _applied} -> {stream_id, floor, head} end)
+  end
+
+  defp missing_applied_sequences(floor, applied, _present) when floor > applied, do: []
+
+  defp missing_applied_sequences(floor, applied, present) do
+    Enum.reject(floor..applied, &MapSet.member?(present, &1))
+  end
+
+  defp contiguous_unapplied_head(applied, head, _present) when applied >= head, do: head
+
+  defp contiguous_unapplied_head(applied, head, present) do
+    Enum.reduce_while((applied + 1)..head, applied, fn seq, _last ->
+      if MapSet.member?(present, seq), do: {:cont, seq}, else: {:halt, seq - 1}
+    end)
+  end
+
+  defp current_local_stream?(name, shard, stream_id) do
+    cluster = Protocol.stream_cluster(stream_id)
+
+    Protocol.stream_name(stream_id) == name and
+      Protocol.stream_origin(stream_id) == node() and
+      Protocol.stream_generation(stream_id) == generation(name) and
+      Protocol.stream_shard(stream_id) == shard and
+      Protocol.stream_epoch(stream_id) == local_cluster_epoch(name, cluster)
+  end
+
+  defp await_closed_local_clusters(name, clusters, timeout, started_at) do
+    pending? =
+      Enum.any?(clusters, fn cluster ->
+        not is_nil(closed_local_cluster_epoch(name, cluster))
+      end)
+
+    elapsed = System.monotonic_time(:millisecond) - started_at
+
+    cond do
+      not pending? ->
+        max(timeout - elapsed, 0)
+
+      elapsed >= timeout ->
+        exit(
+          {:timeout,
+           {GenServer, :call,
+            [data_name(name), {:await_closed_local_clusters, clusters}, timeout]}}
+        )
+
+      true ->
+        receive do
+        after
+          min(10, timeout - elapsed) ->
+            await_closed_local_clusters(name, clusters, timeout, started_at)
+        end
+    end
+  end
+
+  defp rebuild_registry_reverse_index(name, shard) do
+    reverse = reg_by_pid_table(name, shard)
+    :ets.delete_all_objects(reverse)
+
+    reg_by_key_table(name, shard)
+    |> :ets.tab2list()
+    |> Enum.each(fn {{cluster, key}, pid, meta, time, entry_node} ->
+      :ets.insert(reverse, {{pid, cluster, key}, meta, time, entry_node})
+    end)
+  end
+
+  defp rebuild_registry_claim_reverse_index(name, shard) do
+    reverse = reg_claim_by_pid_table(name, shard)
+    :ets.delete_all_objects(reverse)
+
+    reg_claim_by_key_table(name, shard)
+    |> :ets.tab2list()
+    |> Enum.each(fn {{cluster, key, origin, generation, epoch}, pid, meta, time, seq} ->
+      :ets.insert(
+        reverse,
+        {{pid, cluster, key, origin, generation, epoch}, meta, time, seq}
+      )
+    end)
+  end
+
+  defp rebuild_pg_reverse_index(name, shard) do
+    reverse = pg_by_pid_table(name, shard)
+    :ets.delete_all_objects(reverse)
+
+    pg_by_key_table(name, shard)
+    |> :ets.tab2list()
+    |> Enum.each(fn {{cluster, key, pid}, meta, time, entry_node} ->
+      :ets.insert(reverse, {{pid, cluster, key}, meta, time, entry_node})
+    end)
+  end
+
+  defp purge_inactive_cluster_rows(name, shard) do
+    clusters =
+      Enum.concat([
+        Enum.map(:ets.tab2list(reg_by_key_table(name, shard)), fn
+          {{cluster, _key}, _pid, _meta, _time, _entry_node} -> cluster
+        end),
+        Enum.map(:ets.tab2list(reg_claim_by_key_table(name, shard)), fn
+          {{cluster, _key, _origin, _generation, _epoch}, _pid, _meta, _time, _seq} ->
+            cluster
+        end),
+        Enum.map(:ets.tab2list(pg_by_key_table(name, shard)), fn
+          {{cluster, _key, _pid}, _meta, _time, _entry_node} -> cluster
+        end),
+        Enum.map(:ets.tab2list(replica_cursor_table(name, shard)), fn {stream_id, _seq} ->
+          Protocol.stream_cluster(stream_id)
+        end)
+      ])
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.filter(&is_nil(local_cluster_epoch(name, &1)))
+
+    Enum.each(clusters, fn cluster ->
+      :ets.select_delete(reg_by_key_table(name, shard), [
+        {{{cluster, :_}, :_, :_, :_, :_}, [], [true]}
+      ])
+
+      :ets.select_delete(reg_claim_by_key_table(name, shard), [
+        {{{cluster, :_, :_, :_, :_}, :_, :_, :_, :_}, [], [true]}
+      ])
+
+      :ets.select_delete(pg_by_key_table(name, shard), [
+        {{{cluster, :_, :_}, :_, :_, :_}, [], [true]}
+      ])
+    end)
+
+    :ok = delete_replica_cursors_for_clusters(name, shard, clusters)
+    if clusters != [], do: remove_clusters(name, clusters)
+    :ok
   end
 
   def replica_stream_head(name, shard, stream_id) do
@@ -1620,11 +1836,47 @@ defmodule Group.Replica.Data do
       Enum.map(clusters, fn cluster ->
         epoch = local_cluster_epoch(state.name, cluster)
         :ets.delete(local_cluster_epochs_table(state.name), cluster)
-        if epoch, do: :ets.insert(closed_local_cluster_epochs_table(state.name), {cluster, epoch})
+
+        if epoch do
+          pending_shards = MapSet.new(0..(state.num_shards - 1))
+
+          :ets.insert(
+            closed_local_cluster_epochs_table(state.name),
+            {cluster, epoch, pending_shards}
+          )
+        end
+
         {cluster, epoch}
       end)
 
     {:reply, epochs, state}
+  end
+
+  def handle_call({:mark_closed_cluster_shard, clusters, shard}, _from, state) do
+    completed =
+      Enum.reduce(clusters, [], fn cluster, acc ->
+        case :ets.lookup(closed_local_cluster_epochs_table(state.name), cluster) do
+          [{^cluster, epoch, pending_shards}] ->
+            pending_shards = MapSet.delete(pending_shards, shard)
+
+            if MapSet.size(pending_shards) == 0 do
+              :ets.delete(closed_local_cluster_epochs_table(state.name), cluster)
+              [cluster | acc]
+            else
+              :ets.insert(
+                closed_local_cluster_epochs_table(state.name),
+                {cluster, epoch, pending_shards}
+              )
+
+              acc
+            end
+
+          [] ->
+            acc
+        end
+      end)
+
+    {:reply, Enum.reverse(completed), state}
   end
 
   def handle_call(
@@ -1689,13 +1941,6 @@ defmodule Group.Replica.Data do
       {2, 1},
       {{:remote_authority_installs, remote_node}, 0}
     )
-
-    for view_shard <- 0..(state.num_shards - 1) do
-      :ets.insert(
-        replication_meta_table(state.name),
-        {{:remote_view_info, view_shard, remote_node}, generation, epoch_revision, epoch_revision}
-      )
-    end
 
     rows =
       for {cluster, epoch} <- epochs, not is_nil(cluster), do: {{remote_node, cluster}, epoch}
@@ -1886,34 +2131,12 @@ defmodule Group.Replica.Data do
     {:ok, %{name: name, num_shards: num_shards}}
   end
 
-  defp observe_remote_cluster_revision(name, remote_node, revision, num_shards) do
+  defp observe_remote_cluster_revision(name, remote_node, revision, _num_shards) do
     key = {:remote_epoch_observed, remote_node}
 
     case :ets.lookup(replication_meta_table(name), key) do
       [{^key, current}] when current >= revision -> :ok
       _ -> :ets.insert(replication_meta_table(name), {key, revision})
-    end
-
-    for shard <- 0..(num_shards - 1) do
-      view_key = {:remote_view_info, shard, remote_node}
-
-      case :ets.lookup(replication_meta_table(name), view_key) do
-        [{^view_key, _generation, _authoritative, observed}] when observed >= revision ->
-          :ok
-
-        [{^view_key, generation, authoritative, _observed}] ->
-          :ets.insert(
-            replication_meta_table(name),
-            {view_key, generation, authoritative, revision}
-          )
-
-        [] ->
-          :ets.insert(
-            replication_meta_table(name),
-            {view_key, remote_generation(name, remote_node),
-             remote_cluster_epoch_revision(name, remote_node), revision}
-          )
-      end
     end
 
     :ok

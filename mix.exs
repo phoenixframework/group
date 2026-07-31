@@ -34,7 +34,8 @@ defmodule Group.MixProject do
 
   defp deps do
     [
-      {:ex_doc, "~> 0.30", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.30", only: :dev, runtime: false},
+      {:stream_data, "~> 1.4", only: :test}
     ]
   end
 

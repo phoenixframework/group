@@ -293,6 +293,9 @@ All operations are **eventually consistent**:
   `Group.Replica.Transport`, or `{module, opts}`. The default adapter uses
   `:erlang.send_nosuspend/3`; adapters must return promptly with `:ok`, `:busy`,
   or `:disconnected`. Dropped and busy frames are repaired by anti-entropy.
+  `Group.Replica.Transport.TCP` is an included sideband adapter with bounded
+  per-peer writer queues; its socket owners are separate processes, so socket
+  backpressure cannot block a Group shard.
 - **`replicated_oplog_max_entries`** — maximum retained replica records per
   shard across all local streams. Defaults to 65,536. Pruning never waits for
   peer acknowledgements; a peer behind the retained floor receives an exact
@@ -391,9 +394,13 @@ point-in-time value. The highest observed incremental revision is tracked
 separately and can never promote a partial view to exact authority. Discovery
 hints never mutate membership on their own. Authority installation fans a
 local fence to every lane, which sweeps only that lane's retained receive
-streams. Because PG rows intentionally do not carry protocol epochs, a
-superseded origin/cluster slice is cleared and its current cursor reset so the
-next head reconstructs it from retained deltas or an exact snapshot.
+streams. Shared authority may become visible before that fanout reaches a lane,
+but the lane's constant-size view is not marked installed until its purge
+finishes; data validation requires that marker. A heartbeat or lane hello can
+confirm an installed view but cannot promote a pending one. Because PG rows
+intentionally do not carry protocol epochs, a superseded origin/cluster slice
+is cleared and its current cursor reset so the next head reconstructs it from
+retained deltas or an exact snapshot.
 
 Replica state itself does not travel on the control plane. Once the hello is
 fenced, stream-head exchange on the replica transport catches the peer up.
@@ -412,10 +419,13 @@ tail even when no later write occurs. If the requested sequence is older than
 the bounded oplog floor, the origin sends an exact snapshot of only its own
 registry claims and PG memberships; absence from that snapshot is a delete.
 
-There are no leaders, quorum acknowledgements, tombstones, or known-membership
-retention barriers. Oplog memory is bounded locally and independently of slow
-peers. Deletes are normal ordered records while retained, and exact snapshots
-close gaps after pruning.
+There are no leaders, quorum acknowledgements, per-entry replicated tombstones,
+or known-membership retention barriers. Oplog memory is bounded locally and
+independently of slow peers. Deletes are normal ordered records while retained,
+and exact snapshots close gaps after pruning. Named-cluster close uses only a
+temporary local shard-completion barrier; the final shard removes it and all
+routing rows, including after a caller timeout or shard restart. Reconnect
+waits for that barrier so a prior close cannot erase newly accepted writes.
 
 The sender flush timer is mainly a fallback for idle periods. The unified
 outbound buffer also flushes immediately when it hits the configured size, when a new enqueue
@@ -429,6 +439,26 @@ not a correctness dependency; cluster epochs reject data racing a disconnect
 or reconnect, and generation fencing rejects data from a restarted origin.
 An alternative sideband adapter authenticates the peer as a dist-Erlang node
 and calls `Group.Replica.Transport.deliver/4` locally.
+
+For example, replica data can use the included sideband TCP adapter while
+authority and membership remain on dist Erlang:
+
+```elixir
+replica_transport:
+  {Group.Replica.Transport.TCP,
+   [
+     ip: {0, 0, 0, 0},
+     advertised_ip: {10, 0, 1, 12},
+     port: 44_321,
+     max_queue: 1_024
+   ]}
+```
+
+Each node advertises its own reachable address. TCP frames are capability
+authenticated by the dist-Erlang hello but are not encrypted, so use a trusted
+network or place the connection behind TLS. The adapter deliberately has no
+control/data ordering relationship; the generation/epoch lane barrier and
+stream sequence checks supply correctness.
 
 ### Named Cluster TTL Leases
 
@@ -466,7 +496,8 @@ mix test
 ```
 
 See [`test/README.md`](test/README.md) for details on the distributed test
-infrastructure.
+infrastructure, shrinkable StreamData lifecycle-model tests, and the bounded
+TLA+ anti-entropy model.
 
 ## Benchmarks
 
