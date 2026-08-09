@@ -939,6 +939,49 @@ defmodule Group.Replica.Data do
     Enum.uniq(Enum.map(existing, &elem(&1, 0)) ++ Enum.map(claims, &elem(&1, 0)))
   end
 
+  def replace_registry_claims_for_stream_from_staging(
+        name,
+        shard,
+        stream_id,
+        snapshot_seq,
+        staging_table,
+        chunk_count
+      ) do
+    cluster = Group.Replica.Protocol.stream_cluster(stream_id)
+    origin_node = Group.Replica.Protocol.stream_origin(stream_id)
+    generation = Group.Replica.Protocol.stream_generation(stream_id)
+    epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+    existing = registry_claims_for_stream(name, shard, stream_id)
+
+    keys =
+      Enum.reduce(existing, MapSet.new(), fn {key, pid, _meta, _time}, keys ->
+        :ets.delete(
+          reg_claim_by_key_table(name, shard),
+          {cluster, key, origin_node, generation, epoch}
+        )
+
+        :ets.delete(
+          reg_claim_by_pid_table(name, shard),
+          {pid, cluster, key, origin_node, generation, epoch}
+        )
+
+        MapSet.put(keys, key)
+      end)
+
+    keys =
+      Group.Replica.Snapshot.fold_registry(
+        staging_table,
+        chunk_count,
+        keys,
+        fn {key, pid, meta, time}, keys ->
+          put_registry_claim(name, shard, stream_id, snapshot_seq, key, pid, meta, time)
+          MapSet.put(keys, key)
+        end
+      )
+
+    MapSet.to_list(keys)
+  end
+
   def purge_registry_claims_for_origin(name, shard, origin_node) do
     claims =
       :ets.select(reg_claim_by_key_table(name, shard), [

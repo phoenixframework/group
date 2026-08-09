@@ -2356,7 +2356,7 @@ defmodule GroupTest do
                       {:erlang, :send_nosuspend,
                        [
                          {^shard_name, ^local_node},
-                         {:group_replica_frame, ^local_node, {:delta_batch, 1, runs}},
+                         {:group_replica_frame, ^local_node, {:delta_batch, _version, runs}},
                          [:noconnect]
                        ]}},
                      1_000

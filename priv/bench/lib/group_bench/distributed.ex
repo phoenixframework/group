@@ -67,6 +67,23 @@ defmodule GroupBench.Distributed do
     IO.puts("\n  Done.\n")
   end
 
+  def run_snapshot_sync_only(opts \\ []) do
+    shards = Keyword.get(opts, :shards, 1)
+    entries = Keyword.get(opts, :entries, 50_000)
+    Process.put(:bench_shards, shards)
+
+    header("Distributed Exact-Snapshot Benchmark")
+    IO.puts("  coordinator: #{node()}")
+    IO.puts("  shards:      #{shards}")
+    IO.puts("  entries:     #{format_number(entries)}")
+    IO.puts("  schedulers:  #{System.schedulers_online()}")
+
+    connect_replicas()
+    bench_snapshot_sync(@replicas, entries)
+
+    IO.puts("\n  Done.\n")
+  end
+
   # ── Connection ────────────────────────────────────────────────────────
 
   defp connect_replicas do
@@ -206,6 +223,48 @@ defmodule GroupBench.Distributed do
 
       stop_groups(replicas)
     end
+  end
+
+  defp bench_snapshot_sync([r1, r2] = replicas, key_count) do
+    header("Exact Snapshot (receiver below oplog floor)")
+    subheader("#{format_number(key_count)} keys")
+
+    start_group_on(r1,
+      replicated_oplog_max_entries: 64,
+      replicated_anti_entropy_interval: 100,
+      replicated_peer_lease_timeout: 15_000
+    )
+
+    :erpc.call(
+      r1,
+      GroupBench.Replica,
+      :bulk_register,
+      [@name, key_count, "snapshot-"],
+      180_000
+    )
+
+    {sync_us, _} =
+      :timer.tc(fn ->
+        start_group_on(r2,
+          replicated_oplog_max_entries: 64,
+          replicated_anti_entropy_interval: 100,
+          replicated_peer_lease_timeout: 15_000
+        )
+
+        poll_until(
+          fn ->
+            :erpc.call(r2, GroupBench.Replica, :total_registry_count, [@name]) >= key_count
+          end,
+          120_000
+        )
+      end)
+
+    rate = if sync_us > 0, do: round(key_count * 1_000_000 / sync_us), else: 0
+
+    IO.puts("  sync time:  #{format_number(div(sync_us, 1000))} ms")
+    IO.puts("  keys/sec:   #{format_number(rate)}")
+
+    stop_groups(replicas)
   end
 
   # ── 3. Concurrent cross-node writes ──────────────────────────────────

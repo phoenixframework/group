@@ -16,6 +16,11 @@ defmodule Group.Replica.Transport do
   and sequences each origin/generation/shard/cluster/epoch stream; receivers
   discard duplicates and request gaps. Per-shard ordered delivery avoids repair
   traffic and is therefore the preferred fast path.
+
+  A sideband implementation can delegate `try_send/5` to
+  `Group.Replica.Transport.Outbox.try_send/5`. That adds one local send only for
+  the configured sideband transport; the default distribution adapter retains
+  its direct remote `:erlang.send_nosuspend/3` path.
   """
 
   @type frame :: term()
@@ -47,6 +52,24 @@ defmodule Group.Replica.Transport do
   def deliver(group, source_node, shard, frame)
       when is_atom(group) and is_atom(source_node) and is_integer(shard) and shard >= 0 do
     send(Group.Replica.shard_name(group, shard), {:group_replica_frame, source_node, frame})
+    :ok
+  end
+
+  @doc """
+  Delivers a complete batch received from one authenticated peer.
+
+  A finite-frame transport may segment the encoded batch on the wire, but it
+  must authenticate the peer and reassemble every segment before calling this
+  function. Group never observes or applies a partial batch.
+  """
+  def deliver_batch(group, source_node, shard, frames)
+      when is_atom(group) and is_atom(source_node) and is_integer(shard) and shard >= 0 and
+             is_list(frames) do
+    send(
+      Group.Replica.shard_name(group, shard),
+      {:group_replica_batch, source_node, frames}
+    )
+
     :ok
   end
 

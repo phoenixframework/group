@@ -9,6 +9,7 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 metadir="${repo_root}/tmp/tlc"
 config="${TLA_CONFIG:-${repo_root}/test/formal/GroupAntiEntropy.cfg}"
+spec="${TLA_SPEC:-${repo_root}/test/formal/GroupAntiEntropy.tla}"
 mkdir -p "${metadir}"
 
 exec java -XX:+UseParallelGC -cp "${TLA_JAR}" tlc2.TLC \
@@ -16,4 +17,4 @@ exec java -XX:+UseParallelGC -cp "${TLA_JAR}" tlc2.TLC \
   -metadir "${metadir}" \
   -workers "${TLC_WORKERS:-4}" \
   -config "${config}" \
-  "${repo_root}/test/formal/GroupAntiEntropy.tla"
+  "${spec}"

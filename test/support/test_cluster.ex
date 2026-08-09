@@ -54,6 +54,12 @@ defmodule Group.TestCluster do
     end)
   end
 
+  @doc false
+  def resume_if_alive(pid) when is_pid(pid) do
+    if Process.alive?(pid), do: :sys.resume(pid)
+    :ok
+  end
+
   @doc "Call a function on a remote node, raise on badrpc"
   def rpc!(node, mod, fun, args) do
     case :rpc.call(node, mod, fun, args) do
@@ -501,6 +507,22 @@ defmodule Group.TestCluster do
 
       :ok
     end)
+  end
+
+  @doc false
+  def kill_shard_with_snapshot_staging(name, shard_index) do
+    shard = Process.whereis(Group.Replica.shard_name(name, shard_index))
+    state = :sys.get_state(shard)
+    {_key, transfer} = Enum.at(state.snapshot_transfers, 0)
+    monitor = Process.monitor(shard)
+    Process.exit(shard, :kill)
+
+    receive do
+      {:DOWN, ^monitor, :process, ^shard, :killed} ->
+        {shard, :ets.info(transfer.table)}
+    after
+      5_000 -> raise "snapshot staging owner did not terminate"
+    end
   end
 
   @doc "Returns the current message_queue_len for a shard on a remote node."

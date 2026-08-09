@@ -62,23 +62,120 @@ defmodule Group.MutationCampaign do
     %{
       name: "registry_snapshot_is_additive",
       file: "lib/group/replica/data.ex",
-      correct_source: "existing = registry_claims_for_stream(name, shard, stream_id)",
-      faulty_source: "existing = []",
-      test: ["test/distributed_test.exs:4030"]
+      correct_source: "Enum.reduce(existing, MapSet.new(), fn {key, pid, _meta, _time}, keys ->",
+      faulty_source:
+        "Enum.reduce(Enum.take(existing, 0), MapSet.new(), fn {key, pid, _meta, _time}, keys ->",
+      test: ["test/replica_snapshot_distributed_test.exs:16"]
     },
     %{
       name: "pg_snapshot_is_additive",
       file: "lib/group/replica.ex",
+      correct_source: "Enum.reduce(current, events, fn {key, pid, old_meta, _old_time}, acc ->",
+      faulty_source:
+        "Enum.reduce(Enum.take(current, 0), events, fn {key, pid, old_meta, _old_time}, acc ->",
+      test: ["test/replica_snapshot_distributed_test.exs:16"]
+    },
+    %{
+      name: "single_chunk_registry_snapshot_is_additive",
+      file: "lib/group/replica/data.ex",
+      correct_source: "Enum.each(existing, fn {key, pid, _meta, _time} ->",
+      faulty_source: "Enum.each(Enum.take(existing, 0), fn {key, pid, _meta, _time} ->",
+      test: ["test/distributed_test.exs:4030"]
+    },
+    %{
+      name: "single_chunk_pg_snapshot_is_additive",
+      file: "lib/group/replica.ex",
+      correct_source: "      current\n      |> Map.keys()\n",
+      faulty_source: "      %{}\n      |> Map.keys()\n",
+      test: ["test/distributed_test.exs:4030"]
+    },
+    %{
+      name: "commit_incomplete_snapshot",
+      file: "lib/group/replica.ex",
       correct_source: """
-          current =
-            state.name
-            |> Data.pg_entries_for_origin(state.shard_index, cluster, source_node)
-            |> Map.new(fn {key, pid, meta, time} -> {{key, pid}, {meta, time}} end)
+          if MapSet.size(transfer.received) == transfer.chunk_count do
+            if transfer.registry_seen == transfer.registry_count and
+                 transfer.pg_seen == transfer.pg_count do
+              commit_snapshot_transfer(state, key, source_node, stream_id, transfer)
+            else
+              discard_snapshot_transfer(state, key)
+            end
+          else
+            state
+          end
       """,
       faulty_source: """
-          current = %{}
+          if MapSet.size(transfer.received) >= 1 do
+            commit_snapshot_transfer(state, key, source_node, stream_id, transfer)
+          else
+            state
+          end
       """,
-      test: ["test/distributed_test.exs:4030"]
+      test: ["test/replica_snapshot_distributed_test.exs:16"]
+    },
+    %{
+      name: "allow_duplicate_snapshot_rows",
+      file: "lib/group/replica/snapshot.ex",
+      correct_source: """
+          if :ets.insert_new(table, objects) and
+               :ets.info(table, :size) - size_before == length(objects) do
+      """,
+      faulty_source: """
+          if :ets.insert(table, objects) and size_before >= 0 do
+      """,
+      test: ["test/replica_snapshot_distributed_test.exs:164"]
+    },
+    %{
+      name: "do_not_supersede_partial_snapshot",
+      file: "lib/group/replica.ex",
+      correct_source: """
+            %{snapshot_seq: existing_seq} when existing_seq < snapshot_seq ->
+              state = discard_snapshot_transfer(state, key)
+              {:ok, state, new_snapshot_transfer(snapshot_seq, manifest)}
+      """,
+      faulty_source: """
+            %{snapshot_seq: existing_seq} when existing_seq < snapshot_seq ->
+              _ = existing_seq
+              {:ignore, state}
+      """,
+      test: ["test/replica_snapshot_distributed_test.exs:107"]
+    },
+    %{
+      name: "accept_stale_snapshot_authority",
+      file: "lib/group/replica.ex",
+      correct_source: """
+        defp valid_snapshot_stream?(state, source_node, stream_id, snapshot_seq) do
+          valid_remote_stream?(state, source_node, stream_id) and
+            snapshot_seq > Data.replica_cursor(state.name, state.shard_index, stream_id)
+        end
+      """,
+      faulty_source: """
+        defp valid_snapshot_stream?(state, _source_node, stream_id, snapshot_seq) do
+          snapshot_seq > Data.replica_cursor(state.name, state.shard_index, stream_id)
+        end
+      """,
+      test: ["test/replica_snapshot_distributed_test.exs:202"]
+    },
+    %{
+      name: "disable_snapshot_staging_expiry",
+      file: "lib/group/replica.ex",
+      correct_source: """
+            if now - transfer.last_progress > acc.replicated_peer_lease_timeout do
+              discard_snapshot_transfer(acc, key)
+            else
+              acc
+            end
+      """,
+      faulty_source: """
+            _ = {now, transfer}
+
+            if Process.get(:force_snapshot_staging_expiry, false) do
+              discard_snapshot_transfer(acc, key)
+            else
+              acc
+            end
+      """,
+      test: ["test/replica_snapshot_distributed_test.exs:202"]
     },
     %{
       name: "disable_below_floor_snapshot",
@@ -157,6 +254,32 @@ defmodule Group.MutationCampaign do
           :ok
       """,
       test: ["test/distributed_test.exs:5531"]
+    },
+    %{
+      name: "assume_authority_fanout_reaches_late_lane",
+      file: "lib/group/replica.ex",
+      correct_source: """
+        defp install_current_replica_lane(state, remote_node, generation) do
+          old_generation =
+            Data.remote_view_generation(state.name, state.shard_index, remote_node)
+
+          state = maybe_purge_remote_generation(state, remote_node, old_generation, generation)
+          state = purge_remote_streams_outside_authority(state, remote_node)
+          :ok = install_replica_view(state, remote_node, generation)
+
+          state
+          |> touch_replica_peer(remote_node)
+          |> Map.update!(:cluster_control_dirty, &Map.delete(&1, remote_node))
+          |> send_replica_heads(remote_node)
+        end
+      """,
+      faulty_source: """
+        defp install_current_replica_lane(state, remote_node, generation) do
+          _ = {remote_node, generation}
+          state
+        end
+      """,
+      test: ["test/replica_snapshot_distributed_test.exs:329"]
     },
     %{
       name: "skip_generation_purge",

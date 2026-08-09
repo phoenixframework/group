@@ -37,6 +37,14 @@ To isolate the 10,000-cluster lifecycle scenario:
   --coordinator-expr 'GroupBench.Distributed.run_many_clusters_only(shards: 4)'
 ```
 
+To measure the exact-snapshot fallback independently (one shard models one
+busy lane of a much larger sharded deployment):
+
+```bash
+./run_distributed.sh --shards 1 \
+  --coordinator-expr 'GroupBench.Distributed.run_snapshot_sync_only(shards: 1, entries: 50000)'
+```
+
 ## Local Scenarios
 
 All local benchmarks run for both the default (nil) cluster and a named cluster

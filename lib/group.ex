@@ -229,9 +229,14 @@ defmodule Group do
   - `:replica_transport` — replica data transport module or `{module, opts}` tuple.
     Defaults to `Group.Replica.Transport.Distribution`. The transport must be
     nonblocking and may return `:busy`; anti-entropy repairs dropped frames.
+    Sideband transports can use `Group.Replica.Transport.Outbox` for lossy,
+    batched, per-shard isolation without adding a hop to the default transport.
   - `:replicated_oplog_max_entries` — maximum retained replica records per shard
     before old prefixes are pruned and lagging peers require a snapshot
     (default: `65_536`)
+  - `:replicated_snapshot_chunk_target_bytes` — target maximum encoded size of
+    each transport-neutral exact-snapshot chunk (default: `1_048_576`). A
+    single registry or membership row larger than the target remains one chunk.
   - `:replicated_anti_entropy_interval` — milliseconds between repeated stream
     head advertisements (default: `1_000`)
   - `:replicated_peer_lease_timeout` — milliseconds without a dist-Erlang

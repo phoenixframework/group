@@ -60,14 +60,17 @@ defmodule Group.Replica do
   - heads advertises {stream, retained_floor, head}.
   - delta_batch carries one or more contiguous stream runs.
   - need requests the receiver's next missing sequence.
-  - snapshot exactly replaces one origin's registry claims and PG slice when
-    the requested prefix has already been pruned.
+  - snapshot_chunk carries a byte-bounded part of one exact origin slice when
+    the requested prefix has already been pruned. Receivers stage chunks in a
+    private ETS table and expose nothing until every chunk is present.
 
   Every stream field is validated against the authenticated source node and
   current generation/epoch. An old generation, a closed epoch, a wrong shard,
   or a transitive claim for another node's pid is rejected. Control/data
   reordering is safe: early frames are ignored and repeated heads repair them;
-  late frames fail their generation or epoch fence.
+  late frames fail their generation or epoch fence. Snapshot chunks may be
+  lost, duplicated, reordered, or mixed across retransmissions at the same
+  stream head; exact row counts and set insertion prevent partial commits.
 
   ## Bounded recovery
 
@@ -117,13 +120,13 @@ defmodule Group.Replica do
   yielding. FIFO is preserved within the local request lane, while protocol and
   cluster barriers flush earlier buffered state first.
 
-  Receive-only handlers for the previous direct batch/snapshot messages remain
-  for rolling compatibility and tests; protocol v1 never emits them.
+  Snapshot staging is owned by the receiving shard, expires after a peer lease
+  without progress, and disappears automatically if the shard crashes.
   """
 
   require Logger
 
-  alias Group.Replica.{Data, Protocol}
+  alias Group.Replica.{Data, Protocol, Snapshot}
 
   defstruct [
     :name,
@@ -137,6 +140,7 @@ defmodule Group.Replica do
     :replicated_sender_flush_interval,
     :replicated_pg_receiver_local_request_quota,
     :replicated_oplog_max_entries,
+    :replicated_snapshot_chunk_target_bytes,
     :replicated_anti_entropy_interval,
     :replicated_peer_lease_timeout,
     :replica_transport,
@@ -159,7 +163,8 @@ defmodule Group.Replica do
     cluster_control_dirty: %{},
     authority_dirty_notified: MapSet.new(),
     monitors: %{},
-    peer_transports: %{}
+    peer_transports: %{},
+    snapshot_transfers: %{}
   ]
 
   def start_link(opts) do
@@ -240,6 +245,7 @@ defmodule Group.Replica do
       replicated_pg_receiver_local_request_quota:
         config.replicated_pg_receiver_local_request_quota,
       replicated_oplog_max_entries: config.replicated_oplog_max_entries,
+      replicated_snapshot_chunk_target_bytes: config.replicated_snapshot_chunk_target_bytes,
       replicated_anti_entropy_interval: config.replicated_anti_entropy_interval,
       replicated_peer_lease_timeout: config.replicated_peer_lease_timeout,
       replica_transport: elem(config.replica_transport, 0),
@@ -473,9 +479,10 @@ defmodule Group.Replica do
           {:noreply, state}
 
         replica_authority_current?(state, remote_node, generation, epoch_revision) ->
-          # Shared authority arrived first; its local fanout is already the
-          # ordered marker that will purge and install this lane's view.
-          {:noreply, state}
+          # The shared authority can arrive before this sibling is registered,
+          # so shard-zero fanout is intentionally lossy at startup. Rebuild
+          # this lane directly from the exact shared authority.
+          {:noreply, install_current_replica_lane(state, remote_node, generation)}
 
         true ->
           {:noreply, request_replica_authority(state, remote_node)}
@@ -768,10 +775,17 @@ defmodule Group.Replica do
     {:noreply, take_priority_turn(state)}
   end
 
+  def handle_info({:group_replica_batch, remote_node, frames}, state)
+      when is_atom(remote_node) and is_list(frames) do
+    state = Enum.reduce(frames, state, &handle_replica_frame(&2, remote_node, &1))
+    {:noreply, take_priority_turn(state)}
+  end
+
   def handle_info({@anti_entropy_timer, ref}, state) do
     state =
       if state.anti_entropy_ref == ref do
         state
+        |> expire_stale_snapshot_transfers()
         |> expire_stale_replica_peers()
         |> probe_replica_peers()
         |> request_quiet_cluster_hellos()
@@ -2952,6 +2966,20 @@ defmodule Group.Replica do
     )
   end
 
+  defp install_current_replica_lane(state, remote_node, generation) do
+    old_generation =
+      Data.remote_view_generation(state.name, state.shard_index, remote_node)
+
+    state = maybe_purge_remote_generation(state, remote_node, old_generation, generation)
+    state = purge_remote_streams_outside_authority(state, remote_node)
+    :ok = install_replica_view(state, remote_node, generation)
+
+    state
+    |> touch_replica_peer(remote_node)
+    |> Map.update!(:cluster_control_dirty, &Map.delete(&1, remote_node))
+    |> send_replica_heads(remote_node)
+  end
+
   defp schedule_anti_entropy(state) do
     ref = make_ref()
 
@@ -3116,7 +3144,45 @@ defmodule Group.Replica do
     end)
   end
 
+  defp expire_stale_snapshot_transfers(%{snapshot_transfers: transfers} = state)
+       when map_size(transfers) == 0,
+       do: state
+
+  defp expire_stale_snapshot_transfers(state) do
+    now = monotonic_millis()
+
+    Enum.reduce(state.snapshot_transfers, state, fn {key, transfer}, acc ->
+      if now - transfer.last_progress > acc.replicated_peer_lease_timeout do
+        discard_snapshot_transfer(acc, key)
+      else
+        acc
+      end
+    end)
+  end
+
+  defp discard_snapshot_transfer(state, key) do
+    case Map.pop(state.snapshot_transfers, key) do
+      {nil, transfers} ->
+        %{state | snapshot_transfers: transfers}
+
+      {transfer, transfers} ->
+        :ok = Snapshot.delete_staging_table(transfer.table)
+        %{state | snapshot_transfers: transfers}
+    end
+  end
+
+  defp discard_snapshot_transfers_for_source(state, source_node) do
+    Enum.reduce(state.snapshot_transfers, state, fn
+      {{^source_node, _stream_id} = key, _transfer}, acc ->
+        discard_snapshot_transfer(acc, key)
+
+      {_key, _transfer}, acc ->
+        acc
+    end)
+  end
+
   defp expire_replica_peer(state, remote_node) do
+    state = discard_snapshot_transfers_for_source(state, remote_node)
     %{name: name, shard_index: shard} = state
 
     if shard == 0 do
@@ -3268,44 +3334,279 @@ defmodule Group.Replica do
   defp handle_replica_frame(
          state,
          source_node,
-         {:snapshot, version, stream_id, snapshot_seq, reg_data, pg_data}
+         {:snapshot_chunk, version, stream_id, snapshot_seq, chunk_index, chunk_count,
+          registry_count, pg_count, reg_data, pg_data}
        )
-       when version == @protocol_version do
-    if valid_remote_stream?(state, source_node, stream_id) and
-         snapshot_seq >= Data.replica_cursor(state.name, state.shard_index, stream_id) do
-      state = flush_pending_replicated_barrier(state)
-      cluster = Protocol.stream_cluster(stream_id)
-
-      reg_data =
-        Enum.filter(reg_data, fn {key, pid, _meta, _time} ->
-          node(pid) == source_node and
-            shard_index_for(cluster, key, state.num_shards) == state.shard_index
-        end)
-
-      affected_registry_keys =
-        Data.replace_registry_claims_for_stream(
-          state.name,
-          state.shard_index,
+       when version == @protocol_version and is_integer(snapshot_seq) and snapshot_seq >= 0 and
+              is_integer(chunk_index) and is_integer(chunk_count) and
+              is_integer(registry_count) and is_integer(pg_count) and is_list(reg_data) and
+              is_list(pg_data) do
+    if valid_snapshot_stream?(state, source_node, stream_id, snapshot_seq) and
+         valid_snapshot_manifest?(
+           chunk_index,
+           chunk_count,
+           registry_count,
+           pg_count,
+           reg_data,
+           pg_data
+         ) and
+         valid_snapshot_rows?(state, source_node, stream_id, reg_data, pg_data) do
+      if chunk_count == 1 and registry_count == length(reg_data) and
+           pg_count == length(pg_data) do
+        apply_complete_snapshot_rows(
+          state,
+          source_node,
           stream_id,
           snapshot_seq,
-          reg_data
+          reg_data,
+          pg_data
         )
-
-      {state, events} =
-        Enum.reduce(affected_registry_keys, {state, []}, fn key, {acc, inner_events} ->
-          reconcile_registry_projection(acc, cluster, key, :reconcile, inner_events)
-        end)
-
-      events = replace_remote_pg_snapshot(state, source_node, cluster, pg_data, events)
-      :ok = Data.put_replica_cursor(state.name, state.shard_index, stream_id, snapshot_seq)
-      notify_monitors(state.name, events)
-      state
+      else
+        stage_replica_snapshot_chunk(
+          state,
+          source_node,
+          stream_id,
+          snapshot_seq,
+          chunk_index,
+          chunk_count,
+          registry_count,
+          pg_count,
+          reg_data,
+          pg_data
+        )
+      end
     else
       state
     end
   end
 
   defp handle_replica_frame(state, _source_node, _frame), do: state
+
+  defp valid_snapshot_stream?(state, source_node, stream_id, snapshot_seq) do
+    valid_remote_stream?(state, source_node, stream_id) and
+      snapshot_seq > Data.replica_cursor(state.name, state.shard_index, stream_id)
+  end
+
+  defp valid_snapshot_manifest?(
+         chunk_index,
+         chunk_count,
+         registry_count,
+         pg_count,
+         reg_data,
+         pg_data
+       ) do
+    total_count = registry_count + pg_count
+    chunk_row_count = length(reg_data) + length(pg_data)
+
+    chunk_count > 0 and chunk_index > 0 and chunk_index <= chunk_count and
+      registry_count >= 0 and pg_count >= 0 and
+      chunk_count <= max(total_count, 1) and
+      ((total_count == 0 and chunk_count == 1 and chunk_row_count == 0) or
+         (total_count > 0 and chunk_row_count > 0))
+  end
+
+  defp valid_snapshot_rows?(state, source_node, stream_id, reg_data, pg_data) do
+    cluster = Protocol.stream_cluster(stream_id)
+
+    Enum.all?(reg_data, fn
+      {key, pid, _meta, _time} when is_pid(pid) ->
+        node(pid) == source_node and
+          shard_index_for(cluster, key, state.num_shards) == state.shard_index
+
+      _other ->
+        false
+    end) and
+      Enum.all?(pg_data, fn
+        {key, pid, _meta, _time} when is_pid(pid) ->
+          node(pid) == source_node and
+            shard_index_for(cluster, key, state.num_shards) == state.shard_index
+
+        _other ->
+          false
+      end)
+  end
+
+  defp stage_replica_snapshot_chunk(
+         state,
+         source_node,
+         stream_id,
+         snapshot_seq,
+         chunk_index,
+         chunk_count,
+         registry_count,
+         pg_count,
+         reg_data,
+         pg_data
+       ) do
+    key = {source_node, stream_id}
+    manifest = {chunk_count, registry_count, pg_count}
+
+    case snapshot_transfer(state, key, snapshot_seq, manifest) do
+      {:ignore, state} ->
+        state
+
+      {:ok, state, transfer} ->
+        cond do
+          MapSet.member?(transfer.received, chunk_index) ->
+            state
+
+          transfer.registry_seen + length(reg_data) > registry_count or
+              transfer.pg_seen + length(pg_data) > pg_count ->
+            discard_snapshot_transfer(state, key)
+
+          true ->
+            case Snapshot.stage_rows(transfer.table, chunk_index, reg_data, pg_data) do
+              :ok ->
+                transfer = %{
+                  transfer
+                  | received: MapSet.put(transfer.received, chunk_index),
+                    registry_seen: transfer.registry_seen + length(reg_data),
+                    pg_seen: transfer.pg_seen + length(pg_data),
+                    last_progress: monotonic_millis()
+                }
+
+                state = put_snapshot_transfer(state, key, transfer)
+                maybe_commit_snapshot_transfer(state, key, source_node, stream_id)
+
+              {:error, :duplicate_row} ->
+                discard_snapshot_transfer(state, key)
+            end
+        end
+    end
+  end
+
+  defp snapshot_transfer(state, key, snapshot_seq, manifest) do
+    case Map.get(state.snapshot_transfers, key) do
+      nil ->
+        {:ok, state, new_snapshot_transfer(snapshot_seq, manifest)}
+
+      %{snapshot_seq: existing_seq} when existing_seq > snapshot_seq ->
+        {:ignore, state}
+
+      %{snapshot_seq: existing_seq} when existing_seq < snapshot_seq ->
+        state = discard_snapshot_transfer(state, key)
+        {:ok, state, new_snapshot_transfer(snapshot_seq, manifest)}
+
+      %{manifest: ^manifest} = transfer ->
+        {:ok, state, transfer}
+
+      _conflicting_transfer ->
+        {:ignore, discard_snapshot_transfer(state, key)}
+    end
+  end
+
+  defp new_snapshot_transfer(snapshot_seq, {chunk_count, registry_count, pg_count} = manifest) do
+    %{
+      snapshot_seq: snapshot_seq,
+      manifest: manifest,
+      chunk_count: chunk_count,
+      registry_count: registry_count,
+      pg_count: pg_count,
+      registry_seen: 0,
+      pg_seen: 0,
+      received: MapSet.new(),
+      last_progress: monotonic_millis(),
+      table: Snapshot.new_staging_table()
+    }
+  end
+
+  defp put_snapshot_transfer(state, key, transfer) do
+    %{state | snapshot_transfers: Map.put(state.snapshot_transfers, key, transfer)}
+  end
+
+  defp maybe_commit_snapshot_transfer(state, key, source_node, stream_id) do
+    transfer = Map.fetch!(state.snapshot_transfers, key)
+
+    if MapSet.size(transfer.received) == transfer.chunk_count do
+      if transfer.registry_seen == transfer.registry_count and
+           transfer.pg_seen == transfer.pg_count do
+        commit_snapshot_transfer(state, key, source_node, stream_id, transfer)
+      else
+        discard_snapshot_transfer(state, key)
+      end
+    else
+      state
+    end
+  end
+
+  defp commit_snapshot_transfer(state, key, source_node, stream_id, transfer) do
+    state =
+      if valid_snapshot_stream?(state, source_node, stream_id, transfer.snapshot_seq) do
+        state = flush_pending_replicated_barrier(state)
+        cluster = Protocol.stream_cluster(stream_id)
+
+        affected_registry_keys =
+          Data.replace_registry_claims_for_stream_from_staging(
+            state.name,
+            state.shard_index,
+            stream_id,
+            transfer.snapshot_seq,
+            transfer.table,
+            transfer.chunk_count
+          )
+
+        {state, events} =
+          Enum.reduce(affected_registry_keys, {state, []}, fn key, {acc, inner_events} ->
+            reconcile_registry_projection(acc, cluster, key, :reconcile, inner_events)
+          end)
+
+        events =
+          replace_remote_pg_snapshot_from_staging(
+            state,
+            source_node,
+            cluster,
+            transfer.table,
+            transfer.chunk_count,
+            events
+          )
+
+        :ok =
+          Data.put_replica_cursor(
+            state.name,
+            state.shard_index,
+            stream_id,
+            transfer.snapshot_seq
+          )
+
+        notify_monitors(state.name, events)
+        state
+      else
+        state
+      end
+
+    discard_snapshot_transfer(state, key)
+  end
+
+  defp apply_complete_snapshot_rows(
+         state,
+         source_node,
+         stream_id,
+         snapshot_seq,
+         reg_data,
+         pg_data
+       ) do
+    state = flush_pending_replicated_barrier(state)
+    cluster = Protocol.stream_cluster(stream_id)
+
+    affected_registry_keys =
+      Data.replace_registry_claims_for_stream(
+        state.name,
+        state.shard_index,
+        stream_id,
+        snapshot_seq,
+        reg_data
+      )
+
+    {state, events} =
+      Enum.reduce(affected_registry_keys, {state, []}, fn key, {acc, inner_events} ->
+        reconcile_registry_projection(acc, cluster, key, :reconcile, inner_events)
+      end)
+
+    events = replace_remote_pg_snapshot_rows(state, source_node, cluster, pg_data, events)
+    :ok = Data.put_replica_cursor(state.name, state.shard_index, stream_id, snapshot_seq)
+    notify_monitors(state.name, events)
+    state
+  end
 
   defp apply_replica_delta_run(state, source_node, stream_id, records, advertised_head) do
     if valid_remote_stream?(state, source_node, stream_id) do
@@ -3624,33 +3925,117 @@ defmodule Group.Replica do
 
   defp send_replica_snapshot(state, target_node, stream_id, head) do
     cluster = Protocol.stream_cluster(stream_id)
-
-    {_reg_by_cluster, pg_by_cluster} =
-      Data.local_data_by_cluster(state.name, state.shard_index, [cluster])
-
     reg_data = Data.registry_claims_for_stream(state.name, state.shard_index, stream_id)
+    pg_data = Data.pg_entries_for_origin(state.name, state.shard_index, cluster, node())
 
-    try_send_replica_frame(
-      state,
-      target_node,
-      {:snapshot, Protocol.version(), stream_id, head, reg_data,
-       Map.get(pg_by_cluster, cluster, [])}
-    )
+    envelope_bytes =
+      Snapshot.frame_envelope_bytes(stream_id, head, length(reg_data), length(pg_data))
+
+    snapshot =
+      Snapshot.chunk_rows(
+        reg_data,
+        pg_data,
+        state.replicated_snapshot_chunk_target_bytes,
+        envelope_bytes
+      )
+
+    chunk_count = length(snapshot.chunks)
+
+    snapshot.chunks
+    |> Enum.with_index(1)
+    |> Enum.reduce(state, fn {{reg_chunk, pg_chunk}, chunk_index}, acc ->
+      try_send_replica_frame(
+        acc,
+        target_node,
+        {:snapshot_chunk, Protocol.version(), stream_id, head, chunk_index, chunk_count,
+         snapshot.registry_count, snapshot.pg_count, reg_chunk, pg_chunk}
+      )
+    end)
   end
 
-  defp replace_remote_pg_snapshot(state, source_node, cluster, pg_data, events) do
+  defp replace_remote_pg_snapshot_from_staging(
+         state,
+         source_node,
+         cluster,
+         staging_table,
+         chunk_count,
+         events
+       ) do
+    current = Data.pg_entries_for_origin(state.name, state.shard_index, cluster, source_node)
+
+    events =
+      Snapshot.fold_pg(staging_table, chunk_count, events, fn {key, pid, meta, time}, acc ->
+        case Data.pg_lookup(state.name, state.shard_index, cluster, key, pid) do
+          nil ->
+            :ok =
+              Data.pg_insert(
+                state.name,
+                state.shard_index,
+                cluster,
+                key,
+                pid,
+                meta,
+                time,
+                source_node
+              )
+
+            [build_event(state.name, :joined, key, pid, meta, %{cluster: cluster}) | acc]
+
+          {^meta, ^time, ^source_node} ->
+            acc
+
+          {old_meta, _old_time, ^source_node} ->
+            :ok =
+              Data.pg_insert(
+                state.name,
+                state.shard_index,
+                cluster,
+                key,
+                pid,
+                meta,
+                time,
+                source_node
+              )
+
+            if old_meta == meta do
+              acc
+            else
+              [
+                build_event(state.name, :joined, key, pid, meta, %{
+                  previous_meta: old_meta,
+                  cluster: cluster
+                })
+                | acc
+              ]
+            end
+        end
+      end)
+
+    Enum.reduce(current, events, fn {key, pid, old_meta, _old_time}, acc ->
+      if Snapshot.member_pg?(staging_table, key, pid) do
+        acc
+      else
+        :ok = Data.pg_delete(state.name, state.shard_index, cluster, key, pid)
+
+        event =
+          build_event(state.name, :left, key, pid, old_meta, %{
+            reason: :reconcile,
+            cluster: cluster
+          })
+
+        [event | acc]
+      end
+    end)
+  end
+
+  defp replace_remote_pg_snapshot_rows(state, source_node, cluster, pg_data, events) do
     current =
       state.name
       |> Data.pg_entries_for_origin(state.shard_index, cluster, source_node)
       |> Map.new(fn {key, pid, meta, time} -> {{key, pid}, {meta, time}} end)
 
     desired =
-      pg_data
-      |> Enum.filter(fn {key, pid, _meta, _time} ->
-        node(pid) == source_node and
-          shard_index_for(cluster, key, state.num_shards) == state.shard_index
-      end)
-      |> Map.new(fn {key, pid, meta, time} -> {{key, pid}, {meta, time}} end)
+      Map.new(pg_data, fn {key, pid, meta, time} -> {{key, pid}, {meta, time}} end)
 
     {inserts, deletes, events} =
       current
@@ -4029,7 +4414,10 @@ defmodule Group.Replica do
     %{name: name, shard_index: shard_index, num_shards: num_shards} = state
 
     for i <- 0..(num_shards - 1), i != shard_index do
-      send(shard_name(name, i), message)
+      case Process.whereis(shard_name(name, i)) do
+        pid when is_pid(pid) -> send(pid, message)
+        nil -> :ok
+      end
     end
   end
 

@@ -6,10 +6,11 @@ defmodule Group.Replica.Transport.TCP do
   Replica frames use independent TCP connections, so there is no ordering
   relationship between a control message and its data lane.
 
-  `try_send/5` never writes a socket. It reserves one slot in a bounded
-  per-peer queue and sends to a dedicated writer process. The writer may block
-  up to `:send_timeout` without blocking a Group shard. A full queue returns
-  `:busy`; a missing connection returns `:disconnected`.
+  `try_send/5` only sends to a local per-shard outbox. The outbox batches
+  frames and forwards each target batch to a bounded per-peer writer queue.
+  The writer may block up to `:send_timeout` without blocking a Group shard.
+  Expired, busy, and disconnected batches are dropped and repaired by
+  anti-entropy.
 
   The endpoint capability in the dist-Erlang hello prevents an unrelated
   socket client from injecting frames. This transport is intended for trusted
@@ -21,18 +22,23 @@ defmodule Group.Replica.Transport.TCP do
     * `:ip` - listen address, default `{127, 0, 0, 1}`
     * `:advertised_ip` - address placed in the hello, defaults to `:ip`
     * `:port` - listen port, default `0` (ephemeral)
-    * `:max_queue` - maximum queued frames per peer, default `1_024`
+    * `:max_queue` - maximum queued batches per peer, default `1_024`
     * `:connect_timeout` - outbound connect timeout in milliseconds, default `1_000`
     * `:send_timeout` - writer socket send timeout in milliseconds, default `1_000`
     * `:reconnect_interval` - retry delay in milliseconds, default `50`
+
+  See `Group.Replica.Transport.Outbox` for batching and deadline options.
   """
 
   use GenServer
 
   @behaviour Group.Replica.Transport
+  @behaviour Group.Replica.Transport.Outbox
+
+  alias Group.Replica.Transport.Outbox
 
   @impl true
-  def id, do: :group_sideband_tcp_v1
+  def id, do: :group_sideband_tcp_v2
 
   @impl true
   def child_spec(opts) do
@@ -40,10 +46,10 @@ defmodule Group.Replica.Transport.TCP do
 
     %{
       id: {__MODULE__, name},
-      start: {__MODULE__, :start_link, [opts]},
-      type: :worker,
+      start: {Group.Replica.Transport.TCP.Supervisor, :start_link, [opts]},
+      type: :supervisor,
       restart: :permanent,
-      shutdown: 5_000
+      shutdown: :infinity
     }
   end
 
@@ -58,24 +64,34 @@ defmodule Group.Replica.Transport.TCP do
   end
 
   @impl true
-  def try_send(group, target_node, shard, frame, _opts) do
-    case :ets.lookup(route_table(group), target_node) do
-      [{^target_node, writer, queued, max_queue}] ->
-        if :atomics.add_get(queued, 1, 1) <= max_queue do
-          if :erlang.send_nosuspend(writer, {:replica_frame, shard, frame}) do
-            :ok
-          else
-            :atomics.sub(queued, 1, 1)
-            :busy
-          end
-        else
-          :atomics.sub(queued, 1, 1)
-          :busy
-        end
+  def try_send(group, target_node, shard, frame, opts),
+    do: Outbox.try_send(group, target_node, shard, frame, opts)
 
-      [] ->
-        :disconnected
-    end
+  @impl Group.Replica.Transport.Outbox
+  def init_outbox(group, shard, _opts), do: {:ok, %{group: group, shard: shard}}
+
+  @impl Group.Replica.Transport.Outbox
+  def send_batch(target_node, frames, deadline, %{group: group, shard: shard} = state) do
+    result =
+      try do
+        case :ets.lookup(route_table(group), target_node) do
+          [{^target_node, writer, queued, max_queue}] ->
+            if :atomics.add_get(queued, 1, 1) <= max_queue do
+              send(writer, {:replica_batch, deadline, shard, frames})
+              :ok
+            else
+              :atomics.sub(queued, 1, 1)
+              :busy
+            end
+
+          [] ->
+            :disconnected
+        end
+      rescue
+        ArgumentError -> :disconnected
+      end
+
+    {result, state}
   end
 
   @impl true
@@ -126,8 +142,9 @@ defmodule Group.Replica.Transport.TCP do
       ])
 
     {:ok, {_listen_ip, listen_port}} = :inet.sockname(listener)
+
     capability = :erlang.term_to_binary({node(), make_ref(), System.unique_integer()})
-    descriptor = {:group_sideband_tcp_v1, advertised_ip, listen_port, capability}
+    descriptor = {:group_sideband_tcp_v2, advertised_ip, listen_port, capability}
     :persistent_term.put({__MODULE__, group, :descriptor}, descriptor)
 
     :ets.new(route_table(group), [
@@ -248,7 +265,7 @@ defmodule Group.Replica.Transport.TCP do
         :ok
 
       pid ->
-        _ = :erlang.send_nosuspend(pid, message)
+        send(pid, message)
         :ok
     end
   end
@@ -326,7 +343,7 @@ defmodule Group.Replica.Transport.TCP do
          manager,
          group,
          remote_node,
-         {:group_sideband_tcp_v1, host, port, capability},
+         {:group_sideband_tcp_v2, host, port, capability},
          connect_timeout,
          send_timeout
        ) do
@@ -362,12 +379,18 @@ defmodule Group.Replica.Transport.TCP do
 
   defp writer_loop(socket, manager, remote_node, queued) do
     receive do
-      {:replica_frame, shard, frame} ->
-        result = :gen_tcp.send(socket, :erlang.term_to_binary({shard, frame}))
+      {:replica_batch, deadline, shard, frames} ->
+        result =
+          if deadline <= Outbox.monotonic_ms() do
+            :expired
+          else
+            :gen_tcp.send(socket, :erlang.term_to_binary({:batch, shard, frames}))
+          end
+
         :atomics.sub(queued, 1, 1)
 
         case result do
-          :ok ->
+          result when result in [:ok, :expired] ->
             writer_loop(socket, manager, remote_node, queued)
 
           {:error, _reason} ->
@@ -415,8 +438,9 @@ defmodule Group.Replica.Transport.TCP do
     case :gen_tcp.recv(socket, 0) do
       {:ok, payload} ->
         case decode_authenticated_frame(payload) do
-          {:ok, {shard, frame}} when is_integer(shard) and shard >= 0 ->
-            :ok = Group.Replica.Transport.deliver(group, source_node, shard, frame)
+          {:ok, {:batch, shard, frames}}
+          when is_integer(shard) and shard >= 0 and is_list(frames) ->
+            :ok = Group.Replica.Transport.deliver_batch(group, source_node, shard, frames)
             reader_loop(socket, group, source_node)
 
           _ ->
@@ -445,4 +469,37 @@ defmodule Group.Replica.Transport.TCP do
 
   defp server_name(group), do: :"#{group}_replica_tcp_transport"
   defp route_table(group), do: :"#{group}_replica_tcp_routes"
+end
+
+defmodule Group.Replica.Transport.TCP.Supervisor do
+  @moduledoc false
+  use Supervisor
+
+  alias Group.Replica.Transport.{Outbox, TCP}
+
+  def start_link(opts), do: Supervisor.start_link(__MODULE__, opts)
+
+  @impl true
+  def init(opts) do
+    group = Keyword.fetch!(opts, :name)
+
+    manager = %{
+      id: {TCP, group, :manager},
+      start: {TCP, :start_link, [opts]},
+      type: :worker,
+      restart: :transient,
+      shutdown: 5_000,
+      significant: true
+    }
+
+    outboxes =
+      opts
+      |> Keyword.put(:backend, TCP)
+      |> Outbox.child_spec()
+
+    Supervisor.init([manager, outboxes],
+      strategy: :rest_for_one,
+      auto_shutdown: :any_significant
+    )
+  end
 end

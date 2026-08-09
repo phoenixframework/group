@@ -1,7 +1,7 @@
 defmodule Group.Replica.Protocol do
   @moduledoc false
 
-  @version 1
+  @version 2
 
   def version, do: @version
 

@@ -1833,7 +1833,7 @@ defmodule Group.DistributedTest do
         messages = TestCluster.shard_messages(node_b, name, 0)
 
         case Enum.filter(messages, fn
-               {:group_replica_frame, _source, {:delta_batch, 1, _runs}} ->
+               {:group_replica_frame, _source, {:delta_batch, _version, _runs}} ->
                  true
 
                {:replica_cluster_close, _remote_pid, _generation, _revision, [{"game", _epoch}]} ->
@@ -1843,7 +1843,7 @@ defmodule Group.DistributedTest do
                  false
              end) do
           [
-            {:group_replica_frame, _source, {:delta_batch, 1, runs}},
+            {:group_replica_frame, _source, {:delta_batch, _version, runs}},
             {:replica_cluster_close, _remote_pid, _generation, _revision, [{"game", _epoch}]}
           ] ->
             Enum.any?(runs, fn {_stream_id, _first_seq, records, _head} ->

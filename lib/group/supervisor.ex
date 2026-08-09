@@ -51,6 +51,9 @@ defmodule Group.Supervisor do
     replicated_oplog_max_entries =
       positive_integer_opt(opts, :replicated_oplog_max_entries, 65_536)
 
+    replicated_snapshot_chunk_target_bytes =
+      positive_integer_opt(opts, :replicated_snapshot_chunk_target_bytes, 1_048_576)
+
     replicated_anti_entropy_interval =
       positive_integer_opt(opts, :replicated_anti_entropy_interval, 1_000)
 
@@ -78,6 +81,7 @@ defmodule Group.Supervisor do
       replicated_pg_receiver_local_request_quota: replicated_pg_receiver_local_request_quota,
       replica_transport: replica_transport,
       replicated_oplog_max_entries: replicated_oplog_max_entries,
+      replicated_snapshot_chunk_target_bytes: replicated_snapshot_chunk_target_bytes,
       replicated_anti_entropy_interval: replicated_anti_entropy_interval,
       replicated_peer_lease_timeout: replicated_peer_lease_timeout
     }

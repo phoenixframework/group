@@ -1,4 +1,13 @@
 ## Unreleased
+- **Breaking**: replica protocol v2 splits exact snapshots into
+  transport-neutral, byte-targeted chunks (`1 MiB` by default). Receivers stage
+  chunks in shard-owned private ETS and advance the stream cursor only after an
+  exact, authority-fenced assembly is complete; loss, duplication, reordering,
+  supersession, expiry, and shard crashes remain repairable by anti-entropy.
+  Single-chunk snapshots retain a direct fast path. Sideband transports can use
+  per-shard local outboxes for bounded batching without adding a hop to the
+  default dist-Erlang adapter. Late-starting replica lanes now rebuild their
+  view from shared exact authority when startup fanout races registration.
 - Replace replica state sends/snapshots with per-origin, generation- and
   cluster-epoch-fenced streams: sequenced deltas repair gaps from a bounded
   oplog and fall back to exact origin snapshots after pruning. Replica data now

@@ -18,6 +18,8 @@ mix test test/replica_model_property_test.exs # shrinkable model-based histories
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts, and adversarial replica-transport loss/busy/snapshot recovery |
 | `replica_adversarial_test.exs` | Reproducible mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
 | `replica_model_property_test.exs` | StreamData-generated and shrunk owner histories against an independent lifecycle oracle and scheduler-controlled replica transport |
+| `replica_snapshot_test.exs` | Pure byte partitioning and set-valued private-ETS snapshot staging |
+| `replica_snapshot_distributed_test.exs` | Real-node exact-snapshot loss, reorder, duplicate, conflicting retransmission, supersession, authority fencing, expiry, and shard-crash recovery |
 
 ## Model-based and formal checks
 
@@ -29,7 +31,9 @@ PG key against an independent application-level lifecycle oracle. It also
 requires internal replica indexes to be consistent, every retained owner to be
 alive, and registry conflict losers to be dead. Restart, pruning, and named
 cluster histories retain independent C-owned state while A recovers, so repair
-cannot pass merely by making one origin and one receiver agree.
+cannot pass merely by making one origin and one receiver agree. Model groups
+use a deliberately tiny snapshot target so pruning recovery traverses the real
+multi-chunk assembly path.
 
 StreamData reports the ExUnit seed and shrinks a failure to its smallest command
 history. Local defaults are intentionally quick. Increase the budgets without
@@ -256,6 +260,11 @@ every invisible row and temporary close barrier. A three-node sideband TCP test
 disconnects one origin's real socket, prunes its oplog, reconnects it, and
 requires snapshot recovery without changing the third node's independent
 registry or PG state.
+
+`replica_transport_outbox_test.exs` proves that a blocked sideband backend
+cannot delay the Group-facing local send, frames expire behind that backend,
+busy batches are not retried locally, and batching preserves per-target order.
+The real three-node TCP recovery test runs through the same outbox path.
 
 `Group.TestCluster.assert_replica_consistent/1` checks the
 public dual indexes plus registry claim authority, oplog/order equivalence, and

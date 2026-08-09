@@ -41,6 +41,7 @@ defmodule Group.ReplicaModelPropertyTest do
         replicated_sender_buffer_size: 1,
         replicated_anti_entropy_interval: 60_000,
         replicated_peer_lease_timeout: 120_000,
+        replicated_snapshot_chunk_target_bytes: 256,
         replicated_oplog_max_entries: 4
       ]
 
@@ -87,6 +88,7 @@ defmodule Group.ReplicaModelPropertyTest do
         replicated_sender_buffer_size: 1,
         replicated_anti_entropy_interval: 60_000,
         replicated_peer_lease_timeout: 120_000,
+        replicated_snapshot_chunk_target_bytes: 256,
         replicated_oplog_max_entries: 2
       ]
 
@@ -201,9 +203,17 @@ defmodule Group.ReplicaModelPropertyTest do
 
         scheduler =
           Enum.reduce(41..46, scheduler, fn owner_id, state ->
-            state
-            |> ReplicaModelScheduler.execute({:register, owner_id, :a, 0, owner_id})
-            |> ReplicaModelScheduler.execute({:unregister, owner_id, 0})
+            state =
+              ReplicaModelScheduler.execute(
+                state,
+                {:register, owner_id, :a, 0, owner_id}
+              )
+
+            if rem(owner_id, 2) == 0 do
+              ReplicaModelScheduler.execute(state, {:unregister, owner_id, 0})
+            else
+              state
+            end
           end)
 
         scheduler =
@@ -358,6 +368,7 @@ defmodule Group.ReplicaModelPropertyTest do
       replicated_sender_buffer_size: 1,
       replicated_anti_entropy_interval: 60_000,
       replicated_peer_lease_timeout: 120_000,
+      replicated_snapshot_chunk_target_bytes: 256,
       replicated_oplog_max_entries: Keyword.fetch!(overrides, :oplog)
     ]
   end
