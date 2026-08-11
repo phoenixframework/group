@@ -17,9 +17,11 @@ defmodule Group do
   - Writes (register, join, etc.) return immediately after local update
   - Other nodes receive updates asynchronously over the replica transport
   - During network partitions, nodes may have divergent views
-  - When partitions heal, conflicts are resolved. The built-in resolver kills
-    each losing origin records an authoritative delete and terminates only its
-    own local process with `{:group_registry_conflict, key, winner_meta}`
+  - When connectivity heals, stream gaps are repaired from a bounded oplog or
+    an exact per-origin snapshot; dropped replica sends are therefore safe
+  - Registry conflicts resolve deterministically. Each losing origin records an
+    authoritative delete and terminates only its own local process with
+    `{:group_registry_conflict, key, winner_meta}`
 
   ## Clusters
 
@@ -170,6 +172,10 @@ defmodule Group do
 
   - **Memberships** are stored in replicated, sharded ETS indexes and are
     automatically cleaned up when member processes die.
+
+  - **Process ownership is local**: a shard monitors and exits only processes
+    owned by its own node. Remote lifecycle changes arrive as sequenced replica
+    records or are removed by `nodedown`/peer-lease expiry.
   """
 
   alias Group.Replica

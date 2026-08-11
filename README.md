@@ -15,6 +15,8 @@ lifecycle monitoring, and isolated subclusters for Elixir. No external dependenc
   where only connected nodes participate.
 - **Sharded writes** — writes fan out across N GenServer shards to reduce
   contention. Reads go directly to ETS.
+- **Nonblocking anti-entropy** — replica sends never wait on a remote socket;
+  sequenced deltas, bounded oplogs, and exact snapshots repair dropped work.
 
 ## Installation
 
@@ -218,6 +220,9 @@ All operations are **eventually consistent**:
 - When connectivity returns, per-origin stream heads repair missing sequence
   ranges from a bounded oplog; a lag beyond the retained prefix falls back to
   an exact snapshot of that origin's shard/cluster slice.
+- A dist-Erlang `nodedown` removes that node's view immediately. If the Erlang
+  node remains connected but its Group instance stops responding, a bounded
+  control-plane lease removes the same state and later discovery can rebuild it.
 - Registry conflicts (same key registered on two nodes during a partition) can
   be resolved with a configurable `resolve_registry_conflict` callback. The
   callback selects a winner; each origin retires and terminates only its own
@@ -349,8 +354,14 @@ Each shard has materialized read indexes plus authority/recovery indexes:
 |---|---|---|---|
 | `reg_by_key` | `:set` | `{cluster, key}` | Registry lookup — O(1) |
 | `reg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | Reverse index for death cleanup |
+| `reg_claim_by_key` | `:ordered_set` | `{cluster, key, origin, generation, epoch}` | One authoritative registry claim per origin |
+| `reg_claim_by_pid` | `:ordered_set` | `{pid, cluster, key, origin, generation, epoch}` | Reverse claim index for owner death and repair |
 | `pg_by_key` | `:ordered_set` | `{cluster, key, pid}` | Group membership lookup |
 | `pg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | Reverse index for death cleanup |
+| `replica_stream_meta` | `:set` | `stream_id` | Local stream head, retained floor, and applied journal position |
+| `replica_oplog` | `:ordered_set` | `{stream_id, sequence}` | Bounded sequenced mutation records |
+| `replica_oplog_order` | `:ordered_set` | `append_id` | Shard-wide pruning order across streams |
+| `replica_cursor` | `:set` | `stream_id` | Highest contiguous remote sequence applied |
 
 Registry claim tables retain one authoritative claim per origin independently
 of the visible winner. Stream metadata, oplog, append-order, and receive-cursor
@@ -358,15 +369,23 @@ tables support crash replay and gap repair. Keeping claims separate from the
 single visible `reg_by_key` projection prevents a losing-but-still-live remote
 claim from being forgotten before its owner emits an authoritative delete.
 
-Plus 3 shared tables:
+The node also has shared control/authority tables:
 
 - `cluster_nodes` (`:bag`, cluster→nodes)
 - `node_clusters` (`:bag`, node→clusters)
 - `cluster_leases` (`:set`, cluster→`{ttl_ms, expires_at}`) for local
   `connect(..., ttl: ms)` policy
+- `replication_meta` (`:set`) for the local generation, authority revisions,
+  per-lane installed views, journal metadata, and one atomic append counter per
+  shard
+- `local_cluster_epochs` and `closed_local_cluster_epochs` (`:set`) for active
+  and closing local named-cluster lifetimes
+- `remote_cluster_epochs` (`:set`) for exact generation-fenced remote authority
 
-`cluster_nodes` / `node_clusters` remain the authoritative cluster-membership
-tables. `cluster_leases` is only local lease metadata used by the sweeper.
+`cluster_nodes` / `node_clusters` are the routing projection read by APIs and
+replication fanout. Generation-fenced local/remote epoch tables are the
+authority used to install that projection. `cluster_leases` is only local
+policy metadata used by the sweeper.
 
 `Group.Replica.Data` owns all tables and is supervised with `rest_for_one` so
 tables survive shard crashes.
@@ -438,9 +457,10 @@ including after a caller timeout or shard restart. Reconnect waits for that
 barrier so a prior close cannot erase newly accepted writes.
 
 The sender flush timer is mainly a fallback for idle periods. The unified
-outbound buffer also flushes immediately when it hits the configured size, when a new enqueue
-finds the buffer already past its flush interval, and before control or
-routing work such as cluster connect/disconnect or peer-protocol handling.
+outbound buffer also flushes immediately when it hits the configured size,
+when a new enqueue finds the buffer already past its flush interval, and before
+control or routing work such as cluster connect/disconnect or peer-protocol
+handling.
 
 Transport ordering is not required for correctness: each shard serializes
 writes, each stream numbers them, and receivers reject gaps and duplicates.
@@ -509,27 +529,34 @@ no longer care about a cluster.
 
 ### Process Death Cleanup
 
-Shards monitor all registered/joined processes. On `DOWN`, the shard:
+Shards monitor only locally owned registered/joined processes. A node never
+monitors or exits another node's member processes. On a local owner `DOWN`, the
+shard:
 
 1. Removes entries from both the primary and reverse-index ETS tables.
 2. Appends authoritative unregister/leave mutations before deleting the rows,
    then sends one non-suspending sequenced delta batch per peer.
 3. Fires `:unregistered` / `:left` events to local monitors.
 
-### Node Disconnect
+### Peer Removal and Recovery
 
 On `nodedown`, each shard purges all entries owned by the disconnected node
-from its ETS tables and fires events for each removed entry.
+from its ETS tables, claims, cursors, and authority indexes and fires events for
+each removed entry. If dist Erlang stays connected but a Group instance or its
+control lane disappears, heartbeat lease expiry performs the same complete
+purge. Discovery probes continue after expiry; a returning instance announces
+a new or current generation and anti-entropy reconstructs its live state.
 
 ## Testing
 
 ```bash
 mix test
+mix test.soak   # nightly/release qualification
 ```
 
-See [`test/README.md`](test/README.md) for details on the distributed test
-infrastructure, shrinkable StreamData lifecycle-model tests, and the bounded
-TLA+ anti-entropy model.
+See [`test/README.md`](test/README.md) for the every-PR gate, shrinkable
+StreamData lifecycle-model tests, bounded TLA+ models, and the nightly
+three-node Jepsen transport/lifecycle campaign.
 
 ## Benchmarks
 

@@ -96,7 +96,15 @@ defmodule Group.Replica.Transport do
 end
 
 defmodule Group.Replica.Transport.Distribution do
-  @moduledoc false
+  @moduledoc """
+  Default nonblocking replica transport over Erlang distribution.
+
+  Frames are sent directly to the matching remote shard with
+  `:erlang.send_nosuspend/3` and `:noconnect`, so the caller never waits for a
+  busy distribution socket and never initiates a connection. A busy or absent
+  link returns `:busy`; Group drops that frame and repairs it through periodic
+  anti-entropy.
+  """
   @behaviour Group.Replica.Transport
 
   alias Group.Replica

@@ -17,6 +17,14 @@ receiver crashes. Its invariants require visible data and the cursor to remain
 at a previously committed exact state until every chunk of one valid snapshot
 is present; stale or mixed partial state can never become visible.
 
+`PeerEviction.tla` isolates the lifecycle boundary for a peer which never
+returns and for a later process using the same node name with a fresh
+generation. During its finite faulty prefix it retains and reorders stale
+hello and snapshot messages while leases expire. Authority consists of both a
+generation and an active bit, so an inactive hello fences even a same-epoch
+snapshot. After healing, fair repair must either install only the current
+generation or erase every row and authority reference for the absent peer.
+
 The default TLC configuration uses three nodes: one origin and two independent
 receivers. The origin has one key, a two-record stream, a one-record oplog, and
 the system retains one arbitrary network frame. This forces delta repair,
@@ -41,6 +49,12 @@ TLA_JAR=/path/to/tla2tools.jar \
   TLA_SPEC="$PWD/test/formal/SnapshotAssembly.tla" \
   TLA_CONFIG="$PWD/test/formal/SnapshotAssembly.cfg" \
   test/formal/check.sh
+
+# Run all default models
+TLA_JAR=/path/to/tla2tools.jar test/formal/check_matrix.sh
+
+# Also run the larger two-key, three-sequence anti-entropy state space
+TLA_JAR=/path/to/tla2tools.jar TLA_EXTENDED=1 test/formal/check_matrix.sh
 ```
 
 `TLC_WORKERS` controls worker concurrency and defaults to 4. `TLA_CONFIG` can
@@ -49,7 +63,9 @@ point at an alternate finite configuration.
 TLC proves the listed invariants and liveness property for the configured
 finite instance, not for arbitrary unbounded node and key sets. Larger models
 should be run periodically by increasing `Nodes`, `Origins`, `Keys`, `MaxSeq`,
-`OplogBound`, and `MaxMessages`.
+`OplogBound`, and `MaxMessages`. `check_matrix.sh` runs the protocol, snapshot
+assembly, and peer-eviction models; set `TLA_EXTENDED=1` for the larger
+anti-entropy configuration.
 
 The checked three-node default explores 1,835,826 states, finds 490,236
 distinct states to a depth of 30, and completes in roughly 1 minute 40 seconds
@@ -57,3 +73,11 @@ on the development machine used for the validation run.
 
 The snapshot-assembly model explores 15,681 states, finds 1,088 distinct states
 to a depth of 13, and completes in under a second on the same class of machine.
+
+The peer-eviction model explores 1,527,116 states, finds 238,120 distinct
+states to a depth of 26, and completes in roughly 20 seconds on the development
+machine used for validation.
+
+The extended two-key, three-sequence model explores 127,557,634 states, finds
+32,238,304 distinct states to a depth of 34, and completes in roughly two hours
+on the development machine used for validation.

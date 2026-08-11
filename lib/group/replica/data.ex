@@ -56,6 +56,24 @@ defmodule Group.Replica.Data do
   `entries_by_pid` can select all entries for a pid as a contiguous range scan. Also used
   by `maybe_demonitor` to check if a pid has any remaining entries (select with limit 1).
 
+  ### reg_claim_by_key / reg_claim_by_pid — authoritative registry claims
+
+      {{cluster, key, origin, generation, epoch}, pid, meta, time, sequence}
+      {{pid, cluster, key, origin, generation, epoch}, meta, time, sequence}
+
+  The visible `reg_by_key` row is only a deterministic projection. These tables retain one
+  independently versioned claim per origin so a losing-but-live claim is not forgotten.
+  Only its owner stream can delete it; conflict resolution then recomputes the visible winner.
+
+  ### replica_stream_meta / replica_oplog / replica_oplog_order / replica_cursor
+
+  Local streams are keyed by `{group, origin, generation, shard, cluster, epoch}`.
+  `replica_stream_meta` records each stream's head, retained floor, and applied journal
+  position. `replica_oplog` stores `{stream, sequence}` mutation records while
+  `replica_oplog_order` gives them one shard-wide append order for bounded pruning.
+  `replica_cursor` records only the highest contiguous sequence applied from each remote
+  stream. A gap below the retained floor is repaired by exact per-origin snapshot replacement.
+
   ### cluster_nodes — `:bag`, keyed by cluster name
 
       {cluster, node}
@@ -74,9 +92,9 @@ defmodule Group.Replica.Data do
   targeted deletes from both tables — O(clusters for node) instead of O(total entries).
 
   Both tables are shared across all shards. Used for the default cluster (nil) and named
-  clusters. The nil cluster is maintained by the peer_connect protocol — nodes are added on
-  peer discovery and removed on nodedown/shard death. `Group.nodes/1` reads nil cluster
-  from cluster_nodes.
+  clusters. Peer-connect messages are discovery hints; shard 0's generation-fenced exact
+  authority installs membership. `nodedown`, shard death, or peer-lease expiry removes it.
+  `Group.nodes/1` reads the nil cluster from cluster_nodes.
 
   ### cluster_leases — `:set`, keyed by cluster name
 
@@ -94,6 +112,15 @@ defmodule Group.Replica.Data do
   Keeping leases separate avoids adding policy state to the hot cluster-membership
   lookups used by `Group.connect/3`, peer discovery, and replication fanout.
 
+  ### replication_meta and epoch tables
+
+  `replication_meta` holds the local origin generation, exact and observed authority
+  revisions, per-shard installed remote views, journal metadata, and one append counter per
+  shard. `local_cluster_epochs` and `closed_local_cluster_epochs` fence local named-cluster
+  lifetimes; `remote_cluster_epochs` is the exact node-wide authority installed by shard 0.
+  Exact and merely observed revisions are separate so a partial control burst cannot be
+  promoted to authoritative membership.
+
   ## Match Spec Patterns
 
   All match specs use `{:==, :"$N", value}` guards to filter on runtime values (e.g. node
@@ -104,10 +131,12 @@ defmodule Group.Replica.Data do
   ## Bulk Operations & Their Costs
 
   - `purge_node/3`: Full table scan via `ets.select` filtering by node, then individual
-    deletes. O(table size) for the scan, but this only runs on nodedown — rare path.
+    deletes. O(table size) for the scan, but this only runs on nodedown, remote shard death,
+    or peer-lease expiry — rare paths.
 
   - `local_data_by_cluster/3`: Full table scan filtering by `node() == local_node`,
-    grouped by cluster. Only runs during discovery/sync protocol.
+    grouped by cluster. Retained only for the legacy receive-only cluster-state
+    compatibility path; current recovery uses anti-entropy streams.
 
   - `registry_count`, `pg_count`, `pg_count_by_prefix`, `local_registry_count`,
     `local_pg_count`, `local_registry_present?`, `local_pg_present?`: Uses
@@ -127,8 +156,11 @@ defmodule Group.Replica.Data do
   local processes that registered before the crash would be orphaned — nobody would monitor
   them, and their ETS entries would persist forever if they later died.
 
-  Remote data doesn't need this protection — the discovery protocol re-syncs everything
-  from remote nodes on restart. Only local process entries need the ETS scan.
+  Only locally owned member processes are monitored. Remote owner death arrives as a
+  sequenced delete from that owner; nodedown or peer-lease expiry removes the complete
+  remote origin if it cannot report the delete. Periodic anti-entropy then rebuilds a
+  returning origin from retained deltas or an exact snapshot. No node monitors or exits
+  another node's member processes.
 
   The `state.monitors` map also deduplicates: a pid registered under multiple keys in the
   same shard gets one monitor, not one per key.

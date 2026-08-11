@@ -3,12 +3,21 @@
 ## Running tests
 
 ```bash
-mix test                           # all tests
+mix test                           # every-PR ExUnit/property/chaos/checker gate
+mix test.soak                      # nightly six-profile Jepsen campaign
 mix test test/group_test.exs       # local only
 mix test test/distributed_test.exs # distributed only
 mix test test/replica_adversarial_test.exs # seeded transport chaos
 mix test test/replica_model_property_test.exs # shrinkable model-based histories
+test/jepsen/run.sh                 # one OS-partition/restart Jepsen model test
 ```
+
+`mix test` preserves normal Mix test arguments while always running the pure
+Jepsen lifecycle-checker qualification after ExUnit. It does not require
+Docker. `mix test.soak` first runs that complete PR gate, then runs the
+distribution/TCP/chaos × mixed/permanent Jepsen campaign. The soak defaults to
+20 five-minute fault histories per combination and is intended for nightly and
+release qualification rather than individual edits.
 
 ## Test files
 
@@ -16,7 +25,7 @@ mix test test/replica_model_property_test.exs # shrinkable model-based histories
 |------|---------------|
 | `group_test.exs` | Single-node: register/unregister, join/leave, members, monitor/demonitor, named clusters, concurrent operations |
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts, and adversarial replica-transport loss/busy/snapshot recovery |
-| `replica_adversarial_test.exs` | Reproducible mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
+| `replica_adversarial_test.exs` | Reproducible three-node mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
 | `replica_model_property_test.exs` | StreamData-generated and shrunk owner histories against an independent lifecycle oracle and scheduler-controlled replica transport |
 | `replica_snapshot_test.exs` | Pure byte partitioning and set-valued private-ETS snapshot staging |
 | `replica_snapshot_distributed_test.exs` | Real-node exact-snapshot loss, reorder, duplicate, conflicting retransmission, supersession, authority fencing, expiry, and shard-crash recovery |
@@ -47,6 +56,18 @@ GROUP_MODEL_RUNS=1000 GROUP_MODEL_COMMANDS=100 \
 The independent TLA+ model and TLC configuration live in `test/formal/`.
 See [`formal/README.md`](formal/README.md) for its checked invariants, finite
 model bounds, and run command.
+
+The Docker-backed Jepsen harness lives in [`jepsen/`](jepsen/). It drives
+three independent BEAM containers through concurrent, multi-entry owner
+lifecycles, named-cluster epoch churn, directed/full partitions, transport
+session resets, and VM restarts. The same workload runs over distribution,
+real sideband TCP, and a lossy/duplicating/reordering transport. After healing,
+its independent oracle checks exact public views and the internal registry,
+PG, claim, cluster, cursor, oplog, snapshot-staging, and retired-origin
+invariants. Its permanent-retirement scenario proves eviction even when a peer
+never returns. `test/jepsen/campaign.sh` runs the full profile/scenario matrix;
+`test/jepsen/qualify.sh` mutation-tests the implementation and proves that the
+live checker rejects injected faults.
 
 ## How distribution works
 

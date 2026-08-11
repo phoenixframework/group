@@ -10,8 +10,10 @@ defmodule Group.MixProject do
       version: @version,
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
+      test_ignore_filters: [~r"^test/jepsen/", ~r"^test/mutation/"],
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      aliases: aliases(),
       package: package(),
       docs: docs(),
       name: "Group",
@@ -30,6 +32,10 @@ defmodule Group.MixProject do
       extra_applications: [:logger],
       mod: {Group.Application, []}
     ]
+  end
+
+  def cli do
+    [preferred_envs: ["test.soak": :test]]
   end
 
   defp deps do
@@ -53,6 +59,16 @@ defmodule Group.MixProject do
       main: "Group",
       source_url: @source_url,
       source_ref: "v#{@version}"
+    ]
+  end
+
+  defp aliases do
+    [
+      test: ["test", "cmd test/jepsen/checker.sh"],
+      "test.soak": [
+        "test",
+        "cmd env GROUP_JEPSEN_SKIP_CHECKER=1 test/jepsen/campaign.sh"
+      ]
     ]
   end
 end

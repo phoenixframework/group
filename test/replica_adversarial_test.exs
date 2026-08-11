@@ -13,14 +13,14 @@ defmodule Group.ReplicaAdversarialTest do
     @seed seed
     @tag chaos_seed: seed
 
-    test "seeded mixed-operation transport chaos converges without zombies (seed #{@seed})" do
+    test "seeded three-node transport chaos converges without zombies (seed #{@seed})" do
       seed = @seed
       :rand.seed(:exsss, {seed, seed * 3 + 1, seed * 7 + 2})
 
-      peers = TestCluster.start_peers(2)
+      peers = TestCluster.start_peers(3)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
-      [{_, node_a}, {_, node_b}] = peers
+      nodes = Enum.map(peers, &elem(&1, 1))
       name = :"replica_chaos_#{seed}_#{System.unique_integer([:positive])}"
 
       opts = [
@@ -40,30 +40,29 @@ defmodule Group.ReplicaAdversarialTest do
 
       TestCluster.assert_eventually(
         fn ->
-          Enum.all?([node_a, node_b], fn node ->
-            length(TestCluster.rpc!(node, Group, :nodes, [name])) == 1 and
+          Enum.all?(nodes, fn node ->
+            length(TestCluster.rpc!(node, Group, :nodes, [name])) == length(nodes) - 1 and
               Enum.all?(@clusters, fn cluster ->
-                length(TestCluster.rpc!(node, Group, :nodes, [name, cluster])) == 2
+                length(TestCluster.rpc!(node, Group, :nodes, [name, cluster])) == length(nodes)
               end)
           end)
         end,
         timeout: 10_000
       )
 
-      :ok =
-        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
-          name,
-          {:chaos, [drop_every: 5, duplicate_every: 7, max_delay: 40]}
-        ])
+      chaos_modes = [
+        {:chaos, [drop_every: 5, duplicate_every: 7, max_delay: 40]},
+        {:chaos, [drop_every: 7, duplicate_every: 5, max_delay: 55]},
+        {:chaos, [drop_every: 4, duplicate_every: 9, max_delay: 70]}
+      ]
 
-      :ok =
-        TestCluster.rpc!(node_b, Group.TestReplicaTransport, :set_mode, [
-          name,
-          {:chaos, [drop_every: 7, duplicate_every: 5, max_delay: 55]}
-        ])
+      Enum.zip(nodes, chaos_modes)
+      |> Enum.each(fn {node, mode} ->
+        :ok = TestCluster.rpc!(node, Group.TestReplicaTransport, :set_mode, [name, mode])
+      end)
 
       initial = %{
-        active: %{node_a => MapSet.new(@clusters), node_b => MapSet.new(@clusters)},
+        active: Map.new(nodes, &{&1, MapSet.new(@clusters)}),
         counter: 0,
         pg_keys: MapSet.new(),
         pids: [],
@@ -73,37 +72,36 @@ defmodule Group.ReplicaAdversarialTest do
 
       state =
         Enum.reduce(1..72, initial, fn step, state ->
-          apply_random_operation(state, step, seed, name, node_a, node_b)
+          apply_random_operation(state, step, seed, name, nodes)
         end)
 
-      for node <- [node_a, node_b] do
+      for node <- nodes do
         :ok = TestCluster.rpc!(node, Group.TestReplicaTransport, :set_mode, [name, :pass])
         :ok = TestCluster.rpc!(node, Group, :connect, [name, @clusters])
       end
 
-      assert_converges(name, node_a, node_b, state)
+      assert_converges(name, nodes, state)
 
       # Let delayed frames from the chaos phase arrive, then prove they are
       # duplicates/stale rather than a source of resurrection.
       Process.sleep(150)
-      TestCluster.flush_shards(node_a, name)
-      TestCluster.flush_shards(node_b, name)
-      assert_converges(name, node_a, node_b, state)
+      Enum.each(nodes, &TestCluster.flush_shards(&1, name))
+      assert_converges(name, nodes, state)
 
-      for node <- [node_a, node_b] do
+      for node <- nodes do
         assert :ok =
                  TestCluster.rpc!(node, Group.TestCluster, :assert_replica_consistent, [name])
       end
 
       TestCluster.assert_eventually(
-        fn -> retained_owners_alive?(name, [node_a, node_b]) end,
+        fn -> retained_owners_alive?(name, nodes) end,
         timeout: 15_000
       )
     end
   end
 
-  defp apply_random_operation(state, step, seed, name, node_a, node_b) do
-    nodes = [node_a, node_b]
+  defp apply_random_operation(state, step, seed, name, nodes) do
+    [node_a, node_b | _rest] = nodes
 
     case :rand.uniform(12) do
       choice when choice in 1..3 ->
@@ -244,17 +242,19 @@ defmodule Group.ReplicaAdversarialTest do
     {"chaos/#{seed}/#{kind}/#{step}/#{counter}", %{state | counter: counter}}
   end
 
-  defp assert_converges(name, node_a, node_b, state) do
+  defp assert_converges(name, nodes, state) do
     TestCluster.assert_eventually(
       fn ->
-        length(TestCluster.rpc!(node_a, Group, :nodes, [name])) == 1 and
-          length(TestCluster.rpc!(node_b, Group, :nodes, [name])) == 1 and
+        Enum.all?(nodes, fn node ->
+          length(TestCluster.rpc!(node, Group, :nodes, [name])) == length(nodes) - 1
+        end) and
           Enum.all?(@clusters, fn cluster ->
-            length(TestCluster.rpc!(node_a, Group, :nodes, [name, cluster])) == 2 and
-              length(TestCluster.rpc!(node_b, Group, :nodes, [name, cluster])) == 2
+            Enum.all?(nodes, fn node ->
+              length(TestCluster.rpc!(node, Group, :nodes, [name, cluster])) == length(nodes)
+            end)
           end) and
-          registry_equal?(name, node_a, node_b, state.reg_keys) and
-          memberships_equal?(name, node_a, node_b, state.pg_keys)
+          registry_equal?(name, nodes, state.reg_keys) and
+          memberships_equal?(name, nodes, state.pg_keys)
       end,
       timeout: 20_000,
       interval: 75
@@ -263,19 +263,21 @@ defmodule Group.ReplicaAdversarialTest do
     error ->
       flunk(
         "chaos convergence failed: #{Exception.message(error)}\n" <>
-          "differences=#{inspect(convergence_differences(name, node_a, node_b, state), limit: :infinity)}\n" <>
+          "differences=#{inspect(convergence_differences(name, nodes, state), limit: :infinity)}\n" <>
           "recent operations=#{inspect(Enum.take(state.trace, 20), limit: :infinity)}"
       )
   end
 
-  defp convergence_differences(name, node_a, node_b, state) do
+  defp convergence_differences(name, nodes, state) do
     registry =
       state.reg_keys
       |> Enum.flat_map(fn {cluster, key} ->
         args = [name, key, cluster_opts(cluster)]
-        value_a = TestCluster.rpc!(node_a, Group, :lookup, args)
-        value_b = TestCluster.rpc!(node_b, Group, :lookup, args)
-        if value_a == value_b, do: [], else: [{:registry, cluster, key, value_a, value_b}]
+        values = Map.new(nodes, &{&1, TestCluster.rpc!(&1, Group, :lookup, args)})
+
+        if values |> Map.values() |> Enum.uniq() |> length() == 1,
+          do: [],
+          else: [{:registry, cluster, key, values}]
       end)
       |> Enum.take(10)
 
@@ -283,17 +285,17 @@ defmodule Group.ReplicaAdversarialTest do
       state.pg_keys
       |> Enum.flat_map(fn {cluster, key} ->
         args = [name, key, cluster_opts(cluster)]
-        value_a = TestCluster.rpc!(node_a, Group, :members, args) |> Enum.sort()
-        value_b = TestCluster.rpc!(node_b, Group, :members, args) |> Enum.sort()
-        if value_a == value_b, do: [], else: [{:pg, cluster, key, value_a, value_b}]
+        values = Map.new(nodes, &{&1, TestCluster.rpc!(&1, Group, :members, args) |> Enum.sort()})
+
+        if values |> Map.values() |> Enum.uniq() |> length() == 1,
+          do: [],
+          else: [{:pg, cluster, key, values}]
       end)
       |> Enum.take(10)
 
-    nodes =
+    topology =
       for cluster <- [nil | @clusters] do
-        value_a = group_nodes(node_a, name, cluster)
-        value_b = group_nodes(node_b, name, cluster)
-        {cluster, value_a, value_b}
+        {cluster, Map.new(nodes, &{&1, group_nodes(&1, name, cluster)})}
       end
 
     cluster_trace =
@@ -305,12 +307,12 @@ defmodule Group.ReplicaAdversarialTest do
       end)
 
     protocol =
-      for node <- [node_a, node_b] do
+      for node <- nodes do
         {node, TestCluster.rpc!(node, Group.TestCluster, :replica_protocol_state, [name])}
       end
 
     [
-      nodes: nodes,
+      nodes: topology,
       registry: registry,
       pg: pg,
       cluster_trace: cluster_trace,
@@ -323,21 +325,23 @@ defmodule Group.ReplicaAdversarialTest do
   defp group_nodes(node, name, cluster),
     do: TestCluster.rpc!(node, Group, :nodes, [name, cluster])
 
-  defp registry_equal?(name, node_a, node_b, keys) do
+  defp registry_equal?(name, nodes, keys) do
     Enum.all?(keys, fn {cluster, key} ->
       args = [name, key, cluster_opts(cluster)]
 
-      TestCluster.rpc!(node_a, Group, :lookup, args) ==
-        TestCluster.rpc!(node_b, Group, :lookup, args)
+      nodes |> Enum.map(&TestCluster.rpc!(&1, Group, :lookup, args)) |> Enum.uniq() |> length() ==
+        1
     end)
   end
 
-  defp memberships_equal?(name, node_a, node_b, keys) do
+  defp memberships_equal?(name, nodes, keys) do
     Enum.all?(keys, fn {cluster, key} ->
       args = [name, key, cluster_opts(cluster)]
-      members_a = TestCluster.rpc!(node_a, Group, :members, args) |> Enum.sort()
-      members_b = TestCluster.rpc!(node_b, Group, :members, args) |> Enum.sort()
-      members_a == members_b
+
+      nodes
+      |> Enum.map(&(TestCluster.rpc!(&1, Group, :members, args) |> Enum.sort()))
+      |> Enum.uniq()
+      |> length() == 1
     end)
   end
 

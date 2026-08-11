@@ -1,4 +1,10 @@
 ## Unreleased
+- Add layered anti-entropy qualification: three-node StreamData lifecycle
+  models, seeded adversarial transport histories, TLA+ models for convergence,
+  chunk assembly, and permanent peer eviction, plus a Docker-backed Jepsen
+  oracle across distribution, sideband TCP, and lossy/reordering transports.
+  `mix test` is the every-PR ExUnit/property/checker gate and `mix test.soak`
+  runs the six-profile nightly/release campaign.
 - **Breaking**: replica protocol v2 splits exact snapshots into
   transport-neutral, byte-targeted chunks (`1 MiB` by default). Receivers stage
   chunks in shard-owned private ETS and advance the stream cursor only after an

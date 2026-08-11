@@ -1,0 +1,22 @@
+FROM elixir:1.19.5-otp-28-slim
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates iptables procps \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /group
+
+ENV MIX_ENV=prod
+
+COPY mix.exs mix.lock ./
+COPY lib ./lib
+COPY test/jepsen/node.exs ./test/jepsen/node.exs
+
+RUN mix local.hex --force \
+    && mix deps.get --only prod \
+    && mix compile
+
+COPY test/jepsen/entrypoint.sh /usr/local/bin/group-jepsen-node
+RUN chmod +x /usr/local/bin/group-jepsen-node
+
+ENTRYPOINT ["/usr/local/bin/group-jepsen-node"]

@@ -1,208 +1,261 @@
-# Group — CLAUDE.md
+# Group — Maintainer Architecture Guide
 
-## What is Group
+## What Group Is
 
-Distributed process registry + process groups + lifecycle monitoring + isolated subclusters.
+Group is an eventually consistent distributed process registry, process-group
+service, lifecycle monitor, and named-subcluster layer. Erlang distribution is
+the membership and authority control plane. Replica state moves over a
+configurable, nonblocking data transport and converges through sequenced
+anti-entropy streams.
 
 ## Project Structure
 
 ```
 lib/
-  group.ex              — Public API: register, join, members, monitor, dispatch, connect/disconnect
-  group/event.ex        — %Group.Event{} struct
-  group/supervisor.ex   — Top-level supervisor (rest_for_one: Data → PeerReconnect → Replica.Supervisor → Registry → ClusterLease)
-  group/cluster_lease.ex — Local named-cluster TTL sweeper
-  group/peer_reconnect.ex — Bounded reconnect loop after busy distribution links
-  group/replica/
-    data.ex             — GenServer that owns ETS tables and serializes shared membership mutations.
-    supervisor.ex       — one_for_one supervisor for Replica shards
-  group/replica.ex      — Sharded GenServer: replication, peer discovery, conflict resolution, monitoring
-  group/application.ex  — Empty app supervisor (Group instances are started by consumers)
+  group.ex                         — public API and configuration docs
+  group/supervisor.ex              — rest_for_one instance supervisor
+  group/cluster_lease.ex           — local named-cluster TTL policy
+  group/peer_reconnect.ex          — bounded retry for busy dispatch links
+  group/replica.ex                 — sharded writes, control, AE, projection
+  group/replica/data.ex            — ETS owner, journal, authority, indexes
+  group/replica/protocol.ex        — stream identity and mutation helpers
+  group/replica/snapshot.ex        — byte-targeted snapshot chunks/staging
+  group/replica/transport.ex       — replica transport contract + dist adapter
+  group/replica/transport/outbox.ex — optional lossy sideband outboxes
+  group/replica/transport/tcp.ex   — included sideband TCP adapter
 test/
-  test_helper.exs       — Ensures EPMD/distribution are running; disables prevent_overlapping_partitions
-  group_test.exs        — Local tests (async: true)
-  distributed_test.exs  — Multi-node tests using OTP :peer
-  support/
-    test_cluster.ex     — Peer node helpers (start_peers, spawn_register, spawn_join, etc.)
-    test_conflict_resolver.ex — Custom resolver for tests
-priv/bench/             — Benchmarks (run_local.sh, run_distributed.sh)
+  replica_model_property_test.exs  — shrinkable real-node lifecycle model
+  replica_adversarial_test.exs     — seeded three-node transport chaos
+  replica_snapshot_*               — chunk/assembly failure coverage
+  formal/                          — TLC protocol, assembly, eviction models
+  jepsen/                          — independent-VM lifecycle oracle/campaign
+priv/bench/                        — local and distributed benchmark project
 ```
 
-## Running Tests
+## Required Gates
 
 ```bash
-mix test           # all tests
-mix test test/group_test.exs           # local only
-mix test test/distributed_test.exs     # distributed only
+mix test              # every-PR ExUnit/property/chaos/pure-checker gate
+mix test.soak         # nightly/release six-profile Jepsen campaign
+
+# Focused development
+mix test test/group_test.exs
+mix test test/distributed_test.exs
+mix test test/replica_model_property_test.exs
 ```
 
-Tests require `elixirc_paths(:test)` includes `test/support/`. Distributed tests use OTP `:peer` module for real Erlang nodes.
+`mix test` accepts normal Mix test paths/options and then runs the pure Jepsen
+checker qualification. `mix test.soak` runs that gate first, then twenty
+five-minute histories for distribution/TCP/chaos × mixed/permanent scenarios.
+See `test/README.md`, `test/formal/README.md`, and `test/jepsen/README.md`.
 
-## Running Benchmarks
-
-```bash
-cd priv/bench && ./run_local.sh
-cd priv/bench && ./run_distributed.sh
-```
-
-## Architecture
-
-### Supervision Tree
+## Supervision and Ownership
 
 ```
 Group.Supervisor (rest_for_one)
-├── Group.Replica.Data        — owns all ETS tables; serializes membership mutations
-├── Group.PeerReconnect       — bounded reconnects after busy-link disconnects
-├── Group.Replica.Supervisor  — one_for_one, N shard GenServers
-│   ├── Replica shard 0
-│   ├── Replica shard 1
+├── optional sideband transport manager + per-shard outboxes
+├── Group.Replica.Data
+├── Group.PeerReconnect
+├── Group.Replica.Supervisor
+│   ├── Group.Replica shard 0
+│   ├── Group.Replica shard 1
 │   └── ...
-├── Registry (Elixir)         — :duplicate, for monitor subscriptions
-└── Group.ClusterLease        — local named-cluster TTL sweeper
+├── Registry                    — local monitor subscriptions
+└── Group.ClusterLease          — local named-cluster TTL sweeper
 ```
 
-`rest_for_one` means: if Data dies, every later child restarts. If PeerReconnect dies, the Replica supervisor and monitor Registry restart. If Replica.Supervisor dies, Registry and ClusterLease restart. Replica shards rebuild local process monitors from surviving ETS after restart.
+`Group.Replica.Data` owns every ETS table. A shard restart therefore preserves
+the tables, repairs interrupted index/journal work, replays appended-but-not-
+applied local mutations, and rebuilds monitors for locally owned processes.
+The optional transport precedes Data so losing its manager restarts the whole
+instance and cannot leave stale transport sessions attached to retained state.
 
-### Sharding
+Reads use public ETS directly. Writes route through
+`:erlang.phash2({cluster, key}, num_shards)` to a local shard request lane.
+Shard counts must match across peers.
 
-`phash2({cluster, key}, num_shards)` routes to shard. Default 8 shards. Must match across all nodes (validated on peer_connect). Including cluster in hash avoids false contention between default and named cluster operations.
+## ETS State
 
-### ETS Tables (per shard × 4 + 3 shared)
+Per shard:
 
-| Table | Type | Key | Tuple |
-|-------|------|-----|-------|
-| `reg_by_key` | `:set` | `{cluster, key}` | `{{cluster, key}, pid, meta, time, node}` |
-| `reg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | `{{pid, cluster, key}, meta, time, node}` |
-| `pg_by_key` | `:ordered_set` | `{cluster, key, pid}` | `{{cluster, key, pid}, meta, time, node}` |
-| `pg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | `{{pid, cluster, key}, meta, time, node}` |
-| `cluster_nodes` | `:bag` | cluster | `{cluster, node}` |
-| `node_clusters` | `:bag` | node | `{node, cluster}` |
-| `cluster_leases` | `:set` | cluster | `{cluster, ttl_ms, expires_at}` |
+| Table | Key | Role |
+|---|---|---|
+| `reg_by_key` | `{cluster, key}` | visible registry winner |
+| `reg_by_pid` | `{pid, cluster, key}` | visible reverse index |
+| `reg_claim_by_key` | `{cluster, key, origin, generation, epoch}` | authoritative claims |
+| `reg_claim_by_pid` | `{pid, cluster, key, origin, generation, epoch}` | claim reverse index |
+| `pg_by_key` | `{cluster, key, pid}` | visible PG membership |
+| `pg_by_pid` | `{pid, cluster, key}` | PG reverse index |
+| `replica_stream_meta` | stream id | head, retained floor, journal position |
+| `replica_oplog` | `{stream, sequence}` | retained mutation record |
+| `replica_oplog_order` | append id | shard-wide pruning order |
+| `replica_cursor` | stream id | highest contiguous sequence applied |
 
-**Why ordered_set for by_pid tables**: Contiguous range scans for `entries_by_pid` and `delete_all_for_pid` (process death cleanup). Also enables efficient existence checks with `select(..., 1)`.
+Shared tables hold cluster/node indexes, local TTL leases, local and remote
+cluster epochs, closed-cluster barriers, origin generations, exact/observed
+authority revisions, installed lane views, and journal metadata.
 
-**Why ordered_set for pg_by_key**: `pg_members/4` scans `{cluster, key, *}` as a contiguous range — O(members in group), not O(table).
+Per-shard tables omit `write_concurrency` because one shard serializes their
+writes. The shared replication metadata table uses
+`write_concurrency: :auto`: every shard atomically updates only its own
+`{:append_counter, shard}` object. Cross-shard arrival order has no semantic
+meaning; an append id exists only to bound that shard's oplog across streams.
 
-**Why set for reg_by_key**: Only needs direct lookup/delete by `{cluster, key}` — O(1).
+## Authority and Stream Identity
 
-All tables: `:public`, `read_concurrency: true`, `decentralized_counters: true`. Per-key registry/PG writes serialize through the owning Replica shard; shared cluster-membership dual-index mutations serialize through `Group.Replica.Data`. No table enables `write_concurrency`.
+Every mutation belongs to:
 
-### Reads vs Writes
-
-- **Reads** (`lookup`, `members`, `local_registry_count`) go directly to ETS — no GenServer involved
-- **Writes** (`register`, `join`, `leave`, `unregister`) go through the shard's
-  local request lane (`send` + monitor + tagged reply), not `GenServer.call`
-- **Replication** arrives as `handle_info` messages on shard GenServers
-
-### Config
-
-Stored in `persistent_term` keyed by `{Group, name}`. Includes shard/buffering/reconnect settings plus `log`, and optionally `extract_meta` and `resolve_registry_conflict`.
-
-## Key Protocols
-
-### Peer Discovery (per-shard, on nodeup/init)
-
-1. Each shard sends `{:peer_connect, pid, shard, num_shards, clusters}` to its counterpart
-2. Receiver adds sender to nil cluster ETS, computes shared clusters, sends `{:peer_connect_ack, ...}`
-3. Both sides send `{:cluster_state, cluster, reg_data, pg_data}` for each shared cluster
-4. `merge_remote_cluster_data` applies data: new entries insert, conflicts go through `resolve_conflict`
-
-### Replication (steady state)
-
-After discovery, writes replicate in two stages:
-- nil cluster: uses `state.remote_shards` map
-- Named clusters: uses `cluster_nodes` ETS table
-- Sender batches: `replicate_registry_batch`, `replicate_pg_batch`
-- Receiver buffers registry and PG lanes separately, bulk-applies ETS writes,
-  then takes a bounded fairness turn for local work
-- Remote shard sends use `send_nosuspend(..., [:noconnect])`; a `false` result
-  force-disconnects that node and enters bounded reconnect retries for that
-  peer only
-
-### Conflict Resolution
-
-`resolve_conflict/5` and the batched equivalent handle all registry key conflicts (live replicated registry ops and partition-heal `merge_remote_cluster_data`).
-
-- Default resolver: most recent timestamp wins; pid ordering tiebreaker on equal timestamps
-- **Tiebreaker MUST be deterministic across all nodes**: `time2 > time1 or (time2 == time1 and pid2 > pid1)`. Using `>=` causes mutual kill.
-- Custom: `resolve_registry_conflict: {mod, func, extra_args}` option; the callback owns any process exits
-- The default resolver kills the loser with `{:group_registry_conflict, key, winner_meta}`
-- Runs synchronously inside shard GenServer — must return quickly
-
-### Named Cluster Connect/Disconnect
-
-- `connect/2`: adds to ETS, picks random shard S, S notifies remote S, remote acks with bundled data + fans out to siblings
-- `disconnect/2`: removes local membership, calls ALL local shards to purge the complete replicated cluster view, and has shard 0 broadcast to remotes
-- `connect(..., ttl: ms)`: still checks `cluster_nodes` first, so an already-connected
-  cluster stays an ETS-fast noop and does not refresh the TTL
-- TTL rows are local policy only; they do not change `cluster_nodes` /
-  `node_clusters` semantics
-- On TTL expiry, `Group.ClusterLease` disconnects only if the local node has no
-  cluster-scoped monitors, no local registrations, and no local PG memberships
-  in that cluster. Otherwise it extends the lease by one TTL interval.
-
-### Nodedown / Process Death
-
-- `nodedown`: every shard calls `purge_cluster_node` (unconditional — not gated on shard 0) then `purge_node`
-- Process DOWN: `delete_all_for_pids` + one non-suspending `replicate_process_down_batch` per target peer
-- Remote shard DOWN (monitored pid): treated like nodedown for that node
-
-### Monitor Events
-
-Events delivered as `{:group, [%Group.Event{}, ...], %{name: name}}`. Batched per handler turn:
-- Single ops: one event per message
-- Bulk ops (nodedown, process DOWN, cluster_state merge): all events in one message
-
-Patterns: `:all`, `{:exact, key}`, `{:prefix, "prefix/"}`
-
-### Prefix Queries
-
-`Group.members(name, "prefix/")` scans ALL shards (can't hash prefix to one shard). Uses ETS range guards:
-```elixir
-{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", next_binary_prefix(prefix)}}
 ```
-where `next_binary_prefix` increments the last byte of the prefix string.
+{group, origin_node, origin_generation, shard, cluster, cluster_epoch}
+```
 
-Keys ending with `"/"` are rejected by `validate_key!/1` in register/unregister/join/leave — trailing slash is reserved for prefix queries.
+The origin appends a strictly increasing sequence before applying the
+materialized change. Generation fences a restarted Group instance. A
+named-cluster epoch fences close/reopen. The nil cluster uses the origin
+generation as its epoch.
 
-### Dispatch
+Shard 0 installs one exact node-wide authority snapshot:
 
-`dispatch/4` sends to all members (registry + PG). Groups remote PG members by node and sends one non-suspending `{:group_dispatch, pids, message}` per remote node (O(nodes), not O(members)). The target shard is chosen by `phash2(self(), num_shards)` for per-sender ordering.
+- origin generation;
+- complete active cluster→epoch set;
+- exact authority revision; and
+- authenticated transport descriptor.
 
-`dispatch_local/4` skips cross-node messaging.
+Other shards exchange constant-size lane hellos. Shared authority is not enough
+to accept data: each shard records an installed lane view only after it has
+purged streams outside that authority. Exact and incrementally observed
+revisions are distinct; heartbeats and partial cluster-control bursts can never
+promote an incomplete epoch set to exact authority.
 
-## ETS Match Spec Patterns
+`peer_connect` and `peer_connect_ack` are discovery hints, not authority.
+The old `cluster_state` handler is receive-only rolling compatibility; new
+replica recovery must use heads/deltas/exact snapshots and must not add new
+dependencies on additive full-state merge.
 
-- Use `{:==, :"$N", value}` for runtime variables in guards (e.g., filtering by node)
-- **NOT** `{:const, value}` — it's invalid in ETS match specs
-- Literal Elixir variables interpolate directly into match pattern tuple positions as exact-match filters
-- For result bodies, runtime values can't be embedded directly — use `Enum.map` post-select
+## Anti-Entropy
 
-## Distributed Test Patterns
+Replica data frames are:
 
-- `Group.TestCluster.start_peers(N)` starts N real Erlang nodes via OTP `:peer`
-- All helpers (`spawn_register`, `spawn_join`, `spawn_monitor_forwarder`) use `:erpc.call` with compiled modules from `test/support/`
-- `Node.spawn` with anonymous functions won't work — remote node needs the defining module's beam file
-- `assert_eventually/2` polls with retries for async replication
-- `flush_shards/2` sends a mailbox barrier through each shard so buffered sender
-  and receiver replication work is flushed too
-- `assert_ets_consistent/1` verifies dual-index tables match
-- Partition tests use 3 nodes (isolate 1 from other 2). 2-node partitions are unreliable because the test node bridges them.
-- `Supervisor.start_link` links to caller — in RPC context, must `Process.unlink(pid)` or supervisor dies on RPC return
-- `test_helper.exs`: starts EPMD when needed, calls `Node.start/2`, sets the cookie, and disables `prevent_overlapping_partitions`
+- `heads`: stream, retained floor, and head;
+- `delta_batch`: one or more contiguous stream runs;
+- `need`: the receiver's next missing sequence; and
+- `snapshot_chunk`: one byte-targeted part of an exact origin slice.
+
+A receiver advances its cursor only through a contiguous prefix. Duplicates are
+idempotent; gaps request the missing suffix. Periodic heads recover a dropped
+tail even if no later write occurs. If the requested sequence is below the
+bounded oplog floor, the origin sends an exact snapshot containing only its own
+claims and memberships for that shard/cluster stream. Absence is deletion.
+
+The oplog is bounded per shard and never waits for acknowledgements. There are
+no leaders, quorums, replicated per-entry tombstones, known-member lists, or
+retention barriers. A slow peer cannot pin memory.
+
+Snapshots are transport-neutral and byte-targeted (1 MiB by default). A single
+oversized row is one chunk. Multi-chunk receivers stage rows in shard-owned
+private ETS and preserve the old visible slice/cursor until the complete,
+authority-valid manifest is present. Loss, duplication, reordering,
+supersession, stale authority, expiry, and shard crash must leave no partial
+visible state. Staging expires after one peer-lease interval without progress.
+
+## Nonblocking Transport
+
+All cross-node Group control sends use
+`:erlang.send_nosuspend(..., [:noconnect])`. The default distribution replica
+adapter sends directly the same way and adds no local hop. `:busy` and
+`:disconnected` mean “drop this frame”; periodic anti-entropy repairs it.
+
+A sideband adapter may use one local `Group.Replica.Transport.Outbox` per
+shard. Outboxes batch by peer, impose deadlines, and run bounded socket work
+outside Group shards. Queue overflow, expiry, or socket backpressure drops the
+batch. The included TCP adapter adds bounded per-peer writer queues and
+capability-authenticated ingress while distribution still authenticates node
+identity and carries authority. TCP is not encrypted.
+
+Transport ordering is not required for correctness. Per-shard ordered delivery
+is a fast path; stream sequences reject duplicate/out-of-order data, and
+generation/epoch/lane fences handle control/data reordering. Ingress must derive
+`source_node` from the authenticated connection, never from payload data, and
+must reassemble any transport segmentation before `deliver_batch/4`.
+
+## Registry Projection and Process Ownership
+
+Registry claims remain authoritative per origin even when hidden by another
+origin's visible winner. Conflict resolution folds claims deterministically.
+The configured callback chooses a pid (or neither), but Group owns lifecycle
+effects: each losing origin appends its own authoritative unregister and exits
+only its local process with
+`{:group_registry_conflict, key, winner_meta}`.
+
+A node never monitors or exits another node's member processes. Local shards
+monitor locally owned registration/PG pids. Local `DOWN` appends ordered
+unregister/leave mutations before deletion and replication. Remote owner death
+arrives through those records; `nodedown` or lease expiry is the fallback for
+an origin that cannot emit them.
+
+## Peer and Cluster Lifecycle
+
+- Dist-Erlang `nodedown` immediately purges that node's visible rows, claims,
+  cursors, authority, cluster routing, and sideband session on every shard.
+- Constant-size control heartbeats cover the case where the Erlang node remains
+  connected but its Group instance disappears. Peer-lease expiry performs the
+  same complete purge.
+- Discovery probes continue after expiry. A returning current/new generation
+  is fenced, installs authority per lane, and reconstructs through deltas or an
+  exact snapshot.
+- Incremental named-cluster open/close controls are generation fenced and
+  batched. A quiet exact hello repairs dropped/reordered control messages.
+- Local cluster close uses a temporary all-shard completion barrier. The last
+  shard removes routing/epoch rows; restart repair completes abandoned closes,
+  and reconnect waits so an old close cannot erase new writes.
+
+TTL leases are local policy only. On expiry, Group disconnects a named cluster
+only when no local registrations, PG memberships, or cluster monitors remain.
+
+## Batching and Fairness
+
+Registry and PG mutations share one outbound sender buffer so local mailbox
+order is retained. It flushes on size, age, idle timer, and before control or
+routing barriers. Receivers apply contiguous runs in bulk and emit lifecycle
+events in operation batches. After replicated work, each shard takes a bounded
+FIFO local-request turn to prevent replica pressure from starving callers.
+
+## Distributed Test Rules
+
+- Use three peers for partition/recovery tests. Two nodes cannot cover an
+  independent survivor while an origin and receiver disagree.
+- Remote helpers must be compiled under `test/support/`; call them with MFA
+  through `:erpc`.
+- Unlink supervisors started inside RPC helpers.
+- `flush_shards/2` is only a mailbox/barrier aid; convergence assertions must
+  still wait for AE and inspect exact public/internal state.
+- Always assert dead owners are absent, retained owners are alive, claims and
+  projections agree, cursors are contiguous, no partial snapshot remains, and
+  retired origins have no rows.
 
 ## Critical Invariants
 
-1. **purge_cluster_node is unconditional** — every shard calls it on nodedown/DOWN, not just shard 0. Late peer_connect on non-zero shard can re-add dead node after shard 0 cleaned it.
-2. **Dispatch :unregistered for evicted local pid** in "remote wins" branch of resolve_conflict — monitors need to see the eviction.
-3. **merge_remote_cluster_data uses Enum.reduce** (not `for`) to thread `{state, events}` through, since resolve_conflict modifies `state.monitors`.
-4. **Additive merge only** — cluster_state merge inserts but never deletes. Local named-cluster disconnect therefore purges the complete local cluster view, and replicated batches are membership-gated at apply time.
-5. **PG tables have no overwrite conflicts** — `pg_by_key` key includes pid: `{cluster, key, pid}`.
-6. **Named-cluster data is membership-gated** — both `cluster_state` and buffered replicated operations reject data for clusters the local node has left.
+1. A cursor never advances across a gap or before a full exact snapshot commits.
+2. Exact snapshots replace one origin slice; they are never additive merges.
+3. Authority requires generation, exact epoch revision, and installed lane
+   readiness. Observed heartbeats/controls are not exact authority.
+4. A stale generation, epoch, lane, shard, transitive pid, or unauthenticated
+   source is rejected before applying replica data.
+5. Registry claims are retained per origin until that origin deletes them or is
+   retired; the visible winner is reconstructible from remaining claims.
+6. Only an owner node monitors, retires, or exits its member processes.
+7. Oplog pruning is local and bounded; lagging peers use exact snapshot repair.
+8. `nodedown` and peer-lease expiry purge every public and internal reference
+   to the retired origin. Remote shard death cannot leave state permanently;
+   lease expiry or fenced rediscovery completes cleanup/recovery.
+9. Snapshot staging is private, all-or-nothing, authority fenced, and expiring.
+10. Local append/journal repair makes an appended mutation either replayable or
+    durably applied after a shard crash.
+11. Cross-node control and replica calls never block a Group shard.
+12. Cluster close completion survives caller timeout and shard restart.
 
 ## Logging
 
-- `log:` option: `:info` (default), `false` (routine logs disabled), `:verbose` (all shards)
-- `log/2` (normal), `log_verbose/2` (verbose only), `log_once/2` (shard 0 only) use `Logger.info`; `:verbose` is Group's own flag, not a Logger level
-- Registry conflicts are unconditional `Logger.error` events; busy distribution links are unconditional `Logger.warning` events
-- Runtime change: `Group.log_level(name, level)`
+`log: :info | :verbose | false` controls routine Group logs and can be changed
+with `Group.log_level/2`. Registry conflicts remain errors and busy dispatch
+links remain warnings regardless of the routine level.
