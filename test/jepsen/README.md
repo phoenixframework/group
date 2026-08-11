@@ -25,7 +25,7 @@ The replica lane is selectable without changing the workload or checker:
 - `tcp` uses Group's production sideband TCP adapter while Erlang distribution
   remains the control plane; and
 - `chaos` is a local per-shard outbox which deterministically drops,
-  duplicates, delays, and reorders replica frames.
+  duplicates, delays, and reorders replica messages.
 
 After faults stop, every surviving node reconnects and the harness takes two
 terminal snapshots. The independent checker requires:

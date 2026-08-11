@@ -5,10 +5,10 @@ defmodule Group.ReplicaModelScheduler do
 
   defmodule Envelope do
     @moduledoc false
-    defstruct [:id, :source, :target, :shard, :frame]
+    defstruct [:id, :source, :target, :shard, :message]
   end
 
-  defstruct [:name, :nodes, :model, :group_opts, owners: %{}, queue: [], next_frame_id: 1]
+  defstruct [:name, :nodes, :model, :group_opts, owners: %{}, queue: [], next_message_id: 1]
 
   def new(name, nodes, group_opts \\ []) do
     %__MODULE__{
@@ -247,18 +247,18 @@ defmodule Group.ReplicaModelScheduler do
 
   def drain(%__MODULE__{} = state, wait_ms \\ 0) do
     receive do
-      {ControlledReplicaTransport, :frame, group, source, target, shard, frame}
+      {ControlledReplicaTransport, :message, group, source, target, shard, message}
       when group == state.name ->
         envelope = %Envelope{
-          id: state.next_frame_id,
+          id: state.next_message_id,
           source: source,
           target: target,
           shard: shard,
-          frame: frame
+          message: message
         }
 
         drain(
-          %{state | queue: state.queue ++ [envelope], next_frame_id: state.next_frame_id + 1},
+          %{state | queue: state.queue ++ [envelope], next_message_id: state.next_message_id + 1},
           wait_ms
         )
     after
@@ -391,8 +391,8 @@ defmodule Group.ReplicaModelScheduler do
         TestCluster.rpc!(
           envelope.target,
           Group.Replica.Transport,
-          :deliver,
-          [state.name, envelope.source, envelope.shard, envelope.frame]
+          :incoming,
+          [state.name, envelope.source, envelope.shard, envelope.message]
         )
 
       TestCluster.flush_shards(envelope.target, state.name)
@@ -505,7 +505,7 @@ defmodule Group.ReplicaModelScheduler do
 
   defp drain_transport_messages(name) do
     receive do
-      {ControlledReplicaTransport, :frame, ^name, _source, _target, _shard, _frame} ->
+      {ControlledReplicaTransport, :message, ^name, _source, _target, _shard, _message} ->
         drain_transport_messages(name)
     after
       0 -> :ok

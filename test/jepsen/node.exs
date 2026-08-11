@@ -80,14 +80,14 @@ defmodule Group.Jepsen.Transport.Common do
   @moduledoc false
   alias Group.Jepsen.Transport.Stats
 
-  def try_send(delegate, group, target_node, shard, frame, opts) do
-    record(frame)
+  def outgoing(delegate, group, target_node, shard, message, opts) do
+    record(message)
 
     if Stats.blocked?(target_node) do
       Stats.increment(:logical_drop)
       :ok
     else
-      result = delegate.try_send(group, target_node, shard, frame, opts)
+      result = delegate.outgoing(group, target_node, shard, message, opts)
       Stats.increment(transport_result(result))
       observe_outbox(group, shard)
       result
@@ -103,7 +103,7 @@ defmodule Group.Jepsen.Transport.Common do
   end
 
   def record({:delta_batch, _version, _runs}), do: Stats.increment(:delta_batch)
-  def record(_frame), do: Stats.increment(:other_frame)
+  def record(_message), do: Stats.increment(:other_message)
 
   defp transport_result(:ok), do: :transport_ok
   defp transport_result(:busy), do: :transport_busy
@@ -140,8 +140,8 @@ defmodule Group.Jepsen.Transport.Distribution do
   def child_spec(opts), do: {Stats, opts}
 
   @impl true
-  def try_send(group, target_node, shard, frame, opts) do
-    Common.try_send(Delegate, group, target_node, shard, frame, opts)
+  def outgoing(group, target_node, shard, message, opts) do
+    Common.outgoing(Delegate, group, target_node, shard, message, opts)
   end
 end
 
@@ -168,8 +168,8 @@ defmodule Group.Jepsen.Transport.TCP do
   end
 
   @impl true
-  def try_send(group, target_node, shard, frame, opts) do
-    Common.try_send(Delegate, group, target_node, shard, frame, opts)
+  def outgoing(group, target_node, shard, message, opts) do
+    Common.outgoing(Delegate, group, target_node, shard, message, opts)
   end
 
   @impl true
@@ -219,8 +219,8 @@ defmodule Group.Jepsen.Transport.Chaos do
   end
 
   @impl true
-  def try_send(group, target_node, shard, frame, _opts) do
-    Common.record(frame)
+  def outgoing(group, target_node, shard, message, _opts) do
+    Common.record(message)
 
     if Stats.blocked?(target_node) do
       Stats.increment(:logical_drop)
@@ -228,7 +228,7 @@ defmodule Group.Jepsen.Transport.Chaos do
     else
       case Process.whereis(worker_name(group, shard)) do
         pid when is_pid(pid) ->
-          send(pid, {:send, target_node, frame})
+          send(pid, {:outgoing, target_node, message})
           :ok
 
         nil ->
@@ -277,7 +277,7 @@ defmodule Group.Jepsen.Transport.Chaos.Worker do
   def init({group, shard}), do: {:ok, %{group: group, shard: shard, counter: 0}}
 
   @impl true
-  def handle_info({:send, target_node, frame}, state) do
+  def handle_info({:outgoing, target_node, message}, state) do
     counter = state.counter + 1
     next = %{state | counter: counter}
 
@@ -285,11 +285,11 @@ defmodule Group.Jepsen.Transport.Chaos.Worker do
       Stats.increment(:chaos_drop)
     else
       delay = rem(counter * 17, 41)
-      Process.send_after(self(), {:deliver, target_node, frame}, delay)
+      Process.send_after(self(), {:forward, target_node, message}, delay)
 
       if rem(counter, 7) == 0 do
         Stats.increment(:chaos_duplicate)
-        Process.send_after(self(), {:deliver, target_node, frame}, rem(delay + 19, 47))
+        Process.send_after(self(), {:forward, target_node, message}, rem(delay + 19, 47))
       end
 
       if delay > 0, do: Stats.increment(:chaos_delay)
@@ -298,9 +298,9 @@ defmodule Group.Jepsen.Transport.Chaos.Worker do
     {:noreply, next}
   end
 
-  def handle_info({:deliver, target_node, frame}, state) do
+  def handle_info({:forward, target_node, replica_message}, state) do
     destination = {Group.Replica.shard_name(state.group, state.shard), target_node}
-    message = {:group_replica_frame, node(), frame}
+    message = {:group_replica_frame, node(), replica_message}
 
     case :erlang.send_nosuspend(destination, message, [:noconnect]) do
       true -> Stats.increment(:chaos_delivered)

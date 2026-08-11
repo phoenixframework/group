@@ -556,7 +556,7 @@ defmodule Group.ReplicaSnapshotDistributedTest do
       ])
 
     :ok =
-      TestCluster.rpc!(node_a, Group.Replica.Transport, :deliver, [
+      TestCluster.rpc!(node_a, Group.Replica.Transport, :incoming, [
         name,
         node_b,
         0,
@@ -581,7 +581,7 @@ defmodule Group.ReplicaSnapshotDistributedTest do
   defp deliver_frames(node_b, node_a, name, frames) do
     Enum.each(frames, fn frame ->
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
           name,
           node_a,
           0,

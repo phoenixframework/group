@@ -36,7 +36,7 @@ defmodule Group.TestReplicaTransport do
   end
 
   @impl true
-  def try_send(group, target_node, shard, frame, _opts) do
+  def outgoing(group, target_node, shard, message, _opts) do
     case :persistent_term.get({__MODULE__, group}, :pass) do
       :drop ->
         :ok
@@ -45,42 +45,44 @@ defmodule Group.TestReplicaTransport do
         :busy
 
       :duplicate ->
-        deliver(group, target_node, shard, frame)
-        deliver(group, target_node, shard, frame)
+        forward(group, target_node, shard, message)
+        forward(group, target_node, shard, message)
 
       {:drop_types, types} ->
-        if frame_type(frame) in types, do: :ok, else: deliver(group, target_node, shard, frame)
+        if message_type(message) in types,
+          do: :ok,
+          else: forward(group, target_node, shard, message)
 
       {:duplicate_types, types} ->
-        if frame_type(frame) in types do
-          deliver(group, target_node, shard, frame)
-          deliver(group, target_node, shard, frame)
+        if message_type(message) in types do
+          forward(group, target_node, shard, message)
+          forward(group, target_node, shard, message)
         else
-          deliver(group, target_node, shard, frame)
+          forward(group, target_node, shard, message)
         end
 
       {:delay_types, delays, default_delay} ->
-        delay = Map.get(delays, frame_type(frame), default_delay)
-        delayed_deliver(group, target_node, shard, frame, delay)
+        delay = Map.get(delays, message_type(message), default_delay)
+        delayed_forward(group, target_node, shard, message, delay)
 
       {:capture_drop, types} ->
-        if frame_type(frame) in types, do: capture(group, target_node, shard, frame)
+        if message_type(message) in types, do: capture(group, target_node, shard, message)
         :ok
 
       {:capture_pass, types} ->
-        if frame_type(frame) in types, do: capture(group, target_node, shard, frame)
-        deliver(group, target_node, shard, frame)
+        if message_type(message) in types, do: capture(group, target_node, shard, message)
+        forward(group, target_node, shard, message)
 
       {:chaos, opts} ->
-        chaos_deliver(group, target_node, shard, frame, opts)
+        chaos_forward(group, target_node, shard, message, opts)
 
       :pass ->
-        deliver(group, target_node, shard, frame)
+        forward(group, target_node, shard, message)
     end
   end
 
-  defp chaos_deliver(group, target_node, shard, frame, opts) do
-    hash = :erlang.phash2({target_node, shard, frame}, 1_000_003)
+  defp chaos_forward(group, target_node, shard, message, opts) do
+    hash = :erlang.phash2({target_node, shard, message}, 1_000_003)
     drop_every = Keyword.get(opts, :drop_every, 0)
     duplicate_every = Keyword.get(opts, :duplicate_every, 0)
     max_delay = Keyword.get(opts, :max_delay, 0)
@@ -91,43 +93,43 @@ defmodule Group.TestReplicaTransport do
 
       duplicate_every > 0 and rem(hash, duplicate_every) == 0 ->
         delay = if max_delay > 0, do: rem(hash, max_delay + 1), else: 0
-        delayed_deliver(group, target_node, shard, frame, delay)
-        delayed_deliver(group, target_node, shard, frame, max(max_delay - delay, 0))
+        delayed_forward(group, target_node, shard, message, delay)
+        delayed_forward(group, target_node, shard, message, max(max_delay - delay, 0))
 
       true ->
         delay = if max_delay > 0, do: rem(hash, max_delay + 1), else: 0
-        delayed_deliver(group, target_node, shard, frame, delay)
+        delayed_forward(group, target_node, shard, message, delay)
     end
   end
 
-  defp delayed_deliver(group, target_node, shard, frame, delay) when delay <= 0,
-    do: deliver(group, target_node, shard, frame)
+  defp delayed_forward(group, target_node, shard, message, delay) when delay <= 0,
+    do: forward(group, target_node, shard, message)
 
-  defp delayed_deliver(group, target_node, shard, frame, delay) do
+  defp delayed_forward(group, target_node, shard, message, delay) do
     source_node = node()
 
     spawn(fn ->
       receive do
       after
-        delay -> deliver(group, target_node, shard, frame, source_node)
+        delay -> forward(group, target_node, shard, message, source_node)
       end
     end)
 
     :ok
   end
 
-  defp capture(group, target_node, shard, frame) do
+  defp capture(group, target_node, shard, message) do
     key = {__MODULE__, group, :captured}
     captured = :persistent_term.get(key, [])
-    :persistent_term.put(key, [{target_node, shard, frame} | captured])
+    :persistent_term.put(key, [{target_node, shard, message} | captured])
   end
 
-  defp deliver(group, target_node, shard, frame),
-    do: deliver(group, target_node, shard, frame, node())
+  defp forward(group, target_node, shard, message),
+    do: forward(group, target_node, shard, message, node())
 
-  defp deliver(group, target_node, shard, frame, source_node) do
+  defp forward(group, target_node, shard, replica_message, source_node) do
     destination = {Group.Replica.shard_name(group, shard), target_node}
-    message = {:group_replica_frame, source_node, frame}
+    message = {:group_replica_frame, source_node, replica_message}
 
     case :erlang.send_nosuspend(destination, message, [:noconnect]) do
       true -> :ok
@@ -135,6 +137,6 @@ defmodule Group.TestReplicaTransport do
     end
   end
 
-  defp frame_type(frame) when is_tuple(frame), do: elem(frame, 0)
-  defp frame_type(_frame), do: :unknown
+  defp message_type(message) when is_tuple(message), do: elem(message, 0)
+  defp message_type(_message), do: :unknown
 end

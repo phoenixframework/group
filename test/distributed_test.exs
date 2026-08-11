@@ -4606,7 +4606,7 @@ defmodule Group.DistributedTest do
         ])
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
           name,
           node_a,
           1,
@@ -4635,7 +4635,7 @@ defmodule Group.DistributedTest do
       end)
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
           name,
           node_a,
           1,
@@ -4722,7 +4722,7 @@ defmodule Group.DistributedTest do
     end
 
     @tag timeout: 60_000
-    test "duplicate and reordered replica frames are idempotent and emit one lifecycle event" do
+    test "duplicate and reordered replica messages are idempotent and emit one lifecycle event" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -4827,7 +4827,7 @@ defmodule Group.DistributedTest do
 
       Enum.each(generation_frames, fn {_target, shard, frame} ->
         :ok =
-          TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+          TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
             name,
             node_a,
             shard,
@@ -4882,7 +4882,7 @@ defmodule Group.DistributedTest do
 
       Enum.each(epoch_frames, fn {_target, shard, frame} ->
         :ok =
-          TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+          TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
             name,
             node_a,
             shard,
@@ -5096,7 +5096,7 @@ defmodule Group.DistributedTest do
          ]}
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
           name,
           node_a,
           0,
@@ -5113,7 +5113,7 @@ defmodule Group.DistributedTest do
              ]) == 0
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
           name,
           node_b,
           0,
@@ -5368,7 +5368,7 @@ defmodule Group.DistributedTest do
       mutation = {:register, nil, key, pid, meta, System.monotonic_time(), node_a}
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
           name,
           node_a,
           0,
@@ -5432,7 +5432,7 @@ defmodule Group.DistributedTest do
         Map.fetch!(frames_by_first_seq, 2)
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
           name,
           node_a,
           shard,
@@ -5454,7 +5454,7 @@ defmodule Group.DistributedTest do
 
       for frame <- [first_frame, second_frame, third_frame] do
         :ok =
-          TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+          TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
             name,
             node_a,
             shard,
@@ -5492,7 +5492,7 @@ defmodule Group.DistributedTest do
 
       for frame <- [first_frame, second_frame, third_frame] do
         :ok =
-          TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+          TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
             name,
             node_a,
             shard,
@@ -5600,7 +5600,7 @@ defmodule Group.DistributedTest do
       # time this frame runs, but shard 1 must still reject it until its own
       # old-generation purge has completed.
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
           name,
           node_a,
           1,
@@ -5633,7 +5633,7 @@ defmodule Group.DistributedTest do
              ]) == 0
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :deliver, [
+        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
           name,
           node_a,
           1,

@@ -289,7 +289,7 @@ All operations are **eventually consistent**:
   milliseconds. Defaults to 5.
 - **`busy_dist_retry_attempts`** — reconnect attempts after a non-suspending
   remote dispatch reports a busy dist link. Defaults to 300. Replica transport
-  frames are simply dropped and repaired instead of forcing a disconnect.
+  messages are simply dropped and repaired instead of forcing a disconnect.
 - **`busy_dist_retry_interval`** — milliseconds between dispatch busy-link
   reconnect attempts. Defaults to 1,000.
 - **`replicated_pg_receiver_local_request_quota`** — legacy-named quota for
@@ -298,7 +298,7 @@ All operations are **eventually consistent**:
 - **`replica_transport`** — a module implementing
   `Group.Replica.Transport`, or `{module, opts}`. The default adapter uses
   `:erlang.send_nosuspend/3`; adapters must return promptly with `:ok`, `:busy`,
-  or `:disconnected`. Dropped and busy frames are repaired by anti-entropy.
+  or `:disconnected`. Dropped and busy messages are repaired by anti-entropy.
   `Group.Replica.Transport.TCP` is an included sideband adapter with local
   per-shard batching and bounded per-peer writer queues; its socket owners are
   separate processes, so socket backpressure cannot block a Group shard.
@@ -307,7 +307,7 @@ All operations are **eventually consistent**:
   peer acknowledgements; a peer behind the retained floor receives an exact
   snapshot.
 - **`replicated_snapshot_chunk_target_bytes`** — target maximum encoded size
-  of each exact-snapshot frame. Defaults to 1 MiB and applies above every
+  of each exact-snapshot message. Defaults to 1 MiB and applies above every
   transport, including dist Erlang. A single row larger than the target is
   sent alone. Receivers stage chunks in shard-owned private ETS and replace
   visible state only after the complete exact slice is present.
@@ -435,7 +435,7 @@ fenced, stream-head exchange on the replica transport catches the peer up.
 Every local mutation is first appended to a stream identified by
 `{group, origin_node, origin_generation, shard, cluster, cluster_epoch}` and a
 strictly increasing sequence number. It is then applied to the materialized
-ETS view and batched into one delta frame per target. Process-death registry
+ETS view and batched into one delta message per target. Process-death registry
 and PG removals can share one record and retain their one-event-batch behavior.
 
 Receivers advance a cursor only across a contiguous sequence prefix. A gap
@@ -448,7 +448,7 @@ There are no leaders, quorum acknowledgements, per-entry replicated tombstones,
 or known-membership retention barriers. Oplog memory is bounded locally and
 independently of slow peers. Deletes are normal ordered records while retained,
 and exact snapshots close gaps after pruning. Exact snapshots are split into
-transport-neutral byte-bounded frames; loss, duplication, or reordering leaves
+transport-neutral byte-bounded messages; loss, duplication, or reordering leaves
 the old visible slice and cursor untouched until all chunks arrive. Incomplete
 staging expires after a peer-lease interval without progress and is destroyed
 automatically with its owning shard. Named-cluster close uses only a temporary
@@ -467,8 +467,8 @@ writes, each stream numbers them, and receivers reject gaps and duplicates.
 Per-shard ordered delivery is still a useful fast path. Cross-stream order is
 not a correctness dependency; cluster epochs reject data racing a disconnect
 or reconnect, and generation fencing rejects data from a restarted origin.
-An alternative sideband adapter authenticates the peer as a dist-Erlang node
-and calls `Group.Replica.Transport.deliver/4` locally.
+An alternative sideband adapter passes incoming messages to
+`Group.Replica.Transport.incoming/4` locally.
 
 For example, replica data can use the included sideband TCP adapter while
 authority and membership remain on dist Erlang:
@@ -495,22 +495,21 @@ control/data ordering relationship; the generation/epoch lane barrier and
 stream sequence checks supply correctness.
 
 The default distribution adapter still sends directly to the remote shard and
-does not pay for a local outbox. Sideband adapters can delegate `try_send/5` to
-`Group.Replica.Transport.Outbox.try_send/5` and supervise one outbox per shard
-with `Group.Replica.Transport.Outbox.child_spec/1`. An outbox groups frames by
+does not pay for a local outbox. Sideband adapters can delegate `outgoing/5` to
+`Group.Replica.Transport.Outbox.push/5` and supervise one outbox per shard
+with `Group.Replica.Transport.Outbox.child_spec/1`. An outbox groups messages by
 target and invokes the adapter's `send_batch/4` callback. Calls that expire or
 return `:busy`/`:disconnected` are dropped without a local retry; the next
 anti-entropy exchange repairs them.
 
 A message-oriented backend fits this callback shape by obtaining a connection
 once from `init_outbox/3`, then sending each `send_batch/4` result to a
-registered ingress name on the target node. Queue pressure maps to `:busy` and
-a missing session maps to `:disconnected`. Ingress must attach the authenticated
-connection's source node; an adapter must never trust a source node supplied
-inside the payload. Exact snapshots are already bounded by Group. A transport
-with a smaller maximum frame may additionally segment an encoded batch, but it
-must completely reassemble that batch before calling
-`Group.Replica.Transport.deliver_batch/4`.
+registered incoming name on the target node. Queue pressure maps to `:busy` and
+a missing session maps to `:disconnected`. The adapter passes the trusted peer's
+source node alongside each message. Exact snapshots are already bounded by
+Group. A transport with a smaller maximum frame may additionally segment an
+encoded batch, but it must completely reassemble that batch before calling
+`Group.Replica.Transport.incoming_batch/4`.
 
 ### Named Cluster TTL Leases
 

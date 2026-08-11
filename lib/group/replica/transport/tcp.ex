@@ -3,17 +3,17 @@ defmodule Group.Replica.Transport.TCP do
   Sideband TCP transport for replica data.
 
   Erlang distribution still carries Group discovery and authority controls.
-  Replica frames use independent TCP connections, so there is no ordering
+  Replica messages use independent TCP connections, so there is no ordering
   relationship between a control message and its data lane.
 
-  `try_send/5` only sends to a local per-shard outbox. The outbox batches
-  frames and forwards each target batch to a bounded per-peer writer queue.
+  `outgoing/5` only pushes to a local per-shard outbox. The outbox batches
+  messages and forwards each target batch to a bounded per-peer writer queue.
   The writer may block up to `:send_timeout` without blocking a Group shard.
   Expired, busy, and disconnected batches are dropped and repaired by
   anti-entropy.
 
   The endpoint capability in the dist-Erlang hello prevents an unrelated
-  socket client from injecting frames. This transport is intended for trusted
+  socket client from injecting messages. This transport is intended for trusted
   cluster networks; it does not encrypt traffic. Put it behind a private
   network or a TLS/WebSocket tunnel when confidentiality is required.
 
@@ -64,20 +64,20 @@ defmodule Group.Replica.Transport.TCP do
   end
 
   @impl true
-  def try_send(group, target_node, shard, frame, opts),
-    do: Outbox.try_send(group, target_node, shard, frame, opts)
+  def outgoing(group, target_node, shard, message, opts),
+    do: Outbox.push(group, target_node, shard, message, opts)
 
   @impl Group.Replica.Transport.Outbox
   def init_outbox(group, shard, _opts), do: {:ok, %{group: group, shard: shard}}
 
   @impl Group.Replica.Transport.Outbox
-  def send_batch(target_node, frames, deadline, %{group: group, shard: shard} = state) do
+  def send_batch(target_node, messages, deadline, %{group: group, shard: shard} = state) do
     result =
       try do
         case :ets.lookup(route_table(group), target_node) do
           [{^target_node, writer, queued, max_queue}] ->
             if :atomics.add_get(queued, 1, 1) <= max_queue do
-              send(writer, {:replica_batch, deadline, shard, frames})
+              send(writer, {:replica_batch, deadline, shard, messages})
               :ok
             else
               :atomics.sub(queued, 1, 1)
@@ -379,12 +379,12 @@ defmodule Group.Replica.Transport.TCP do
 
   defp writer_loop(socket, manager, remote_node, queued) do
     receive do
-      {:replica_batch, deadline, shard, frames} ->
+      {:replica_batch, deadline, shard, messages} ->
         result =
           if deadline <= Outbox.monotonic_ms() do
             :expired
           else
-            :gen_tcp.send(socket, :erlang.term_to_binary({:batch, shard, frames}))
+            :gen_tcp.send(socket, :erlang.term_to_binary({:batch, shard, messages}))
           end
 
         :atomics.sub(queued, 1, 1)
@@ -438,9 +438,9 @@ defmodule Group.Replica.Transport.TCP do
     case :gen_tcp.recv(socket, 0) do
       {:ok, payload} ->
         case decode_authenticated_frame(payload) do
-          {:ok, {:batch, shard, frames}}
-          when is_integer(shard) and shard >= 0 and is_list(frames) ->
-            :ok = Group.Replica.Transport.deliver_batch(group, source_node, shard, frames)
+          {:ok, {:batch, shard, messages}}
+          when is_integer(shard) and shard >= 0 and is_list(messages) ->
+            :ok = Group.Replica.Transport.incoming_batch(group, source_node, shard, messages)
             reader_loop(socket, group, source_node)
 
           _ ->

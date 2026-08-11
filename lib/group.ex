@@ -234,7 +234,7 @@ defmodule Group do
     data or cluster controls are busy (default: `8`)
   - `:replica_transport` — replica data transport module or `{module, opts}` tuple.
     Defaults to `Group.Replica.Transport.Distribution`. The transport must be
-    nonblocking and may return `:busy`; anti-entropy repairs dropped frames.
+    nonblocking and may return `:busy`; anti-entropy repairs dropped messages.
     Sideband transports can use `Group.Replica.Transport.Outbox` for lossy,
     batched, per-shard isolation without adding a hop to the default transport.
   - `:replicated_oplog_max_entries` — maximum retained replica records per shard

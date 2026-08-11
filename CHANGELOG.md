@@ -5,6 +5,10 @@
   oracle across distribution, sideband TCP, and lossy/reordering transports.
   `mix test` is the every-PR ExUnit/property/checker gate and `mix test.soak`
   runs the six-profile nightly/release campaign.
+- **Breaking**: the replica transport boundary now names logical direction
+  rather than implementation mechanics: adapters implement `outgoing/5`,
+  sideband adapters use `Group.Replica.Transport.Outbox.push/5`, and receiving
+  adapters call `incoming/4` or `incoming_batch/4`.
 - **Breaking**: replica protocol v2 splits exact snapshots into
   transport-neutral, byte-targeted chunks (`1 MiB` by default). Receivers stage
   chunks in shard-owned private ETS and advance the stream cursor only after an
@@ -44,7 +48,7 @@
   the losing process's `{:group_registry_conflict, key, winner_meta}` exit reason.
 - **Breaking**: `Group.dispatch/4` remote sends and process-DOWN replication are now
   non-suspending and never auto-connect. Busy dispatch drops still force a disconnect and
-  bounded reconnect retry; replica frames are dropped and repaired by anti-entropy without
+  bounded reconnect retry; replica messages are dropped and repaired by anti-entropy without
   disturbing the dist-Erlang control connection. Previously dispatch could block the caller
   and initiate new connections.
 - Configured function-form `extract_meta` callbacks are now applied on reads and lifecycle

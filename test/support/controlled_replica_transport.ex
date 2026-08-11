@@ -19,15 +19,15 @@ defmodule Group.ControlledReplicaTransport do
   end
 
   @impl true
-  def try_send(group, target_node, shard, frame, opts) do
+  def outgoing(group, target_node, shard, message, opts) do
     case :persistent_term.get({__MODULE__, group, :mode}, :capture) do
       :capture ->
         controller = Keyword.fetch!(opts, :controller)
-        send(controller, {__MODULE__, :frame, group, node(), target_node, shard, frame})
+        send(controller, {__MODULE__, :message, group, node(), target_node, shard, message})
         :ok
 
       :pass ->
-        deliver(group, target_node, shard, frame)
+        forward(group, target_node, shard, message)
 
       :busy ->
         :busy
@@ -37,9 +37,9 @@ defmodule Group.ControlledReplicaTransport do
     end
   end
 
-  defp deliver(group, target_node, shard, frame) do
+  defp forward(group, target_node, shard, replica_message) do
     destination = {Group.Replica.shard_name(group, shard), target_node}
-    message = {:group_replica_frame, node(), frame}
+    message = {:group_replica_frame, node(), replica_message}
 
     case :erlang.send_nosuspend(destination, message, [:noconnect]) do
       true -> :ok

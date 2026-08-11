@@ -64,11 +64,11 @@ defmodule Group.Replica do
     the requested prefix has already been pruned. Receivers stage chunks in a
     private ETS table and expose nothing until every chunk is present.
 
-  Every stream field is validated against the authenticated source node and
+  Every stream field is validated against the source node and
   current generation/epoch. An old generation, a closed epoch, a wrong shard,
   or a transitive claim for another node's pid is rejected. Control/data
-  reordering is safe: early frames are ignored and repeated heads repair them;
-  late frames fail their generation or epoch fence. Snapshot chunks may be
+  reordering is safe: early messages are ignored and repeated heads repair them;
+  late messages fail their generation or epoch fence. Snapshot chunks may be
   lost, duplicated, reordered, or mixed across retransmissions at the same
   stream head; exact row counts and set insertion prevent partial commits.
 
@@ -88,10 +88,10 @@ defmodule Group.Replica do
 
   All cross-node control messages use :erlang.send_nosuspend/3 with :noconnect.
   The default replica adapter does the same. Transport callbacks return :ok,
-  :busy, or :disconnected; failure drops the frame and anti-entropy repairs it.
+  :busy, or :disconnected; failure drops the message and anti-entropy repairs it.
   Replica shards never remotely monitor or exit member processes.
 
-  The transport need not order frames for correctness. The local shard
+  The transport need not order messages for correctness. The local shard
   serializes writes, sequence numbers establish per-stream order, and receivers
   reject duplicates and gaps. TCP shard-to-shard ordering remains the efficient
   fast path. No semantic operation spans clusters, so cross-stream ordering is
@@ -764,20 +764,21 @@ defmodule Group.Replica do
     end
   end
 
-  def handle_info({:group_replica_frame, remote_pid, frame}, state) when is_pid(remote_pid) do
+  def handle_info({:group_replica_frame, remote_pid, message}, state) when is_pid(remote_pid) do
     remote_node = node(remote_pid)
-    state = handle_replica_frame(state, remote_node, frame)
+    state = handle_replica_message(state, remote_node, message)
     {:noreply, take_priority_turn(state)}
   end
 
-  def handle_info({:group_replica_frame, remote_node, frame}, state) when is_atom(remote_node) do
-    state = handle_replica_frame(state, remote_node, frame)
+  def handle_info({:group_replica_frame, remote_node, message}, state)
+      when is_atom(remote_node) do
+    state = handle_replica_message(state, remote_node, message)
     {:noreply, take_priority_turn(state)}
   end
 
-  def handle_info({:group_replica_batch, remote_node, frames}, state)
-      when is_atom(remote_node) and is_list(frames) do
-    state = Enum.reduce(frames, state, &handle_replica_frame(&2, remote_node, &1))
+  def handle_info({:group_replica_batch, remote_node, messages}, state)
+      when is_atom(remote_node) and is_list(messages) do
+    state = Enum.reduce(messages, state, &handle_replica_message(&2, remote_node, &1))
     {:noreply, take_priority_turn(state)}
   end
 
@@ -2712,7 +2713,7 @@ defmodule Group.Replica do
         {stream_id, first_seq, records, head}
       end)
 
-    try_send_replica_frame(state, target_node, {:delta_batch, Protocol.version(), runs})
+    outgoing_replica_message(state, target_node, {:delta_batch, Protocol.version(), runs})
   end
 
   defp group_broadcast_ops_by_target(ops, state, cluster_fun) do
@@ -2812,12 +2813,12 @@ defmodule Group.Replica do
     end
   end
 
-  defp try_send_replica_frame(state, target_node, frame) do
-    case state.replica_transport.try_send(
+  defp outgoing_replica_message(state, target_node, message) do
+    case state.replica_transport.outgoing(
            state.name,
            target_node,
            state.shard_index,
-           frame,
+           message,
            state.replica_transport_opts
          ) do
       :ok -> :ok
@@ -3230,7 +3231,7 @@ defmodule Group.Replica do
     if heads == [] do
       state
     else
-      try_send_replica_frame(state, target_node, {:heads, Protocol.version(), heads})
+      outgoing_replica_message(state, target_node, {:heads, Protocol.version(), heads})
     end
   end
 
@@ -3287,7 +3288,7 @@ defmodule Group.Replica do
       (is_nil(cluster) or cluster_member?(state.name, cluster))
   end
 
-  defp handle_replica_frame(state, source_node, {:heads, version, heads})
+  defp handle_replica_message(state, source_node, {:heads, version, heads})
        when version == @protocol_version do
     needs =
       Enum.flat_map(heads, fn {stream_id, _floor, head} ->
@@ -3302,11 +3303,11 @@ defmodule Group.Replica do
     needs
     |> Enum.chunk_every(state.replicated_sender_buffer_size)
     |> Enum.reduce(state, fn chunk, acc ->
-      try_send_replica_frame(acc, source_node, {:needs, Protocol.version(), chunk})
+      outgoing_replica_message(acc, source_node, {:needs, Protocol.version(), chunk})
     end)
   end
 
-  defp handle_replica_frame(state, source_node, {:delta_batch, version, runs})
+  defp handle_replica_message(state, source_node, {:delta_batch, version, runs})
        when version == @protocol_version do
     state = flush_pending_replicated_sender_barrier(state)
 
@@ -3315,7 +3316,7 @@ defmodule Group.Replica do
     end)
   end
 
-  defp handle_replica_frame(state, source_node, {:need, version, stream_id, next_seq})
+  defp handle_replica_message(state, source_node, {:need, version, stream_id, next_seq})
        when version == @protocol_version do
     if Protocol.stream_origin(stream_id) == node() and
          Protocol.stream_shard(stream_id) == state.shard_index and
@@ -3326,12 +3327,12 @@ defmodule Group.Replica do
     end
   end
 
-  defp handle_replica_frame(state, source_node, {:needs, version, needs})
+  defp handle_replica_message(state, source_node, {:needs, version, needs})
        when version == @protocol_version do
     send_replica_repairs(state, source_node, needs)
   end
 
-  defp handle_replica_frame(
+  defp handle_replica_message(
          state,
          source_node,
          {:snapshot_chunk, version, stream_id, snapshot_seq, chunk_index, chunk_count,
@@ -3380,7 +3381,7 @@ defmodule Group.Replica do
     end
   end
 
-  defp handle_replica_frame(state, _source_node, _frame), do: state
+  defp handle_replica_message(state, _source_node, _message), do: state
 
   defp valid_snapshot_stream?(state, source_node, stream_id, snapshot_seq) do
     valid_remote_stream?(state, source_node, stream_id) and
@@ -3857,7 +3858,7 @@ defmodule Group.Replica do
   end
 
   defp request_replica_need(state, target_node, stream_id, next_seq) do
-    try_send_replica_frame(
+    outgoing_replica_message(
       state,
       target_node,
       {:needs, Protocol.version(), [{stream_id, next_seq}]}
@@ -3884,7 +3885,7 @@ defmodule Group.Replica do
         state
 
       runs ->
-        try_send_replica_frame(
+        outgoing_replica_message(
           state,
           target_node,
           {:delta_batch, Protocol.version(), Enum.reverse(runs)}
@@ -3944,7 +3945,7 @@ defmodule Group.Replica do
     snapshot.chunks
     |> Enum.with_index(1)
     |> Enum.reduce(state, fn {{reg_chunk, pg_chunk}, chunk_index}, acc ->
-      try_send_replica_frame(
+      outgoing_replica_message(
         acc,
         target_node,
         {:snapshot_chunk, Protocol.version(), stream_id, head, chunk_index, chunk_count,

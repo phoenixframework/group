@@ -19,10 +19,10 @@ defmodule Group.ReplicaTransportOutboxTest do
     end
 
     @impl true
-    def send_batch(target_node, frames, deadline, state) do
+    def send_batch(target_node, messages, deadline, state) do
       send(
         state.controller,
-        {:outbox_batch, state.group, state.shard, target_node, frames, deadline}
+        {:outbox_batch, state.group, state.shard, target_node, messages, deadline}
       )
 
       if state.sleep > 0, do: Process.sleep(state.sleep)
@@ -30,7 +30,7 @@ defmodule Group.ReplicaTransportOutboxTest do
     end
   end
 
-  test "batches frames per target while preserving per-target order" do
+  test "batches messages per target while preserving per-target order" do
     group = unique_group(:batch)
     target_a = :"outbox-a@test"
     target_b = :"outbox-b@test"
@@ -40,20 +40,20 @@ defmodule Group.ReplicaTransportOutboxTest do
       outbox_flush_interval: 1_000
     )
 
-    assert :ok = Outbox.try_send(group, target_a, 0, {:frame, 1}, outbox_deadline: 1_000)
-    assert :ok = Outbox.try_send(group, target_b, 0, {:frame, 2}, outbox_deadline: 1_000)
-    assert :ok = Outbox.try_send(group, target_a, 0, {:frame, 3}, outbox_deadline: 1_000)
+    assert :ok = Outbox.push(group, target_a, 0, {:message, 1}, outbox_deadline: 1_000)
+    assert :ok = Outbox.push(group, target_b, 0, {:message, 2}, outbox_deadline: 1_000)
+    assert :ok = Outbox.push(group, target_a, 0, {:message, 3}, outbox_deadline: 1_000)
 
     batches =
       for _ <- 1..2, into: %{} do
-        assert_receive {:outbox_batch, ^group, 0, target, frames, deadline}, 1_000
+        assert_receive {:outbox_batch, ^group, 0, target, messages, deadline}, 1_000
         assert deadline > Outbox.monotonic_ms()
-        {target, frames}
+        {target, messages}
       end
 
     assert batches == %{
-             target_a => [{:frame, 1}, {:frame, 3}],
-             target_b => [{:frame, 2}]
+             target_a => [{:message, 1}, {:message, 3}],
+             target_b => [{:message, 2}]
            }
   end
 
@@ -66,21 +66,21 @@ defmodule Group.ReplicaTransportOutboxTest do
       backend_sleep: 200
     )
 
-    assert :ok = Outbox.try_send(group, target, 0, :first, outbox_deadline: 1_000)
+    assert :ok = Outbox.push(group, target, 0, :first, outbox_deadline: 1_000)
     assert_receive {:outbox_batch, ^group, 0, ^target, [:first], _deadline}, 1_000
 
     caller = self()
 
     spawn(fn ->
-      result = Outbox.try_send(group, target, 0, :expires_behind_backend, outbox_deadline: 10)
-      send(caller, {:try_send_returned, result})
+      result = Outbox.push(group, target, 0, :expires_behind_backend, outbox_deadline: 10)
+      send(caller, {:push_returned, result})
     end)
 
-    assert_receive {:try_send_returned, :ok}, 100
+    assert_receive {:push_returned, :ok}, 100
     refute_receive {:outbox_batch, ^group, 0, ^target, [:expires_behind_backend], _deadline}, 300
   end
 
-  test "expired frames and backend backpressure are dropped without local retries" do
+  test "expired messages and backend backpressure are dropped without local retries" do
     expired_group = unique_group(:expired)
     target = :"outbox-expired@test"
 
@@ -89,7 +89,7 @@ defmodule Group.ReplicaTransportOutboxTest do
     )
 
     assert :ok =
-             Outbox.try_send(expired_group, target, 0, :expired, outbox_deadline: 5)
+             Outbox.push(expired_group, target, 0, :expired, outbox_deadline: 5)
 
     refute_receive {:outbox_batch, ^expired_group, 0, ^target, [:expired], _deadline}, 100
 
@@ -100,12 +100,12 @@ defmodule Group.ReplicaTransportOutboxTest do
       backend_result: :busy
     )
 
-    assert :ok = Outbox.try_send(busy_group, target, 0, :busy, outbox_deadline: 1_000)
+    assert :ok = Outbox.push(busy_group, target, 0, :busy, outbox_deadline: 1_000)
     assert_receive {:outbox_batch, ^busy_group, 0, ^target, [:busy], _deadline}, 1_000
     refute_receive {:outbox_batch, ^busy_group, 0, ^target, [:busy], _deadline}, 100
   end
 
-  test "complete inbound batches use one authenticated local delivery" do
+  test "complete incoming batches use one local mailbox operation" do
     group = unique_group(:deliver)
     source_node = :"outbox-source@test"
     parent = self()
@@ -124,7 +124,7 @@ defmodule Group.ReplicaTransportOutboxTest do
     assert_receive :receiver_ready
 
     assert :ok =
-             Group.Replica.Transport.deliver_batch(
+             Group.Replica.Transport.incoming_batch(
                group,
                source_node,
                0,

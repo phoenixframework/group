@@ -33,7 +33,7 @@ release qualification rather than individual edits.
 ## Model-based and formal checks
 
 `replica_model_property_test.exs` runs real Group instances on three peer VMs.
-The controlled transport queues each replica frame so generated commands can
+The controlled transport queues each replica message so generated commands can
 deliver, duplicate, drop, reorder, or strand it. After the bounded-fault
 prefix, the test enables fair delivery and compares every tracked registry and
 PG key against an independent application-level lifecycle oracle. It also
@@ -251,11 +251,12 @@ timestamp.
 ### Replica transport fault injection
 
 `Group.TestReplicaTransport` implements the production transport behaviour but
-can return `:busy`, drop selected frame types, duplicate or delay frames, and
-capture frames for explicit stale-generation/epoch replay. Its `{:chaos, opts}`
-mode is deterministic for a given frame, which makes failures reproducible.
+can return `:busy`, drop selected message types, duplicate or delay messages,
+and capture messages for explicit stale-generation/epoch replay. Its
+`{:chaos, opts}` mode is deterministic for a given message, which makes failures
+reproducible.
 
-`Group.ControlledReplicaTransport` is the model-test transport. It queues frames
+`Group.ControlledReplicaTransport` is the model-test transport. It queues messages
 at the test process without scheduling timers; `Group.ReplicaModelScheduler`
 then owns the exact delivery schedule. These roles are separate so the existing
 timing-oriented regressions retain their original mechanics while property
@@ -263,7 +264,7 @@ failures can be replayed and shrunk exactly.
 
 The distributed anti-entropy tests cover dropped creates and deletes, cursor
 gaps, globally pruned multi-stream oplogs, exact snapshot fallback, malformed
-authority, stale frame replay, lease expiry on a live VM, and multi-shard
+authority, stale message replay, lease expiry on a live VM, and multi-shard
 generation recovery. They also restart a suspended data lane after deliberately
 losing its cluster-close fence and require the lane to sweep the stale registry
 and PG slices from shared authority. Authority topology tests suspend every
@@ -272,7 +273,7 @@ the full epoch snapshot, nonzero shards receive constant-size lane hellos, and
 incremental opens stay on their matching shard. Separate tests suspend a
 backlogged authority shard while other replica lanes continue converging and
 deliver data before authority to prove rejection does not advance the cursor
-and the same frame applies after authority repair. Concurrent snapshot tests
+and the same message applies after authority repair. Concurrent snapshot tests
 require every advertised revision to contain exactly that many unique named
 epochs, and heartbeat tests prove observed revisions cannot advance the exact
 authority marker. Crash-window tests interrupt journal, dual-index, receive
@@ -283,7 +284,7 @@ requires snapshot recovery without changing the third node's independent
 registry or PG state.
 
 `replica_transport_outbox_test.exs` proves that a blocked sideband backend
-cannot delay the Group-facing local send, frames expire behind that backend,
+cannot delay the Group-facing local push, messages expire behind that backend,
 busy batches are not retried locally, and batching preserves per-target order.
 The real three-node TCP recovery test runs through the same outbox path.
 

@@ -134,7 +134,7 @@ dependencies on additive full-state merge.
 
 ## Anti-Entropy
 
-Replica data frames are:
+Replica data messages are:
 
 - `heads`: stream, retained floor, and head;
 - `delta_batch`: one or more contiguous stream runs;
@@ -163,7 +163,7 @@ visible state. Staging expires after one peer-lease interval without progress.
 All cross-node Group control sends use
 `:erlang.send_nosuspend(..., [:noconnect])`. The default distribution replica
 adapter sends directly the same way and adds no local hop. `:busy` and
-`:disconnected` mean “drop this frame”; periodic anti-entropy repairs it.
+`:disconnected` mean “drop this message”; periodic anti-entropy repairs it.
 
 A sideband adapter may use one local `Group.Replica.Transport.Outbox` per
 shard. Outboxes batch by peer, impose deadlines, and run bounded socket work
@@ -174,9 +174,8 @@ identity and carries authority. TCP is not encrypted.
 
 Transport ordering is not required for correctness. Per-shard ordered delivery
 is a fast path; stream sequences reject duplicate/out-of-order data, and
-generation/epoch/lane fences handle control/data reordering. Ingress must derive
-`source_node` from the authenticated connection, never from payload data, and
-must reassemble any transport segmentation before `deliver_batch/4`.
+generation/epoch/lane fences handle control/data reordering. A transport must
+reassemble any transport segmentation before `incoming_batch/4`.
 
 ## Registry Projection and Process Ownership
 
