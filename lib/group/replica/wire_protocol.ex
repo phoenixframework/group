@@ -1,4 +1,4 @@
-defmodule Group.Replica.Protocol do
+defmodule Group.Replica.WireProtocol do
   @moduledoc false
 
   @version 2

@@ -2985,7 +2985,7 @@ defmodule GroupTest do
                  Enum.to_list(1..operations_per_shard)
 
         assert Enum.all?(order_rows, fn {_append_id, stream_id, _seq} ->
-                 Group.Replica.Protocol.stream_shard(stream_id) == shard
+                 Group.Replica.WireProtocol.stream_shard(stream_id) == shard
                end)
 
         oplog_rows =
@@ -3097,8 +3097,8 @@ defmodule GroupTest do
       :ok = Group.join(name, pg_key, %{kind: :pg})
 
       stream_id = Group.Replica.Data.local_stream_id(name, 0, nil)
-      generation = Group.Replica.Protocol.stream_generation(stream_id)
-      epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+      generation = Group.Replica.WireProtocol.stream_generation(stream_id)
+      epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
 
       :ets.delete(Group.Replica.Data.reg_by_pid_table(name, 0), {self(), nil, reg_key})
       :ets.delete(Group.Replica.Data.pg_by_pid_table(name, 0), {self(), nil, pg_key})
@@ -3155,7 +3155,7 @@ defmodule GroupTest do
       :ok = Group.Replica.Data.add_cluster_node(name, [cluster], remote_route)
 
       stream_id = Group.Replica.Data.local_stream_id(name, 0, cluster)
-      old_epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+      old_epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
 
       # Group.disconnect/3 closes authority and routing before its request
       # reaches every shard. Model a shard kill in that exact window.

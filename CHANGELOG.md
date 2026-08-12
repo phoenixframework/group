@@ -2,13 +2,21 @@
 - Add layered anti-entropy qualification: three-node StreamData lifecycle
   models, seeded adversarial transport histories, TLA+ models for convergence,
   chunk assembly, and permanent peer eviction, plus a Docker-backed Jepsen
-  oracle across distribution, sideband TCP, and lossy/reordering transports.
+  oracle across distribution, a test-only sideband TCP lane, and
+  lossy/reordering transports.
   `mix test` is the every-PR ExUnit/property/checker gate and `mix test.soak`
   runs the six-profile nightly/release campaign.
-- **Breaking**: the replica transport boundary now names logical direction
+- **Breaking**: move the replica transport API from
+  `Group.Replica.Transport.*` to `Group.Transport.*`; the default adapter is
+  now `Group.Transport.DistErl`. The boundary also names logical direction
   rather than implementation mechanics: adapters implement `outgoing/5`,
-  sideband adapters use `Group.Replica.Transport.Outbox.push/5`, and receiving
-  adapters call `incoming/4` or `incoming_batch/4`.
+  sideband adapters use `Group.Transport.Outbox.push/5`, and receiving adapters
+  call `Group.Transport.incoming/4` or `incoming_batch/4`. No compatibility
+  aliases are provided.
+- Rename the internal replica wire helper from `Group.Replica.Protocol` to
+  `Group.Replica.WireProtocol` to avoid overloading Elixir protocol terminology.
+  The standalone TCP adapter is retained only as hidden test infrastructure;
+  Group ships the transport contract, dist-Erlang adapter, and outbox helper.
 - **Breaking**: replica protocol v2 splits exact snapshots into
   transport-neutral, byte-targeted chunks (`1 MiB` by default). Receivers stage
   chunks in shard-owned private ETS and advance the stream cursor only after an

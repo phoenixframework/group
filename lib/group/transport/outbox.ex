@@ -1,9 +1,9 @@
-defmodule Group.Replica.Transport.Outbox do
+defmodule Group.Transport.Outbox do
   @moduledoc """
   Lossy per-shard outboxes for sideband replica transports.
 
   This module is an implementation helper, not a replacement for
-  `Group.Replica.Transport`. Distribution can continue sending directly with
+  `Group.Transport`. Distribution can continue sending directly with
   `:erlang.send_nosuspend/3`. A sideband adapter delegates `outgoing/5` to
   `push/5`, which performs only a local `send/2` to the matching shard
   outbox.
@@ -15,7 +15,7 @@ defmodule Group.Replica.Transport.Outbox do
 
   A backend using this helper implements:
 
-      @behaviour Group.Replica.Transport.Outbox
+      @behaviour Group.Transport.Outbox
 
       def init_outbox(group, shard, opts), do: {:ok, backend_state}
 
@@ -25,7 +25,7 @@ defmodule Group.Replica.Transport.Outbox do
       end
 
   The backend must pass only complete logical messages to
-  `Group.Replica.Transport.incoming_batch/4`.
+  `Group.Transport.incoming_batch/4`.
 
   ## Options
 
@@ -46,8 +46,8 @@ defmodule Group.Replica.Transport.Outbox do
   reassemble those batches before local delivery.
   """
 
-  @type message :: Group.Replica.Transport.message()
-  @type outgoing_result :: Group.Replica.Transport.outgoing_result()
+  @type message :: Group.Transport.message()
+  @type outgoing_result :: Group.Transport.outgoing_result()
   @type backend_state :: term()
 
   @callback init_outbox(group :: atom(), shard :: non_neg_integer(), opts :: keyword()) ::
@@ -73,7 +73,7 @@ defmodule Group.Replica.Transport.Outbox do
 
     %{
       id: {__MODULE__, group},
-      start: {Group.Replica.Transport.Outbox.Supervisor, :start_link, [opts]},
+      start: {Group.Transport.Outbox.Supervisor, :start_link, [opts]},
       type: :supervisor,
       restart: :permanent,
       shutdown: :infinity
@@ -119,7 +119,7 @@ defmodule Group.Replica.Transport.Outbox do
   end
 end
 
-defmodule Group.Replica.Transport.Outbox.Supervisor do
+defmodule Group.Transport.Outbox.Supervisor do
   @moduledoc false
   use Supervisor
 
@@ -143,8 +143,8 @@ defmodule Group.Replica.Transport.Outbox.Supervisor do
     children =
       for shard <- 0..(num_shards - 1) do
         %{
-          id: {Group.Replica.Transport.Outbox.Worker, group, shard},
-          start: {Group.Replica.Transport.Outbox.Worker, :start_link, [opts, shard]},
+          id: {Group.Transport.Outbox.Worker, group, shard},
+          start: {Group.Transport.Outbox.Worker, :start_link, [opts, shard]},
           restart: :permanent,
           shutdown: 5_000
         }
@@ -154,11 +154,11 @@ defmodule Group.Replica.Transport.Outbox.Supervisor do
   end
 end
 
-defmodule Group.Replica.Transport.Outbox.Worker do
+defmodule Group.Transport.Outbox.Worker do
   @moduledoc false
   use GenServer
 
-  alias Group.Replica.Transport.Outbox
+  alias Group.Transport.Outbox
 
   @default_batch_size 64
   @default_batch_bytes 1_048_576

@@ -47,7 +47,7 @@ defmodule Group.Replica.Snapshot do
     # empty list. Reserve that once for each domain. The large chunk integers
     # ensure every practical index/count uses no more space than this envelope.
     :erlang.external_size(
-      {:snapshot_chunk, Group.Replica.Protocol.version(), stream_id, snapshot_seq,
+      {:snapshot_chunk, Group.Replica.WireProtocol.version(), stream_id, snapshot_seq,
        @max_compact_chunk_count, @max_compact_chunk_count, registry_count, pg_count, [], []}
     ) + 10
   end

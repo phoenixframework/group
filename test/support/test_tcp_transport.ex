@@ -1,44 +1,15 @@
-defmodule Group.Replica.Transport.TCP do
-  @moduledoc """
-  Sideband TCP transport for replica data.
-
-  Erlang distribution still carries Group discovery and authority controls.
-  Replica messages use independent TCP connections, so there is no ordering
-  relationship between a control message and its data lane.
-
-  `outgoing/5` only pushes to a local per-shard outbox. The outbox batches
-  messages and forwards each target batch to a bounded per-peer writer queue.
-  The writer may block up to `:send_timeout` without blocking a Group shard.
-  Expired, busy, and disconnected batches are dropped and repaired by
-  anti-entropy.
-
-  The endpoint capability in the dist-Erlang hello prevents an unrelated
-  socket client from injecting messages. This transport is intended for trusted
-  cluster networks; it does not encrypt traffic. Put it behind a private
-  network or a TLS/WebSocket tunnel when confidentiality is required.
-
-  ## Options
-
-    * `:ip` - listen address, default `{127, 0, 0, 1}`
-    * `:advertised_ip` - address placed in the hello, defaults to `:ip`
-    * `:port` - listen port, default `0` (ephemeral)
-    * `:max_queue` - maximum queued batches per peer, default `1_024`
-    * `:connect_timeout` - outbound connect timeout in milliseconds, default `1_000`
-    * `:send_timeout` - writer socket send timeout in milliseconds, default `1_000`
-    * `:reconnect_interval` - retry delay in milliseconds, default `50`
-
-  See `Group.Replica.Transport.Outbox` for batching and deadline options.
-  """
+defmodule Group.TestTCPTransport do
+  @moduledoc false
 
   use GenServer
 
-  @behaviour Group.Replica.Transport
-  @behaviour Group.Replica.Transport.Outbox
+  @behaviour Group.Transport
+  @behaviour Group.Transport.Outbox
 
-  alias Group.Replica.Transport.Outbox
+  alias Group.Transport.Outbox
 
   @impl true
-  def id, do: :group_sideband_tcp_v2
+  def id, do: :group_test_sideband_tcp_v2
 
   @impl true
   def child_spec(opts) do
@@ -46,7 +17,7 @@ defmodule Group.Replica.Transport.TCP do
 
     %{
       id: {__MODULE__, name},
-      start: {Group.Replica.Transport.TCP.Supervisor, :start_link, [opts]},
+      start: {Group.TestTCPTransport.Supervisor, :start_link, [opts]},
       type: :supervisor,
       restart: :permanent,
       shutdown: :infinity
@@ -67,10 +38,10 @@ defmodule Group.Replica.Transport.TCP do
   def outgoing(group, target_node, shard, message, opts),
     do: Outbox.push(group, target_node, shard, message, opts)
 
-  @impl Group.Replica.Transport.Outbox
+  @impl Group.Transport.Outbox
   def init_outbox(group, shard, _opts), do: {:ok, %{group: group, shard: shard}}
 
-  @impl Group.Replica.Transport.Outbox
+  @impl Group.Transport.Outbox
   def send_batch(target_node, messages, deadline, %{group: group, shard: shard} = state) do
     result =
       try do
@@ -144,7 +115,7 @@ defmodule Group.Replica.Transport.TCP do
     {:ok, {_listen_ip, listen_port}} = :inet.sockname(listener)
 
     capability = :erlang.term_to_binary({node(), make_ref(), System.unique_integer()})
-    descriptor = {:group_sideband_tcp_v2, advertised_ip, listen_port, capability}
+    descriptor = {:group_test_sideband_tcp_v2, advertised_ip, listen_port, capability}
     :persistent_term.put({__MODULE__, group, :descriptor}, descriptor)
 
     :ets.new(route_table(group), [
@@ -343,7 +314,7 @@ defmodule Group.Replica.Transport.TCP do
          manager,
          group,
          remote_node,
-         {:group_sideband_tcp_v2, host, port, capability},
+         {:group_test_sideband_tcp_v2, host, port, capability},
          connect_timeout,
          send_timeout
        ) do
@@ -440,7 +411,7 @@ defmodule Group.Replica.Transport.TCP do
         case decode_authenticated_frame(payload) do
           {:ok, {:batch, shard, messages}}
           when is_integer(shard) and shard >= 0 and is_list(messages) ->
-            :ok = Group.Replica.Transport.incoming_batch(group, source_node, shard, messages)
+            :ok = Group.Transport.incoming_batch(group, source_node, shard, messages)
             reader_loop(socket, group, source_node)
 
           _ ->
@@ -471,11 +442,12 @@ defmodule Group.Replica.Transport.TCP do
   defp route_table(group), do: :"#{group}_replica_tcp_routes"
 end
 
-defmodule Group.Replica.Transport.TCP.Supervisor do
+defmodule Group.TestTCPTransport.Supervisor do
   @moduledoc false
   use Supervisor
 
-  alias Group.Replica.Transport.{Outbox, TCP}
+  alias Group.TestTCPTransport, as: TCP
+  alias Group.Transport.Outbox
 
   def start_link(opts), do: Supervisor.start_link(__MODULE__, opts)
 

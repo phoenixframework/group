@@ -1,3 +1,5 @@
+Code.require_file("../support/test_tcp_transport.ex", __DIR__)
+
 defmodule Group.Jepsen.Transport.Stats do
   @moduledoc false
   use GenServer
@@ -110,7 +112,7 @@ defmodule Group.Jepsen.Transport.Common do
   defp transport_result(:disconnected), do: :transport_disconnected
 
   defp observe_outbox(group, shard) do
-    case Process.whereis(Group.Replica.Transport.Outbox.name(group, shard)) do
+    case Process.whereis(Group.Transport.Outbox.name(group, shard)) do
       pid when is_pid(pid) ->
         case Process.info(pid, :message_queue_len) do
           {:message_queue_len, length} -> Stats.observe_max(:outbox_mailbox_peak, length)
@@ -125,10 +127,10 @@ end
 
 defmodule Group.Jepsen.Transport.Distribution do
   @moduledoc false
-  @behaviour Group.Replica.Transport
+  @behaviour Group.Transport
 
   alias Group.Jepsen.Transport.{Common, Stats}
-  alias Group.Replica.Transport.Distribution, as: Delegate
+  alias Group.Transport.DistErl, as: Delegate
 
   @impl true
   def id, do: Delegate.id()
@@ -147,10 +149,10 @@ end
 
 defmodule Group.Jepsen.Transport.TCP do
   @moduledoc false
-  @behaviour Group.Replica.Transport
+  @behaviour Group.Transport
 
   alias Group.Jepsen.Transport.Common
-  alias Group.Replica.Transport.TCP, as: Delegate
+  alias Group.TestTCPTransport, as: Delegate
 
   @impl true
   def id, do: Delegate.id()
@@ -190,7 +192,7 @@ defmodule Group.Jepsen.Transport.TCP.Supervisor do
   def init(opts) do
     children = [
       {Group.Jepsen.Transport.Stats, opts},
-      Group.Replica.Transport.TCP.child_spec(opts)
+      Group.TestTCPTransport.child_spec(opts)
     ]
 
     Supervisor.init(children, strategy: :one_for_one)
@@ -199,7 +201,7 @@ end
 
 defmodule Group.Jepsen.Transport.Chaos do
   @moduledoc false
-  @behaviour Group.Replica.Transport
+  @behaviour Group.Transport
 
   alias Group.Jepsen.Transport.{Common, Stats}
 
@@ -380,7 +382,7 @@ defmodule Group.Jepsen.Transport.Control do
 
   defp maybe_disconnect(target_node) do
     if profile() == :tcp do
-      Group.Replica.Transport.TCP.disconnect_peer(:jepsen_group, target_node)
+      Group.TestTCPTransport.disconnect_peer(:jepsen_group, target_node)
     end
   catch
     :exit, _ -> :ok
@@ -388,7 +390,7 @@ defmodule Group.Jepsen.Transport.Control do
 
   defp maybe_reconnect(target_node) do
     if profile() == :tcp do
-      Group.Replica.Transport.TCP.reconnect_peer(:jepsen_group, target_node)
+      Group.TestTCPTransport.reconnect_peer(:jepsen_group, target_node)
     end
   catch
     :exit, _ -> :ok
@@ -813,7 +815,7 @@ end
 defmodule Group.Jepsen.Invariant do
   @moduledoc false
 
-  alias Group.Replica.{Data, Protocol}
+  alias Group.Replica.{Data, WireProtocol}
 
   def snapshot(retired_nodes) do
     config = Group.get_config(:jepsen_group)
@@ -846,7 +848,7 @@ defmodule Group.Jepsen.Invariant do
       shard_mailbox_max:
         mailbox_max(Enum.map(shards, &Group.Replica.shard_name(:jepsen_group, &1))),
       outbox_mailbox_max:
-        mailbox_max(Enum.map(shards, &Group.Replica.Transport.Outbox.name(:jepsen_group, &1))),
+        mailbox_max(Enum.map(shards, &Group.Transport.Outbox.name(:jepsen_group, &1))),
       total_memory_bytes: :erlang.memory(:total)
     }
   rescue
@@ -1002,15 +1004,16 @@ defmodule Group.Jepsen.Invariant do
       Data.replica_cursor_table(:jepsen_group, shard)
       |> :ets.tab2list()
       |> Enum.each(fn {stream, seq} ->
-        origin = Protocol.stream_origin(stream)
-        cluster = Protocol.stream_cluster(stream)
+        origin = WireProtocol.stream_origin(stream)
+        cluster = WireProtocol.stream_cluster(stream)
 
         valid? =
-          Protocol.stream_name(stream) == :jepsen_group and
-            Protocol.stream_shard(stream) == shard and
+          WireProtocol.stream_name(stream) == :jepsen_group and
+            WireProtocol.stream_shard(stream) == shard and
             origin != node() and
-            Protocol.stream_generation(stream) == Data.remote_generation(:jepsen_group, origin) and
-            Protocol.stream_epoch(stream) ==
+            WireProtocol.stream_generation(stream) ==
+              Data.remote_generation(:jepsen_group, origin) and
+            WireProtocol.stream_epoch(stream) ==
               Data.remote_cluster_epoch(:jepsen_group, origin, cluster) and seq >= 0
 
         unless valid?, do: raise("cursor lacks current authority #{inspect({stream, seq})}")
@@ -1041,7 +1044,7 @@ defmodule Group.Jepsen.Invariant do
         cursors =
           Data.replica_cursor_table(:jepsen_group, shard)
           |> :ets.tab2list()
-          |> Enum.filter(fn {stream, _seq} -> Protocol.stream_origin(stream) == origin end)
+          |> Enum.filter(fn {stream, _seq} -> WireProtocol.stream_origin(stream) == origin end)
 
         view = Data.remote_view_generation(:jepsen_group, shard, origin)
 

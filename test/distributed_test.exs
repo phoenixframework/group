@@ -2452,8 +2452,8 @@ defmodule Group.DistributedTest do
                 |> Enum.map(fn %{shard: shard, cursors: cursors} ->
                   relevant =
                     Enum.filter(cursors, fn {stream_id, _seq} ->
-                      Group.Replica.Protocol.stream_origin(stream_id) == node_a and
-                        Group.Replica.Protocol.stream_cluster(stream_id) == dropped_cluster
+                      Group.Replica.WireProtocol.stream_origin(stream_id) == node_a and
+                        Group.Replica.WireProtocol.stream_cluster(stream_id) == dropped_cluster
                     end)
 
                   {shard, relevant}
@@ -4464,7 +4464,7 @@ defmodule Group.DistributedTest do
 
       TestCluster.rpc!(node_b, :erlang, :send, [
         shard_name(name, 2),
-        {:replica_heartbeat, a_lane, Group.Replica.Protocol.version(),
+        {:replica_heartbeat, a_lane, Group.Replica.WireProtocol.version(),
          TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name]), latest_revision}
       ])
 
@@ -4606,7 +4606,7 @@ defmodule Group.DistributedTest do
         ])
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
           name,
           node_a,
           1,
@@ -4626,7 +4626,7 @@ defmodule Group.DistributedTest do
 
       TestCluster.rpc!(node_b, :erlang, :send, [
         shard_name(name, 1),
-        {:replica_heartbeat, a_lane, Group.Replica.Protocol.version(), generation, revision}
+        {:replica_heartbeat, a_lane, Group.Replica.WireProtocol.version(), generation, revision}
       ])
 
       TestCluster.assert_eventually(fn ->
@@ -4635,7 +4635,7 @@ defmodule Group.DistributedTest do
       end)
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
           name,
           node_a,
           1,
@@ -4827,7 +4827,7 @@ defmodule Group.DistributedTest do
 
       Enum.each(generation_frames, fn {_target, shard, frame} ->
         :ok =
-          TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+          TestCluster.rpc!(node_b, Group.Transport, :incoming, [
             name,
             node_a,
             shard,
@@ -4882,7 +4882,7 @@ defmodule Group.DistributedTest do
 
       Enum.each(epoch_frames, fn {_target, shard, frame} ->
         :ok =
-          TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+          TestCluster.rpc!(node_b, Group.Transport, :incoming, [
             name,
             node_a,
             shard,
@@ -4999,7 +4999,7 @@ defmodule Group.DistributedTest do
         node_a
         |> TestCluster.rpc!(Group.Replica.Data, :replica_stream_heads, [name, 0])
         |> Enum.find(fn {stream_id, _floor, _head} ->
-          Group.Replica.Protocol.stream_cluster(stream_id) == "cold"
+          Group.Replica.WireProtocol.stream_cluster(stream_id) == "cold"
         end)
 
       assert floor > 2
@@ -5083,7 +5083,7 @@ defmodule Group.DistributedTest do
       invalid_key = "anti-entropy/authority/forged"
 
       invalid_frame =
-        {:delta_batch, Group.Replica.Protocol.version(),
+        {:delta_batch, Group.Replica.WireProtocol.version(),
          [
            {stream_id, 1,
             [
@@ -5096,7 +5096,7 @@ defmodule Group.DistributedTest do
          ]}
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
           name,
           node_a,
           0,
@@ -5113,7 +5113,7 @@ defmodule Group.DistributedTest do
              ]) == 0
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
           name,
           node_b,
           0,
@@ -5356,7 +5356,7 @@ defmodule Group.DistributedTest do
         TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
 
       stream_id =
-        Group.Replica.Protocol.stream_id(
+        Group.Replica.WireProtocol.stream_id(
           name,
           node_a,
           make_ref(),
@@ -5368,11 +5368,12 @@ defmodule Group.DistributedTest do
       mutation = {:register, nil, key, pid, meta, System.monotonic_time(), node_a}
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
           name,
           node_a,
           0,
-          {:delta_batch, Group.Replica.Protocol.version(), [{stream_id, 1, [{1, [mutation]}], 1}]}
+          {:delta_batch, Group.Replica.WireProtocol.version(),
+           [{stream_id, 1, [{1, [mutation]}], 1}]}
         ])
 
       TestCluster.flush_shards(node_b, name)
@@ -5432,7 +5433,7 @@ defmodule Group.DistributedTest do
         Map.fetch!(frames_by_first_seq, 2)
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
           name,
           node_a,
           shard,
@@ -5454,7 +5455,7 @@ defmodule Group.DistributedTest do
 
       for frame <- [first_frame, second_frame, third_frame] do
         :ok =
-          TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+          TestCluster.rpc!(node_b, Group.Transport, :incoming, [
             name,
             node_a,
             shard,
@@ -5492,7 +5493,7 @@ defmodule Group.DistributedTest do
 
       for frame <- [first_frame, second_frame, third_frame] do
         :ok =
-          TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+          TestCluster.rpc!(node_b, Group.Transport, :incoming, [
             name,
             node_a,
             shard,
@@ -5577,7 +5578,7 @@ defmodule Group.DistributedTest do
         |> then(&"anti-entropy/authority-fanout/new/#{&1}")
 
       stream_id =
-        Group.Replica.Protocol.stream_id(
+        Group.Replica.WireProtocol.stream_id(
           name,
           node_a,
           new_generation,
@@ -5590,7 +5591,7 @@ defmodule Group.DistributedTest do
         {:register, nil, new_key, pid, %{generation: :new}, System.system_time(), node_a}
 
       new_frame =
-        {:delta_batch, Group.Replica.Protocol.version(),
+        {:delta_batch, Group.Replica.WireProtocol.version(),
          [{stream_id, 1, [{1, [new_mutation]}], 1}]}
 
       :ok = TestCluster.rpc!(node_b, :sys, :suspend, [b_lane])
@@ -5600,7 +5601,7 @@ defmodule Group.DistributedTest do
       # time this frame runs, but shard 1 must still reject it until its own
       # old-generation purge has completed.
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
           name,
           node_a,
           1,
@@ -5609,7 +5610,7 @@ defmodule Group.DistributedTest do
 
       send(
         b_control,
-        {:replica_hello, a_control, Group.Replica.Protocol.version(), new_generation, 0,
+        {:replica_hello, a_control, Group.Replica.WireProtocol.version(), new_generation, 0,
          [{nil, new_generation}], Group.TestReplicaTransport.id(),
          Group.TestReplicaTransport.descriptor(name, [])}
       )
@@ -5633,7 +5634,7 @@ defmodule Group.DistributedTest do
              ]) == 0
 
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
           name,
           node_a,
           1,
@@ -5660,7 +5661,7 @@ defmodule Group.DistributedTest do
         name: name,
         shards: 2,
         replica_transport:
-          {Group.Replica.Transport.TCP,
+          {Group.TestTCPTransport,
            [
              max_queue: 16,
              connect_timeout: 250,
@@ -5683,7 +5684,7 @@ defmodule Group.DistributedTest do
             Enum.all?(nodes -- [source], fn target ->
               TestCluster.rpc!(
                 source,
-                Group.Replica.Transport.TCP,
+                Group.TestTCPTransport,
                 :connected?,
                 [name, target]
               )
@@ -5728,15 +5729,15 @@ defmodule Group.DistributedTest do
       end)
 
       :ok =
-        TestCluster.rpc!(node_a, Group.Replica.Transport.TCP, :disconnect_peer, [name, node_b])
+        TestCluster.rpc!(node_a, Group.TestTCPTransport, :disconnect_peer, [name, node_b])
 
       old_reader =
-        TestCluster.rpc!(node_b, Group.Replica.Transport.TCP, :status, [name])
+        TestCluster.rpc!(node_b, Group.TestTCPTransport, :status, [name])
         |> get_in([:inbound, node_a])
 
       refute TestCluster.rpc!(
                node_a,
-               Group.Replica.Transport.TCP,
+               Group.TestTCPTransport,
                :connected?,
                [name, node_b]
              )
@@ -5765,11 +5766,11 @@ defmodule Group.DistributedTest do
              )
 
       :ok =
-        TestCluster.rpc!(node_a, Group.Replica.Transport.TCP, :reconnect_peer, [name, node_b])
+        TestCluster.rpc!(node_a, Group.TestTCPTransport, :reconnect_peer, [name, node_b])
 
       TestCluster.assert_eventually(fn ->
         new_reader =
-          TestCluster.rpc!(node_b, Group.Replica.Transport.TCP, :status, [name])
+          TestCluster.rpc!(node_b, Group.TestTCPTransport, :status, [name])
           |> get_in([:inbound, node_a])
 
         is_pid(new_reader) and new_reader != old_reader
@@ -5779,7 +5780,7 @@ defmodule Group.DistributedTest do
         fn ->
           TestCluster.rpc!(
             node_a,
-            Group.Replica.Transport.TCP,
+            Group.TestTCPTransport,
             :connected?,
             [name, node_b]
           ) and

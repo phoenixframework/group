@@ -233,9 +233,9 @@ defmodule Group do
     local shard requests drained in each fairness turn, including while replica
     data or cluster controls are busy (default: `8`)
   - `:replica_transport` — replica data transport module or `{module, opts}` tuple.
-    Defaults to `Group.Replica.Transport.Distribution`. The transport must be
+    Defaults to `Group.Transport.DistErl`. The transport must be
     nonblocking and may return `:busy`; anti-entropy repairs dropped messages.
-    Sideband transports can use `Group.Replica.Transport.Outbox` for lossy,
+    Sideband transports can use `Group.Transport.Outbox` for lossy,
     batched, per-shard isolation without adding a hop to the default transport.
   - `:replicated_oplog_max_entries` — maximum retained replica records per shard
     before old prefixes are pruned and lagging peers require a snapshot

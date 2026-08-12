@@ -22,7 +22,7 @@ prefix Jepsen:
 The replica lane is selectable without changing the workload or checker:
 
 - `distribution` delegates to Group's production Erlang-distribution adapter;
-- `tcp` uses Group's production sideband TCP adapter while Erlang distribution
+- `tcp` uses Group's hidden test-only TCP adapter while Erlang distribution
   remains the control plane; and
 - `chaos` is a local per-shard outbox which deterministically drops,
   duplicates, delays, and reorders replica messages.

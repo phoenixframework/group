@@ -234,7 +234,7 @@ defmodule Group.ReplicaSnapshotDistributedTest do
 
     TestCluster.flush_shards(node_a, name)
     old_stream = local_stream(node_a, name, cluster)
-    old_epoch = Group.Replica.Protocol.stream_epoch(old_stream)
+    old_epoch = Group.Replica.WireProtocol.stream_epoch(old_stream)
     frames = capture_snapshot(node_a, node_b, name, old_stream, 1)
     assert length(frames) > 1
     {partial, [last]} = Enum.split(frames, -1)
@@ -307,7 +307,7 @@ defmodule Group.ReplicaSnapshotDistributedTest do
 
     new_stream = local_stream(node_a, name, nil)
     refute new_stream == old_stream
-    new_generation = Group.Replica.Protocol.stream_generation(new_stream)
+    new_generation = Group.Replica.WireProtocol.stream_generation(new_stream)
 
     TestCluster.assert_eventually(fn ->
       TestCluster.rpc!(node_b, Group.Replica.Data, :remote_generation, [name, node_a]) ==
@@ -471,9 +471,8 @@ defmodule Group.ReplicaSnapshotDistributedTest do
 
     send(
       target_control,
-      {:replica_hello, source_control, Group.Replica.Protocol.version(), generation, revision,
-       epochs, Group.Replica.Transport.Distribution.id(),
-       Group.Replica.Transport.Distribution.descriptor(name, [])}
+      {:replica_hello, source_control, Group.Replica.WireProtocol.version(), generation, revision,
+       epochs, Group.Transport.DistErl.id(), Group.Transport.DistErl.descriptor(name, [])}
     )
 
     _state = TestCluster.rpc!(context.node_b, :sys, :get_state, [target_control])
@@ -556,11 +555,11 @@ defmodule Group.ReplicaSnapshotDistributedTest do
       ])
 
     :ok =
-      TestCluster.rpc!(node_a, Group.Replica.Transport, :incoming, [
+      TestCluster.rpc!(node_a, Group.Transport, :incoming, [
         name,
         node_b,
         0,
-        {:needs, Group.Replica.Protocol.version(), [{stream_id, next_seq}]}
+        {:needs, Group.Replica.WireProtocol.version(), [{stream_id, next_seq}]}
       ])
 
     TestCluster.flush_shards(node_a, name)
@@ -581,7 +580,7 @@ defmodule Group.ReplicaSnapshotDistributedTest do
   defp deliver_frames(node_b, node_a, name, frames) do
     Enum.each(frames, fn frame ->
       :ok =
-        TestCluster.rpc!(node_b, Group.Replica.Transport, :incoming, [
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
           name,
           node_a,
           0,

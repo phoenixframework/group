@@ -1,4 +1,4 @@
-defmodule Group.Replica.Transport do
+defmodule Group.Transport do
   @moduledoc """
   Transport contract for Group replica data.
 
@@ -10,7 +10,9 @@ defmodule Group.Replica.Transport do
   Erlang distribution remains Group's control plane and supplies the stable
   node identity used here. A sideband adapter can use its `descriptor/2` in the
   control hello to exchange endpoints and pass incoming messages to
-  `incoming/4` or `incoming_batch/4`.
+  `incoming/4` or `incoming_batch/4`. Group trusts the `source_node` supplied
+  by the adapter and validates stream origins and member pids against it; peer
+  authentication, when needed, belongs to the transport.
 
   Adapters do not need to preserve ordering. Group serializes writes per shard
   and sequences each origin/generation/shard/cluster/epoch stream; receivers
@@ -18,7 +20,7 @@ defmodule Group.Replica.Transport do
   traffic and is therefore the preferred fast path.
 
   A sideband implementation can delegate `outgoing/5` to
-  `Group.Replica.Transport.Outbox.push/5`. That adds one local send only for
+  `Group.Transport.Outbox.push/5`. That adds one local send only for
   the configured sideband transport; the default distribution adapter retains
   its direct remote `:erlang.send_nosuspend/3` path.
   """
@@ -52,8 +54,9 @@ defmodule Group.Replica.Transport do
   @doc """
   Passes an incoming replica message to the corresponding local shard.
 
-  This is a local mailbox operation. Stream generation, epoch, group, shard,
-  and origin are validated by the replica.
+  This is a local mailbox operation. `source_node` is the trusted peer identity
+  established by the adapter. Stream generation, epoch, group, shard, origin,
+  and member-pid ownership are validated by the replica.
   """
   def incoming(group, source_node, shard, message)
       when is_atom(group) and is_atom(source_node) and is_integer(shard) and shard >= 0 do
@@ -70,7 +73,8 @@ defmodule Group.Replica.Transport do
 
   A finite-message transport may segment the encoded batch on the wire, but it
   must reassemble every segment before calling this function. Group never
-  observes or applies a partial batch.
+  observes or applies a partial batch. `source_node` has the same trusted-peer
+  meaning as in `incoming/4`.
   """
   def incoming_batch(group, source_node, shard, messages)
       when is_atom(group) and is_atom(source_node) and is_integer(shard) and shard >= 0 and
@@ -102,37 +106,5 @@ defmodule Group.Replica.Transport do
     end
 
     transport
-  end
-end
-
-defmodule Group.Replica.Transport.Distribution do
-  @moduledoc """
-  Default nonblocking replica transport over Erlang distribution.
-
-  Messages are sent directly to the matching remote shard with
-  `:erlang.send_nosuspend/3` and `:noconnect`, so the caller never waits for a
-  busy distribution socket and never initiates a connection. A busy or absent
-  link returns `:busy`; Group drops that message and repairs it through periodic
-  anti-entropy.
-  """
-  @behaviour Group.Replica.Transport
-
-  alias Group.Replica
-
-  @impl true
-  def id, do: :erlang_distribution
-
-  @impl true
-  def descriptor(_group, _opts), do: :erlang_distribution
-
-  @impl true
-  def outgoing(group, target_node, shard, replica_message, _opts) do
-    destination = {Replica.shard_name(group, shard), target_node}
-    message = {:group_replica_frame, node(), replica_message}
-
-    case :erlang.send_nosuspend(destination, message, [:noconnect]) do
-      true -> :ok
-      false -> :busy
-    end
   end
 end

@@ -61,7 +61,8 @@ The Docker-backed Jepsen harness lives in [`jepsen/`](jepsen/). It drives
 three independent BEAM containers through concurrent, multi-entry owner
 lifecycles, named-cluster epoch churn, directed/full partitions, transport
 session resets, and VM restarts. The same workload runs over distribution,
-real sideband TCP, and a lossy/duplicating/reordering transport. After healing,
+a test-only real sideband TCP lane, and a lossy/duplicating/reordering
+transport. After healing,
 its independent oracle checks exact public views and the internal registry,
 PG, claim, cluster, cursor, oplog, snapshot-staging, and retired-origin
 invariants. Its permanent-retirement scenario proves eviction even when a peer
@@ -278,7 +279,7 @@ require every advertised revision to contain exactly that many unique named
 epochs, and heartbeat tests prove observed revisions cannot advance the exact
 authority marker. Crash-window tests interrupt journal, dual-index, receive
 cursor, and named-cluster close updates, then require startup repair to remove
-every invisible row and temporary close barrier. A three-node sideband TCP test
+every invisible row and temporary close barrier. A three-node test-only TCP test
 disconnects one origin's real socket, prunes its oplog, reconnects it, and
 requires snapshot recovery without changing the third node's independent
 registry or PG state.

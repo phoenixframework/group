@@ -246,7 +246,7 @@ All operations are **eventually consistent**:
   busy_dist_retry_attempts: 300,
   busy_dist_retry_interval: 1_000,
   replicated_pg_receiver_local_request_quota: 8,
-  replica_transport: Group.Replica.Transport.Distribution,
+  replica_transport: Group.Transport.DistErl,
   replicated_oplog_max_entries: 65_536,
   replicated_snapshot_chunk_target_bytes: 1_048_576,
   replicated_anti_entropy_interval: 1_000,
@@ -296,12 +296,12 @@ All operations are **eventually consistent**:
   queued local shard requests drained per fairness turn while replica data or
   cluster controls are busy. Defaults to 8.
 - **`replica_transport`** — a module implementing
-  `Group.Replica.Transport`, or `{module, opts}`. The default adapter uses
-  `:erlang.send_nosuspend/3`; adapters must return promptly with `:ok`, `:busy`,
-  or `:disconnected`. Dropped and busy messages are repaired by anti-entropy.
-  `Group.Replica.Transport.TCP` is an included sideband adapter with local
-  per-shard batching and bounded per-peer writer queues; its socket owners are
-  separate processes, so socket backpressure cannot block a Group shard.
+  `Group.Transport`, or `{module, opts}`. The default
+  `Group.Transport.DistErl` adapter uses `:erlang.send_nosuspend/3`; adapters
+  must return promptly with `:ok`, `:busy`, or `:disconnected`. Dropped and busy
+  messages are repaired by anti-entropy. Sideband implementations can use
+  `Group.Transport.Outbox` to move bounded batching and socket work outside the
+  Group shard.
 - **`replicated_oplog_max_entries`** — maximum retained replica records per
   shard across all local streams. Defaults to 65,536. Pruning never waits for
   peer acknowledgements; a peer behind the retained floor receives an exact
@@ -468,36 +468,20 @@ Per-shard ordered delivery is still a useful fast path. Cross-stream order is
 not a correctness dependency; cluster epochs reject data racing a disconnect
 or reconnect, and generation fencing rejects data from a restarted origin.
 An alternative sideband adapter passes incoming messages to
-`Group.Replica.Transport.incoming/4` locally.
-
-For example, replica data can use the included sideband TCP adapter while
+`Group.Transport.incoming/4` locally. Configure a custom adapter while
 authority and membership remain on dist Erlang:
 
 ```elixir
 replica_transport:
-  {Group.Replica.Transport.TCP,
-   [
-     ip: {0, 0, 0, 0},
-     advertised_ip: {10, 0, 1, 12},
-     port: 44_321,
-     max_queue: 1_024,
-     outbox_batch_size: 64,
-     outbox_batch_bytes: 1_048_576,
-     outbox_flush_interval: 1,
-     outbox_deadline: 100
-   ]}
+  {MyApp.GroupTransport,
+   [outbox_batch_size: 64, outbox_batch_bytes: 1_048_576,
+    outbox_flush_interval: 1, outbox_deadline: 100]}
 ```
 
-Each node advertises its own reachable address. TCP frames are capability
-authenticated by the dist-Erlang hello but are not encrypted, so use a trusted
-network or place the connection behind TLS. The adapter deliberately has no
-control/data ordering relationship; the generation/epoch lane barrier and
-stream sequence checks supply correctness.
-
-The default distribution adapter still sends directly to the remote shard and
+The default `Group.Transport.DistErl` adapter sends directly to the remote shard and
 does not pay for a local outbox. Sideband adapters can delegate `outgoing/5` to
-`Group.Replica.Transport.Outbox.push/5` and supervise one outbox per shard
-with `Group.Replica.Transport.Outbox.child_spec/1`. An outbox groups messages by
+`Group.Transport.Outbox.push/5` and supervise one outbox per shard
+with `Group.Transport.Outbox.child_spec/1`. An outbox groups messages by
 target and invokes the adapter's `send_batch/4` callback. Calls that expire or
 return `:busy`/`:disconnected` are dropped without a local retry; the next
 anti-entropy exchange repairs them.
@@ -505,11 +489,13 @@ anti-entropy exchange repairs them.
 A message-oriented backend fits this callback shape by obtaining a connection
 once from `init_outbox/3`, then sending each `send_batch/4` result to a
 registered incoming name on the target node. Queue pressure maps to `:busy` and
-a missing session maps to `:disconnected`. The adapter passes the trusted peer's
-source node alongside each message. Exact snapshots are already bounded by
-Group. A transport with a smaller maximum frame may additionally segment an
-encoded batch, but it must completely reassemble that batch before calling
-`Group.Replica.Transport.incoming_batch/4`.
+a missing session maps to `:disconnected`. The adapter passes its trusted peer
+identity as the source node; Group verifies that stream origins and member pids
+match that identity but does not authenticate the sideband connection itself.
+Exact snapshots are already bounded by Group. A transport with a smaller
+maximum frame may additionally segment an encoded batch, but it must completely
+reassemble that batch before calling
+`Group.Transport.incoming_batch/4`.
 
 ### Named Cluster TTL Leases
 

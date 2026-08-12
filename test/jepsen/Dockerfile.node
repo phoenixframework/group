@@ -11,6 +11,7 @@ ENV MIX_ENV=prod
 COPY mix.exs mix.lock ./
 COPY lib ./lib
 COPY test/jepsen/node.exs ./test/jepsen/node.exs
+COPY test/support/test_tcp_transport.ex ./test/support/test_tcp_transport.ex
 
 RUN mix local.hex --force \
     && mix deps.get --only prod \

@@ -42,8 +42,8 @@ defmodule Group.ReplicaSnapshotTest do
     Enum.with_index(snapshot.chunks, 1)
     |> Enum.each(fn {{registry, pg}, index} ->
       frame =
-        {:snapshot_chunk, Group.Replica.Protocol.version(), stream_id, 123, index, chunk_count,
-         snapshot.registry_count, snapshot.pg_count, registry, pg}
+        {:snapshot_chunk, Group.Replica.WireProtocol.version(), stream_id, 123, index,
+         chunk_count, snapshot.registry_count, snapshot.pg_count, registry, pg}
 
       assert :erlang.external_size(frame) <= target
     end)

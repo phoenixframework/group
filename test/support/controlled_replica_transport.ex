@@ -1,6 +1,6 @@
 defmodule Group.ControlledReplicaTransport do
   @moduledoc false
-  @behaviour Group.Replica.Transport
+  @behaviour Group.Transport
 
   @impl true
   def id, do: :group_controlled_replica_transport

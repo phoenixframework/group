@@ -10,7 +10,7 @@ defmodule Group.Replica do
   @anti_entropy_timer :group_replica_anti_entropy
   @local_request_tag :group_local_request
   @local_reply_tag :group_local_reply
-  @protocol_version Group.Replica.Protocol.version()
+  @protocol_version Group.Replica.WireProtocol.version()
 
   _archdoc = ~S"""
   Sharded control process for local writes, replica transport, anti-entropy,
@@ -55,7 +55,7 @@ defmodule Group.Replica do
     creating remote process monitors. A generation/epoch-revision mismatch
     requests a fresh authoritative hello.
 
-  Replica state uses the configured Group.Replica.Transport:
+  Replica state uses the configured Group.Transport:
 
   - heads advertises {stream, retained_floor, head}.
   - delta_batch carries one or more contiguous stream runs.
@@ -126,7 +126,7 @@ defmodule Group.Replica do
 
   require Logger
 
-  alias Group.Replica.{Data, Protocol, Snapshot}
+  alias Group.Replica.{Data, Snapshot, WireProtocol}
 
   defstruct [
     :name,
@@ -387,7 +387,7 @@ defmodule Group.Replica do
         end)
 
     cond do
-      version != Protocol.version() or transport_id != state.replica_transport.id() ->
+      version != WireProtocol.version() or transport_id != state.replica_transport.id() ->
         Logger.error(
           "#{log_prefix_shard(state)} incompatible replica protocol/transport from #{inspect(remote_node)}"
         )
@@ -448,7 +448,7 @@ defmodule Group.Replica do
     state = flush_pending_replicated_message_barrier(state)
     remote_node = node(remote_pid)
 
-    if version == Protocol.version() and transport_id == state.replica_transport.id() do
+    if version == WireProtocol.version() and transport_id == state.replica_transport.id() do
       if function_exported?(state.replica_transport, :peer_up, 4) do
         :ok =
           state.replica_transport.peer_up(
@@ -737,14 +737,14 @@ defmodule Group.Replica do
 
     state =
       cond do
-        version == Protocol.version() and
+        version == WireProtocol.version() and
           replica_authority_current?(state, remote_node, generation, epoch_revision) and
             replica_view_current?(state, remote_node) ->
           state
           |> put_remote_shard(remote_node, remote_pid)
           |> touch_replica_peer(remote_node)
 
-        version == Protocol.version() and
+        version == WireProtocol.version() and
             replica_authority_current?(state, remote_node, generation, epoch_revision) ->
           state
 
@@ -1781,7 +1781,7 @@ defmodule Group.Replica do
   end
 
   defp append_local_replica_record(state, op) do
-    cluster = Protocol.op_cluster(op)
+    cluster = WireProtocol.op_cluster(op)
 
     case Data.local_stream_id(state.name, state.shard_index, cluster) do
       nil ->
@@ -2713,7 +2713,7 @@ defmodule Group.Replica do
         {stream_id, first_seq, records, head}
       end)
 
-    outgoing_replica_message(state, target_node, {:delta_batch, Protocol.version(), runs})
+    outgoing_replica_message(state, target_node, {:delta_batch, WireProtocol.version(), runs})
   end
 
   defp group_broadcast_ops_by_target(ops, state, cluster_fun) do
@@ -2772,7 +2772,7 @@ defmodule Group.Replica do
     do: registry_op_cluster(op)
 
   defp sequenced_op_cluster({:sequenced, stream_id, _seq, _mutations}),
-    do: Protocol.stream_cluster(stream_id)
+    do: WireProtocol.stream_cluster(stream_id)
 
   defp replicated_op_for_active_cluster?(name, op, cluster_fun)
        when is_function(cluster_fun, 1) do
@@ -2922,14 +2922,14 @@ defmodule Group.Replica do
       send_remote_control_message(
         state,
         target_node,
-        {:replica_hello, self(), Protocol.version(), generation, epoch_revision, cluster_epochs,
-         state.replica_transport.id(), descriptor}
+        {:replica_hello, self(), WireProtocol.version(), generation, epoch_revision,
+         cluster_epochs, state.replica_transport.id(), descriptor}
       )
     else
       send_remote_shard_message(
         state,
         target_node,
-        {:replica_lane_hello, self(), Protocol.version(), Data.generation(state.name),
+        {:replica_lane_hello, self(), WireProtocol.version(), Data.generation(state.name),
          Data.local_cluster_epoch_revision(state.name), state.replica_transport.id(), descriptor}
       )
     end
@@ -3104,7 +3104,7 @@ defmodule Group.Replica do
       send_remote_shard_message(
         acc,
         target_node,
-        {:replica_heartbeat, self(), Protocol.version(), Data.generation(acc.name),
+        {:replica_heartbeat, self(), WireProtocol.version(), Data.generation(acc.name),
          Data.local_cluster_epoch_revision(acc.name)}
       )
 
@@ -3231,7 +3231,7 @@ defmodule Group.Replica do
     if heads == [] do
       state
     else
-      outgoing_replica_message(state, target_node, {:heads, Protocol.version(), heads})
+      outgoing_replica_message(state, target_node, {:heads, WireProtocol.version(), heads})
     end
   end
 
@@ -3263,27 +3263,27 @@ defmodule Group.Replica do
   end
 
   defp replica_stream_target?(state, stream_id, target_node) do
-    Protocol.stream_name(stream_id) == state.name and
-      Protocol.stream_origin(stream_id) == node() and
-      Protocol.stream_shard(stream_id) == state.shard_index and
-      Protocol.stream_generation(stream_id) == Data.generation(state.name) and
-      Protocol.stream_epoch(stream_id) ==
-        Data.local_cluster_epoch(state.name, Protocol.stream_cluster(stream_id)) and
-      case Protocol.stream_cluster(stream_id) do
+    WireProtocol.stream_name(stream_id) == state.name and
+      WireProtocol.stream_origin(stream_id) == node() and
+      WireProtocol.stream_shard(stream_id) == state.shard_index and
+      WireProtocol.stream_generation(stream_id) == Data.generation(state.name) and
+      WireProtocol.stream_epoch(stream_id) ==
+        Data.local_cluster_epoch(state.name, WireProtocol.stream_cluster(stream_id)) and
+      case WireProtocol.stream_cluster(stream_id) do
         nil -> Map.has_key?(state.peer_last_seen, target_node)
         cluster -> target_node in Data.cluster_nodes(state.name, cluster)
       end
   end
 
   defp valid_remote_stream?(state, source_node, stream_id) do
-    cluster = Protocol.stream_cluster(stream_id)
+    cluster = WireProtocol.stream_cluster(stream_id)
 
-    Protocol.stream_name(stream_id) == state.name and
-      Protocol.stream_origin(stream_id) == source_node and
-      Protocol.stream_shard(stream_id) == state.shard_index and
+    WireProtocol.stream_name(stream_id) == state.name and
+      WireProtocol.stream_origin(stream_id) == source_node and
+      WireProtocol.stream_shard(stream_id) == state.shard_index and
       replica_view_current?(state, source_node) and
-      Protocol.stream_generation(stream_id) == Data.remote_generation(state.name, source_node) and
-      Protocol.stream_epoch(stream_id) ==
+      WireProtocol.stream_generation(stream_id) == Data.remote_generation(state.name, source_node) and
+      WireProtocol.stream_epoch(stream_id) ==
         Data.remote_cluster_epoch(state.name, source_node, cluster) and
       (is_nil(cluster) or cluster_member?(state.name, cluster))
   end
@@ -3303,7 +3303,7 @@ defmodule Group.Replica do
     needs
     |> Enum.chunk_every(state.replicated_sender_buffer_size)
     |> Enum.reduce(state, fn chunk, acc ->
-      outgoing_replica_message(acc, source_node, {:needs, Protocol.version(), chunk})
+      outgoing_replica_message(acc, source_node, {:needs, WireProtocol.version(), chunk})
     end)
   end
 
@@ -3318,8 +3318,8 @@ defmodule Group.Replica do
 
   defp handle_replica_message(state, source_node, {:need, version, stream_id, next_seq})
        when version == @protocol_version do
-    if Protocol.stream_origin(stream_id) == node() and
-         Protocol.stream_shard(stream_id) == state.shard_index and
+    if WireProtocol.stream_origin(stream_id) == node() and
+         WireProtocol.stream_shard(stream_id) == state.shard_index and
          replica_stream_target?(state, stream_id, source_node) do
       send_replica_repair(state, source_node, stream_id, next_seq)
     else
@@ -3407,7 +3407,7 @@ defmodule Group.Replica do
   end
 
   defp valid_snapshot_rows?(state, source_node, stream_id, reg_data, pg_data) do
-    cluster = Protocol.stream_cluster(stream_id)
+    cluster = WireProtocol.stream_cluster(stream_id)
 
     Enum.all?(reg_data, fn
       {key, pid, _meta, _time} when is_pid(pid) ->
@@ -3534,7 +3534,7 @@ defmodule Group.Replica do
     state =
       if valid_snapshot_stream?(state, source_node, stream_id, transfer.snapshot_seq) do
         state = flush_pending_replicated_barrier(state)
-        cluster = Protocol.stream_cluster(stream_id)
+        cluster = WireProtocol.stream_cluster(stream_id)
 
         affected_registry_keys =
           Data.replace_registry_claims_for_stream_from_staging(
@@ -3587,7 +3587,7 @@ defmodule Group.Replica do
          pg_data
        ) do
     state = flush_pending_replicated_barrier(state)
-    cluster = Protocol.stream_cluster(stream_id)
+    cluster = WireProtocol.stream_cluster(stream_id)
 
     affected_registry_keys =
       Data.replace_registry_claims_for_stream(
@@ -3672,8 +3672,8 @@ defmodule Group.Replica do
     do: {Enum.reverse(acc), next_seq}
 
   defp valid_replica_mutations?(stream_id, mutations) do
-    origin = Protocol.stream_origin(stream_id)
-    cluster = Protocol.stream_cluster(stream_id)
+    origin = WireProtocol.stream_origin(stream_id)
+    cluster = WireProtocol.stream_cluster(stream_id)
 
     mutations != [] and Enum.all?(mutations, &valid_replica_mutation?(&1, cluster, origin))
   end
@@ -3846,7 +3846,7 @@ defmodule Group.Replica do
       end)
       |> Enum.uniq()
 
-    cluster = Protocol.stream_cluster(stream_id)
+    cluster = WireProtocol.stream_cluster(stream_id)
 
     Enum.reduce(keys, {state, []}, fn key, {acc, events} ->
       reconcile_registry_projection(acc, cluster, key, :reconcile, events)
@@ -3861,15 +3861,15 @@ defmodule Group.Replica do
     outgoing_replica_message(
       state,
       target_node,
-      {:needs, Protocol.version(), [{stream_id, next_seq}]}
+      {:needs, WireProtocol.version(), [{stream_id, next_seq}]}
     )
   end
 
   defp send_replica_repairs(state, target_node, needs) do
     {state, runs} =
       Enum.reduce(needs, {state, []}, fn {stream_id, next_seq}, {acc, runs} ->
-        if Protocol.stream_origin(stream_id) == node() and
-             Protocol.stream_shard(stream_id) == acc.shard_index and
+        if WireProtocol.stream_origin(stream_id) == node() and
+             WireProtocol.stream_shard(stream_id) == acc.shard_index and
              replica_stream_target?(acc, stream_id, target_node) do
           case replica_repair(acc, target_node, stream_id, next_seq) do
             {:run, run} -> {acc, [run | runs]}
@@ -3888,7 +3888,7 @@ defmodule Group.Replica do
         outgoing_replica_message(
           state,
           target_node,
-          {:delta_batch, Protocol.version(), Enum.reverse(runs)}
+          {:delta_batch, WireProtocol.version(), Enum.reverse(runs)}
         )
     end
   end
@@ -3925,7 +3925,7 @@ defmodule Group.Replica do
   end
 
   defp send_replica_snapshot(state, target_node, stream_id, head) do
-    cluster = Protocol.stream_cluster(stream_id)
+    cluster = WireProtocol.stream_cluster(stream_id)
     reg_data = Data.registry_claims_for_stream(state.name, state.shard_index, stream_id)
     pg_data = Data.pg_entries_for_origin(state.name, state.shard_index, cluster, node())
 
@@ -3948,7 +3948,7 @@ defmodule Group.Replica do
       outgoing_replica_message(
         acc,
         target_node,
-        {:snapshot_chunk, Protocol.version(), stream_id, head, chunk_index, chunk_count,
+        {:snapshot_chunk, WireProtocol.version(), stream_id, head, chunk_index, chunk_count,
          snapshot.registry_count, snapshot.pg_count, reg_chunk, pg_chunk}
       )
     end)
@@ -4114,7 +4114,7 @@ defmodule Group.Replica do
 
     stream_ids =
       Enum.map(cluster_epochs, fn {cluster, epoch} ->
-        Protocol.stream_id(
+        WireProtocol.stream_id(
           state.name,
           remote_node,
           generation,
@@ -4171,7 +4171,7 @@ defmodule Group.Replica do
     superseded =
       Enum.flat_map(current_epochs, fn {cluster, current_epoch} ->
         current_stream =
-          Protocol.stream_id(
+          WireProtocol.stream_id(
             state.name,
             remote_node,
             generation,
@@ -4207,7 +4207,7 @@ defmodule Group.Replica do
     # rather than rebuilding the node-wide epoch map in every lane.
     current_epochs =
       streams
-      |> Enum.map(&Protocol.stream_cluster/1)
+      |> Enum.map(&WireProtocol.stream_cluster/1)
       |> Enum.uniq()
       |> Map.new(fn cluster ->
         {cluster, Data.remote_cluster_epoch(state.name, remote_node, cluster)}
@@ -4215,9 +4215,9 @@ defmodule Group.Replica do
 
     superseded =
       Enum.reject(streams, fn stream_id ->
-        Protocol.stream_generation(stream_id) == generation and
-          Map.get(current_epochs, Protocol.stream_cluster(stream_id)) ==
-            Protocol.stream_epoch(stream_id)
+        WireProtocol.stream_generation(stream_id) == generation and
+          Map.get(current_epochs, WireProtocol.stream_cluster(stream_id)) ==
+            WireProtocol.stream_epoch(stream_id)
       end)
 
     purge_superseded_remote_streams(state, remote_node, current_epochs, superseded)
@@ -4234,7 +4234,7 @@ defmodule Group.Replica do
     generation = Data.remote_generation(state.name, remote_node)
 
     superseded
-    |> Enum.group_by(&Protocol.stream_cluster/1)
+    |> Enum.group_by(&WireProtocol.stream_cluster/1)
     |> Enum.reduce(state, fn {cluster, cluster_streams}, acc ->
       affected_keys =
         Data.purge_registry_claims_for_streams(
@@ -4265,7 +4265,7 @@ defmodule Group.Replica do
 
         current_epoch ->
           current_stream =
-            Protocol.stream_id(
+            WireProtocol.stream_id(
               state.name,
               remote_node,
               generation,
@@ -4343,7 +4343,7 @@ defmodule Group.Replica do
 
     records
     |> Enum.reduce(%{}, fn {:sequenced, _stream_id, _seq, [op | _]} = record, acc ->
-      cluster = Protocol.op_cluster(op)
+      cluster = WireProtocol.op_cluster(op)
 
       Enum.reduce(process_down_targets(state, cluster), acc, fn target_node, inner ->
         Map.update(inner, target_node, [record], &[record | &1])
@@ -4520,13 +4520,13 @@ defmodule Group.Replica do
   end
 
   defp current_local_stream?(state, stream_id) do
-    cluster = Protocol.stream_cluster(stream_id)
+    cluster = WireProtocol.stream_cluster(stream_id)
 
-    Protocol.stream_name(stream_id) == state.name and
-      Protocol.stream_origin(stream_id) == node() and
-      Protocol.stream_generation(stream_id) == Data.generation(state.name) and
-      Protocol.stream_shard(stream_id) == state.shard_index and
-      Protocol.stream_epoch(stream_id) == Data.local_cluster_epoch(state.name, cluster)
+    WireProtocol.stream_name(stream_id) == state.name and
+      WireProtocol.stream_origin(stream_id) == node() and
+      WireProtocol.stream_generation(stream_id) == Data.generation(state.name) and
+      WireProtocol.stream_shard(stream_id) == state.shard_index and
+      WireProtocol.stream_epoch(stream_id) == Data.local_cluster_epoch(state.name, cluster)
   end
 
   defp apply_registry_claim_mutations(state, stream_id, seq, mutations) do

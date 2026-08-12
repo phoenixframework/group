@@ -1,7 +1,7 @@
 defmodule Group.ReplicaTransportOutboxTest do
   use ExUnit.Case, async: true
 
-  alias Group.Replica.Transport.Outbox
+  alias Group.Transport.Outbox
 
   defmodule Backend do
     @behaviour Outbox
@@ -124,7 +124,7 @@ defmodule Group.ReplicaTransportOutboxTest do
     assert_receive :receiver_ready
 
     assert :ok =
-             Group.Replica.Transport.incoming_batch(
+             Group.Transport.incoming_batch(
                group,
                source_node,
                0,

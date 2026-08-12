@@ -2,7 +2,7 @@ defmodule Group.Replica.Data do
   @moduledoc false
   use GenServer
 
-  alias Group.Replica.Protocol
+  alias Group.Replica.WireProtocol
 
   _archdoc = """
   GenServer that owns ETS tables for all shards.
@@ -375,7 +375,7 @@ defmodule Group.Replica.Data do
         nil
 
       epoch ->
-        Group.Replica.Protocol.stream_id(
+        Group.Replica.WireProtocol.stream_id(
           name,
           node(),
           generation(name),
@@ -472,8 +472,8 @@ defmodule Group.Replica.Data do
         drop_local_stream(
           name,
           shard,
-          Protocol.stream_cluster(stream_id),
-          Protocol.stream_epoch(stream_id)
+          WireProtocol.stream_cluster(stream_id),
+          WireProtocol.stream_epoch(stream_id)
         )
       end
     end)
@@ -518,13 +518,13 @@ defmodule Group.Replica.Data do
   end
 
   defp current_local_stream?(name, shard, stream_id) do
-    cluster = Protocol.stream_cluster(stream_id)
+    cluster = WireProtocol.stream_cluster(stream_id)
 
-    Protocol.stream_name(stream_id) == name and
-      Protocol.stream_origin(stream_id) == node() and
-      Protocol.stream_generation(stream_id) == generation(name) and
-      Protocol.stream_shard(stream_id) == shard and
-      Protocol.stream_epoch(stream_id) == local_cluster_epoch(name, cluster)
+    WireProtocol.stream_name(stream_id) == name and
+      WireProtocol.stream_origin(stream_id) == node() and
+      WireProtocol.stream_generation(stream_id) == generation(name) and
+      WireProtocol.stream_shard(stream_id) == shard and
+      WireProtocol.stream_epoch(stream_id) == local_cluster_epoch(name, cluster)
   end
 
   defp await_closed_local_clusters(name, clusters, timeout, started_at) do
@@ -605,7 +605,7 @@ defmodule Group.Replica.Data do
           {{cluster, _key, _pid}, _meta, _time, _entry_node} -> cluster
         end),
         Enum.map(:ets.tab2list(replica_cursor_table(name, shard)), fn {stream_id, _seq} ->
-          Protocol.stream_cluster(stream_id)
+          WireProtocol.stream_cluster(stream_id)
         end)
       ])
       |> Enum.reject(&is_nil/1)
@@ -748,7 +748,7 @@ defmodule Group.Replica.Data do
 
   def drop_local_stream(name, shard, cluster, epoch) do
     stream_id =
-      Group.Replica.Protocol.stream_id(name, node(), generation(name), shard, cluster, epoch)
+      Group.Replica.WireProtocol.stream_id(name, node(), generation(name), shard, cluster, epoch)
 
     append_rows =
       :ets.select(replica_oplog_table(name, shard), [
@@ -867,10 +867,10 @@ defmodule Group.Replica.Data do
   # =====================================================================
 
   def put_registry_claim(name, shard, stream_id, seq, key, pid, meta, time) do
-    cluster = Group.Replica.Protocol.stream_cluster(stream_id)
-    origin_node = Group.Replica.Protocol.stream_origin(stream_id)
-    generation = Group.Replica.Protocol.stream_generation(stream_id)
-    epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+    cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
+    origin_node = Group.Replica.WireProtocol.stream_origin(stream_id)
+    generation = Group.Replica.WireProtocol.stream_generation(stream_id)
+    epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
     claim_key = {cluster, key, origin_node, generation, epoch}
     by_key = reg_claim_by_key_table(name, shard)
 
@@ -904,10 +904,10 @@ defmodule Group.Replica.Data do
   end
 
   def delete_registry_claim(name, shard, stream_id, seq, key, pid) do
-    cluster = Group.Replica.Protocol.stream_cluster(stream_id)
-    origin_node = Group.Replica.Protocol.stream_origin(stream_id)
-    generation = Group.Replica.Protocol.stream_generation(stream_id)
-    epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+    cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
+    origin_node = Group.Replica.WireProtocol.stream_origin(stream_id)
+    generation = Group.Replica.WireProtocol.stream_generation(stream_id)
+    epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
     claim_key = {cluster, key, origin_node, generation, epoch}
 
     case :ets.lookup(reg_claim_by_key_table(name, shard), claim_key) do
@@ -934,10 +934,10 @@ defmodule Group.Replica.Data do
   end
 
   def registry_claims_for_stream(name, shard, stream_id) do
-    cluster = Group.Replica.Protocol.stream_cluster(stream_id)
-    origin_node = Group.Replica.Protocol.stream_origin(stream_id)
-    generation = Group.Replica.Protocol.stream_generation(stream_id)
-    epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+    cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
+    origin_node = Group.Replica.WireProtocol.stream_origin(stream_id)
+    generation = Group.Replica.WireProtocol.stream_generation(stream_id)
+    epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
 
     :ets.select(reg_claim_by_key_table(name, shard), [
       {{{cluster, :"$1", origin_node, generation, epoch}, :"$2", :"$3", :"$4", :_}, [],
@@ -946,10 +946,10 @@ defmodule Group.Replica.Data do
   end
 
   def replace_registry_claims_for_stream(name, shard, stream_id, snapshot_seq, claims) do
-    cluster = Group.Replica.Protocol.stream_cluster(stream_id)
-    origin_node = Group.Replica.Protocol.stream_origin(stream_id)
-    generation = Group.Replica.Protocol.stream_generation(stream_id)
-    epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+    cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
+    origin_node = Group.Replica.WireProtocol.stream_origin(stream_id)
+    generation = Group.Replica.WireProtocol.stream_generation(stream_id)
+    epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
     existing = registry_claims_for_stream(name, shard, stream_id)
 
     Enum.each(existing, fn {key, pid, _meta, _time} ->
@@ -979,10 +979,10 @@ defmodule Group.Replica.Data do
         staging_table,
         chunk_count
       ) do
-    cluster = Group.Replica.Protocol.stream_cluster(stream_id)
-    origin_node = Group.Replica.Protocol.stream_origin(stream_id)
-    generation = Group.Replica.Protocol.stream_generation(stream_id)
-    epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+    cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
+    origin_node = Group.Replica.WireProtocol.stream_origin(stream_id)
+    generation = Group.Replica.WireProtocol.stream_generation(stream_id)
+    epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
     existing = registry_claims_for_stream(name, shard, stream_id)
 
     keys =
@@ -1042,10 +1042,10 @@ defmodule Group.Replica.Data do
     streams =
       MapSet.new(stream_ids, fn stream_id ->
         {
-          Group.Replica.Protocol.stream_cluster(stream_id),
-          Group.Replica.Protocol.stream_origin(stream_id),
-          Group.Replica.Protocol.stream_generation(stream_id),
-          Group.Replica.Protocol.stream_epoch(stream_id)
+          Group.Replica.WireProtocol.stream_cluster(stream_id),
+          Group.Replica.WireProtocol.stream_origin(stream_id),
+          Group.Replica.WireProtocol.stream_generation(stream_id),
+          Group.Replica.WireProtocol.stream_epoch(stream_id)
         }
       end)
 

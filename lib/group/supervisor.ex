@@ -44,9 +44,9 @@ defmodule Group.Supervisor do
 
     replica_transport =
       opts
-      |> Keyword.get(:replica_transport, Group.Replica.Transport.Distribution)
-      |> Group.Replica.Transport.normalize()
-      |> Group.Replica.Transport.validate!()
+      |> Keyword.get(:replica_transport, Group.Transport.DistErl)
+      |> Group.Transport.normalize()
+      |> Group.Transport.validate!()
 
     replicated_oplog_max_entries =
       positive_integer_opt(opts, :replicated_oplog_max_entries, 65_536)

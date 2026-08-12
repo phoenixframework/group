@@ -18,12 +18,13 @@ lib/
   group/peer_reconnect.ex          — bounded retry for busy dispatch links
   group/replica.ex                 — sharded writes, control, AE, projection
   group/replica/data.ex            — ETS owner, journal, authority, indexes
-  group/replica/protocol.ex        — stream identity and mutation helpers
+  group/replica/wire_protocol.ex   — wire version, stream identity, mutations
   group/replica/snapshot.ex        — byte-targeted snapshot chunks/staging
-  group/replica/transport.ex       — replica transport contract + dist adapter
-  group/replica/transport/outbox.ex — optional lossy sideband outboxes
-  group/replica/transport/tcp.ex   — included sideband TCP adapter
+  group/transport.ex                — replica transport contract
+  group/transport/dist_erl.ex       — default dist-Erlang adapter
+  group/transport/outbox.ex         — optional lossy sideband outboxes
 test/
+  support/test_tcp_transport.ex     — test-only independent-socket adapter
   replica_model_property_test.exs  — shrinkable real-node lifecycle model
   replica_adversarial_test.exs     — seeded three-node transport chaos
   replica_snapshot_*               — chunk/assembly failure coverage
@@ -165,12 +166,11 @@ All cross-node Group control sends use
 adapter sends directly the same way and adds no local hop. `:busy` and
 `:disconnected` mean “drop this message”; periodic anti-entropy repairs it.
 
-A sideband adapter may use one local `Group.Replica.Transport.Outbox` per
-shard. Outboxes batch by peer, impose deadlines, and run bounded socket work
-outside Group shards. Queue overflow, expiry, or socket backpressure drops the
-batch. The included TCP adapter adds bounded per-peer writer queues and
-capability-authenticated ingress while distribution still authenticates node
-identity and carries authority. TCP is not encrypted.
+A sideband adapter may use one local `Group.Transport.Outbox` per shard.
+Outboxes batch by peer, impose deadlines, and run bounded socket work outside
+Group shards. Queue overflow, expiry, or socket backpressure drops the batch.
+The test suite's hidden TCP adapter exercises a genuinely independent socket
+lane; it is validation infrastructure, not a supported production transport.
 
 Transport ordering is not required for correctness. Per-shard ordered delivery
 is a fast path; stream sequences reject duplicate/out-of-order data, and
@@ -238,8 +238,10 @@ FIFO local-request turn to prevent replica pressure from starving callers.
 2. Exact snapshots replace one origin slice; they are never additive merges.
 3. Authority requires generation, exact epoch revision, and installed lane
    readiness. Observed heartbeats/controls are not exact authority.
-4. A stale generation, epoch, lane, shard, transitive pid, or unauthenticated
-   source is rejected before applying replica data.
+4. A stale generation, epoch, lane, shard, transitive pid, or stream whose
+   origin differs from the transport-reported source is rejected before
+   applying replica data. Group trusts the adapter's source identity;
+   authenticating a sideband peer belongs to that transport.
 5. Registry claims are retained per origin until that origin deletes them or is
    retired; the visible winner is reconstructible from remaining claims.
 6. Only an owner node monitors, retires, or exits its member processes.

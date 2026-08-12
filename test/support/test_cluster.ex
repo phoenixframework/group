@@ -728,7 +728,7 @@ defmodule Group.TestCluster do
         Group.Replica.Data.replica_cursor_table(name, shard)
         |> :ets.tab2list()
         |> Enum.filter(fn {stream_id, _seq} ->
-          Group.Replica.Protocol.stream_origin(stream_id) == origin
+          Group.Replica.WireProtocol.stream_origin(stream_id) == origin
         end)
 
       retained_view = Group.Replica.Data.remote_view_generation(name, shard, origin)
@@ -908,14 +908,14 @@ defmodule Group.TestCluster do
     Group.Replica.Data.replica_cursor_table(name, shard)
     |> :ets.tab2list()
     |> Enum.each(fn {stream_id, seq} ->
-      origin = Group.Replica.Protocol.stream_origin(stream_id)
-      generation = Group.Replica.Protocol.stream_generation(stream_id)
-      cluster = Group.Replica.Protocol.stream_cluster(stream_id)
-      epoch = Group.Replica.Protocol.stream_epoch(stream_id)
+      origin = Group.Replica.WireProtocol.stream_origin(stream_id)
+      generation = Group.Replica.WireProtocol.stream_generation(stream_id)
+      cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
+      epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
 
       valid? =
-        Group.Replica.Protocol.stream_name(stream_id) == name and
-          Group.Replica.Protocol.stream_shard(stream_id) == shard and
+        Group.Replica.WireProtocol.stream_name(stream_id) == name and
+          Group.Replica.WireProtocol.stream_shard(stream_id) == shard and
           origin != node() and
           generation == Group.Replica.Data.remote_generation(name, origin) and
           epoch == Group.Replica.Data.remote_cluster_epoch(name, origin, cluster) and

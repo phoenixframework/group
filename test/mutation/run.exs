@@ -16,7 +16,7 @@ defmodule Group.MutationCampaign do
       name: "accept_old_generation",
       file: "lib/group/replica.ex",
       correct_source:
-        "Protocol.stream_generation(stream_id) == Data.remote_generation(state.name, source_node) and",
+        "WireProtocol.stream_generation(stream_id) == Data.remote_generation(state.name, source_node) and",
       faulty_source: "true and",
       test: ["test/distributed_test.exs:5328"]
     },
@@ -24,7 +24,7 @@ defmodule Group.MutationCampaign do
       name: "accept_old_epoch",
       file: "lib/group/replica.ex",
       correct_source: """
-      Protocol.stream_epoch(stream_id) ==
+      WireProtocol.stream_epoch(stream_id) ==
               Data.remote_cluster_epoch(state.name, source_node, cluster) and
       """,
       faulty_source: """
@@ -369,11 +369,11 @@ defmodule Group.MutationCampaign do
       name: "accept_shared_authority_before_lane_install",
       file: "lib/group/replica.ex",
       correct_source: """
-          Protocol.stream_shard(stream_id) == state.shard_index and
+          WireProtocol.stream_shard(stream_id) == state.shard_index and
             replica_view_current?(state, source_node) and
       """,
       faulty_source: """
-          Protocol.stream_shard(stream_id) == state.shard_index and
+          WireProtocol.stream_shard(stream_id) == state.shard_index and
             true and
       """,
       test: ["test/distributed_test.exs:5531"]

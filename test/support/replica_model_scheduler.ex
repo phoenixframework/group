@@ -390,7 +390,7 @@ defmodule Group.ReplicaModelScheduler do
       :ok =
         TestCluster.rpc!(
           envelope.target,
-          Group.Replica.Transport,
+          Group.Transport,
           :incoming,
           [state.name, envelope.source, envelope.shard, envelope.message]
         )
