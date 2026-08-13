@@ -46,10 +46,30 @@ defmodule Group.Transport do
             ) :: outgoing_result()
 
   @callback child_spec(keyword()) :: Supervisor.child_spec() | :ignore
-  @callback peer_up(group :: atom(), node(), descriptor :: term(), opts :: keyword()) :: :ok
-  @callback peer_down(group :: atom(), node(), opts :: keyword()) :: :ok
 
-  @optional_callbacks child_spec: 1, peer_up: 4, peer_down: 3
+  @doc """
+  Reports that one shard lane can address a peer through this transport.
+
+  A transport sharing one node-level connection across lanes should retain the
+  route until `peer_down/4` has retired every shard previously reported up.
+  """
+  @callback peer_up(
+              group :: atom(),
+              node(),
+              shard :: non_neg_integer(),
+              descriptor :: term(),
+              opts :: keyword()
+            ) :: :ok
+
+  @doc "Reports that one shard lane no longer has live peer authority."
+  @callback peer_down(
+              group :: atom(),
+              node(),
+              shard :: non_neg_integer(),
+              opts :: keyword()
+            ) :: :ok
+
+  @optional_callbacks child_spec: 1, peer_up: 5, peer_down: 4
 
   @doc """
   Passes an incoming replica message to the corresponding local shard.
@@ -57,15 +77,20 @@ defmodule Group.Transport do
   This is a local mailbox operation. `source_node` is the trusted peer identity
   established by the adapter. Stream generation, epoch, group, shard, origin,
   and member-pid ownership are validated by the replica.
+
+  Returns `:disconnected` and drops the message if that shard is not currently
+  registered, for example while its supervisor is restarting.
   """
   def incoming(group, source_node, shard, message)
       when is_atom(group) and is_atom(source_node) and is_integer(shard) and shard >= 0 do
-    send(
-      Group.Replica.shard_name(group, shard),
-      {:group_replica_frame, source_node, message}
-    )
+    case Process.whereis(Group.Replica.shard_name(group, shard)) do
+      pid when is_pid(pid) ->
+        send(pid, {:group_replica_frame, source_node, message})
+        :ok
 
-    :ok
+      nil ->
+        :disconnected
+    end
   end
 
   @doc """
@@ -75,16 +100,21 @@ defmodule Group.Transport do
   must reassemble every segment before calling this function. Group never
   observes or applies a partial batch. `source_node` has the same trusted-peer
   meaning as in `incoming/4`.
+
+  Like `incoming/4`, this returns `:disconnected` if the destination shard is
+  unavailable.
   """
   def incoming_batch(group, source_node, shard, messages)
       when is_atom(group) and is_atom(source_node) and is_integer(shard) and shard >= 0 and
              is_list(messages) do
-    send(
-      Group.Replica.shard_name(group, shard),
-      {:group_replica_batch, source_node, messages}
-    )
+    case Process.whereis(Group.Replica.shard_name(group, shard)) do
+      pid when is_pid(pid) ->
+        send(pid, {:group_replica_batch, source_node, messages})
+        :ok
 
-    :ok
+      nil ->
+        :disconnected
+    end
   end
 
   def normalize(module) when is_atom(module), do: {module, []}

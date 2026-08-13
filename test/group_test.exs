@@ -2675,7 +2675,7 @@ defmodule GroupTest do
       assert Group.lookup(name, key2) == {pid2, %{v: 2}}
     end
 
-    test "terminate flushes buffered replicated registry ops before shard restart" do
+    test "restart purges a flushed legacy registry row that has no authoritative claim" do
       name =
         start_single_shard_group(
           replicated_registry_receiver_buffer_size: 32,
@@ -2706,7 +2706,8 @@ defmodule GroupTest do
         end
       end)
 
-      assert Group.lookup(name, key) == {pid, %{v: 1}}
+      assert Group.lookup(name, key) == nil
+      assert :ok = Group.TestCluster.assert_replica_consistent(name)
     end
 
     test "replaces stale remote registry owner and clears the old by-pid entry" do

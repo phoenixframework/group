@@ -113,7 +113,7 @@ defmodule Group.TestCluster do
         spawn(fn ->
           :ok = Group.register(name, key, meta)
           send(parent, {:registered, self()})
-          Process.sleep(:infinity)
+          registration_owner_loop(name, key)
         end)
 
       receive do
@@ -130,6 +130,26 @@ defmodule Group.TestCluster do
 
       pid
     end)
+  end
+
+  @doc false
+  def unregister_owner(pid) when is_pid(pid) do
+    send(pid, {:unregister, self()})
+
+    receive do
+      {:unregistered, ^pid, result} -> result
+    after
+      5_000 -> raise "unregister_owner timed out"
+    end
+  end
+
+  defp registration_owner_loop(name, key) do
+    receive do
+      {:unregister, reply_to} when is_pid(reply_to) ->
+        result = Group.unregister(name, key)
+        send(reply_to, {:unregistered, self(), result})
+        registration_owner_loop(name, key)
+    end
   end
 
   @doc "Spawn a process on a remote node that joins and sleeps forever.
@@ -525,6 +545,24 @@ defmodule Group.TestCluster do
     end
   end
 
+  @doc false
+  def snapshot_staging_tables(name, shard_index) do
+    owner = Process.whereis(Group.Replica.shard_name(name, shard_index))
+
+    :ets.all()
+    |> Enum.filter(fn table -> :ets.info(table, :owner) == owner end)
+  end
+
+  @doc false
+  def delete_remote_view_info(name, shard_index, remote_node) do
+    :ets.delete(
+      Group.Replica.Data.replication_meta_table(name),
+      {:remote_view_info, shard_index, remote_node}
+    )
+
+    :ok
+  end
+
   @doc "Returns the current message_queue_len for a shard on a remote node."
   def shard_message_queue_len(node, name, shard) do
     :erpc.call(node, __MODULE__, :do_shard_message_queue_len, [name, shard])
@@ -848,9 +886,22 @@ defmodule Group.TestCluster do
 
     missing_authority = MapSet.difference(visible, claims)
 
+    claimed_keys =
+      MapSet.new(claims, fn {cluster, key, _pid, _meta, _time, _origin} -> {cluster, key} end)
+
+    visible_keys =
+      MapSet.new(visible, fn {cluster, key, _pid, _meta, _time, _origin} -> {cluster, key} end)
+
+    missing_projection = MapSet.difference(claimed_keys, visible_keys)
+
     if MapSet.size(missing_authority) > 0 do
       raise "visible registry rows without an authoritative claim in #{name} shard #{shard}: " <>
               inspect(MapSet.to_list(missing_authority))
+    end
+
+    if MapSet.size(missing_projection) > 0 do
+      raise "authoritative registry claims without a visible projection in #{name} shard #{shard}: " <>
+              inspect(MapSet.to_list(missing_projection))
     end
   end
 

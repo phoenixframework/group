@@ -199,6 +199,72 @@ defmodule Group.ReplicaSnapshotDistributedTest do
            end)
   end
 
+  test "rejected first chunks do not leak their private staging tables", context do
+    %{name: name, node_a: node_a, node_b: node_b} = start_pair(context)
+    :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+
+    for index <- 1..4 do
+      TestCluster.spawn_register(node_a, name, "snapshot/rejected/#{index}", %{
+        payload: String.duplicate("x", 160)
+      })
+    end
+
+    TestCluster.flush_shards(node_a, name)
+    stream_id = local_stream(node_a, name, nil)
+    frames = capture_snapshot(node_a, node_b, name, stream_id, 1)
+
+    rows =
+      frames
+      |> Enum.flat_map(&elem(&1, 8))
+      |> Enum.take(2)
+
+    assert [first_row, second_row] = rows
+    {:snapshot_chunk, version, ^stream_id, snapshot_seq, _, _, _, _, _, _} = hd(frames)
+    assert snapshot_staging_tables(node_b, name) == []
+
+    overflow =
+      {:snapshot_chunk, version, stream_id, snapshot_seq, 1, 2, 1, 1, [first_row, second_row], []}
+
+    deliver_frames(node_b, node_a, name, [overflow])
+    assert snapshot_transfer_count(node_b, name) == 0
+    assert snapshot_staging_tables(node_b, name) == []
+
+    duplicate =
+      {:snapshot_chunk, version, stream_id, snapshot_seq, 1, 2, 2, 0, [first_row, first_row], []}
+
+    deliver_frames(node_b, node_a, name, [duplicate])
+    assert snapshot_transfer_count(node_b, name) == 0
+    assert snapshot_staging_tables(node_b, name) == []
+  end
+
+  test "nodedown immediately destroys partial staging owned by the retired source", context do
+    %{name: name, node_a: node_a, node_b: node_b} = start_pair(context)
+    on_exit(fn -> TestCluster.reconnect_nodes(node_a, node_b) end)
+    :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+
+    for index <- 1..4 do
+      TestCluster.spawn_register(node_a, name, "snapshot/nodedown/#{index}", %{
+        payload: String.duplicate("n", 160)
+      })
+    end
+
+    TestCluster.flush_shards(node_a, name)
+    stream_id = local_stream(node_a, name, nil)
+    frames = capture_snapshot(node_a, node_b, name, stream_id, 1)
+    assert length(frames) > 1
+    deliver_frames(node_b, node_a, name, [hd(frames)])
+    assert snapshot_transfer_count(node_b, name) == 1
+
+    TestCluster.disconnect_nodes(node_a, node_b)
+
+    TestCluster.assert_eventually(fn ->
+      node_a not in TestCluster.rpc!(node_b, Group, :nodes, [name])
+    end)
+
+    assert snapshot_transfer_count(node_b, name) == 0
+    assert snapshot_staging_tables(node_b, name) == []
+  end
+
   test "an authority epoch change fences partial chunks and their staging expires", context do
     cluster = "snapshot-epoch"
 
@@ -313,6 +379,9 @@ defmodule Group.ReplicaSnapshotDistributedTest do
       TestCluster.rpc!(node_b, Group.Replica.Data, :remote_generation, [name, node_a]) ==
         new_generation
     end)
+
+    assert snapshot_transfer_count(node_b, name) == 0
+    assert snapshot_staging_tables(node_b, name) == []
 
     :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
 
@@ -603,5 +672,9 @@ defmodule Group.ReplicaSnapshotDistributedTest do
     TestCluster.rpc!(node, :erlang, :map_size, [
       TestCluster.rpc!(node, :sys, :get_state, [Group.Replica.shard_name(name, 0)]).snapshot_transfers
     ])
+  end
+
+  defp snapshot_staging_tables(node, name) do
+    TestCluster.rpc!(node, TestCluster, :snapshot_staging_tables, [name, 0])
   end
 end

@@ -66,13 +66,13 @@ defmodule Group.TestTCPTransport do
   end
 
   @impl true
-  def peer_up(group, remote_node, descriptor, _opts) do
-    send_manager(group, {:peer_up, remote_node, descriptor})
+  def peer_up(group, remote_node, shard, descriptor, _opts) do
+    send_manager(group, {:peer_up, remote_node, shard, descriptor})
   end
 
   @impl true
-  def peer_down(group, remote_node, _opts) do
-    send_manager(group, {:peer_down, remote_node})
+  def peer_down(group, remote_node, shard, _opts) do
+    send_manager(group, {:peer_down, remote_node, shard})
   end
 
   @doc false
@@ -146,8 +146,14 @@ defmodule Group.TestTCPTransport do
   end
 
   @impl true
-  def handle_info({:peer_up, remote_node, descriptor}, state) do
-    state = %{state | peers: Map.put(state.peers, remote_node, descriptor)}
+  def handle_info({:peer_up, remote_node, shard, descriptor}, state) do
+    peer =
+      state.peers
+      |> Map.get(remote_node, %{descriptor: descriptor, lanes: MapSet.new()})
+      |> Map.put(:descriptor, descriptor)
+      |> Map.update!(:lanes, &MapSet.put(&1, shard))
+
+    state = %{state | peers: Map.put(state.peers, remote_node, peer)}
 
     state =
       if MapSet.member?(state.disabled, remote_node) do
@@ -159,8 +165,21 @@ defmodule Group.TestTCPTransport do
     {:noreply, state}
   end
 
-  def handle_info({:peer_down, remote_node}, state) do
-    {:noreply, drop_peer(state, remote_node, true)}
+  def handle_info({:peer_down, remote_node, shard}, state) do
+    case Map.get(state.peers, remote_node) do
+      nil ->
+        {:noreply, state}
+
+      peer ->
+        lanes = MapSet.delete(peer.lanes, shard)
+
+        if MapSet.size(lanes) == 0 do
+          {:noreply, drop_peer(state, remote_node, true)}
+        else
+          peer = %{peer | lanes: lanes}
+          {:noreply, %{state | peers: Map.put(state.peers, remote_node, peer)}}
+        end
+    end
   end
 
   def handle_info({:writer_ready, remote_node, writer, queued}, state) do
@@ -249,7 +268,7 @@ defmodule Group.TestTCPTransport do
       Map.has_key?(state.writers, remote_node) ->
         state
 
-      descriptor = Map.get(state.peers, remote_node) ->
+      peer = Map.get(state.peers, remote_node) ->
         manager = self()
 
         writer =
@@ -258,7 +277,7 @@ defmodule Group.TestTCPTransport do
               manager,
               state.group,
               remote_node,
-              descriptor,
+              peer.descriptor,
               state.connect_timeout,
               state.send_timeout
             )
@@ -411,8 +430,10 @@ defmodule Group.TestTCPTransport do
         case decode_authenticated_frame(payload) do
           {:ok, {:batch, shard, messages}}
           when is_integer(shard) and shard >= 0 and is_list(messages) ->
-            :ok = Group.Transport.incoming_batch(group, source_node, shard, messages)
-            reader_loop(socket, group, source_node)
+            case Group.Transport.incoming_batch(group, source_node, shard, messages) do
+              result when result in [:ok, :disconnected] ->
+                reader_loop(socket, group, source_node)
+            end
 
           _ ->
             :gen_tcp.close(socket)

@@ -108,6 +108,15 @@ defmodule Group.Transport.Outbox do
   @doc false
   def monotonic_ms, do: System.monotonic_time(:millisecond)
 
+  @doc false
+  def validate_options!(opts) when is_list(opts) do
+    deadline(opts)
+    positive_opt(opts, :outbox_batch_size, 64)
+    positive_opt(opts, :outbox_batch_bytes, 1_048_576)
+    non_negative_opt(opts, :outbox_flush_interval, 1)
+    :ok
+  end
+
   defp deadline(opts) do
     case Keyword.get(opts, :outbox_deadline, @default_deadline) do
       value when is_integer(value) and value > 0 ->
@@ -115,6 +124,27 @@ defmodule Group.Transport.Outbox do
 
       other ->
         raise ArgumentError, "expected :outbox_deadline to be positive, got: #{inspect(other)}"
+    end
+  end
+
+  defp positive_opt(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value > 0 ->
+        value
+
+      other ->
+        raise ArgumentError, "expected #{inspect(key)} to be positive, got: #{inspect(other)}"
+    end
+  end
+
+  defp non_negative_opt(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value >= 0 ->
+        value
+
+      other ->
+        raise ArgumentError,
+              "expected #{inspect(key)} to be non-negative, got: #{inspect(other)}"
     end
   end
 end
@@ -127,6 +157,7 @@ defmodule Group.Transport.Outbox.Supervisor do
 
   @impl true
   def init(opts) do
+    :ok = Group.Transport.Outbox.validate_options!(opts)
     group = Keyword.fetch!(opts, :name)
     num_shards = Keyword.fetch!(opts, :num_shards)
     backend = Keyword.fetch!(opts, :backend)
@@ -171,6 +202,7 @@ defmodule Group.Transport.Outbox.Worker do
 
   @impl true
   def init({opts, shard}) do
+    :ok = Outbox.validate_options!(opts)
     group = Keyword.fetch!(opts, :name)
     backend = Keyword.fetch!(opts, :backend)
     {:ok, backend_state} = backend.init_outbox(group, shard, opts)
@@ -218,7 +250,10 @@ defmodule Group.Transport.Outbox.Worker do
     end
   end
 
-  def handle_info({:group_replica_outbox_flush, ref}, %{flush_ref: ref} = state) do
+  def handle_info(
+        {:group_replica_outbox_flush, ref},
+        %{flush_ref: {ref, _timer_ref}} = state
+      ) do
     {:noreply, flush(%{state | flush_ref: nil})}
   end
 
@@ -237,12 +272,17 @@ defmodule Group.Transport.Outbox.Worker do
   end
 
   defp schedule_flush(%{pending_count: 0} = state), do: state
-  defp schedule_flush(%{flush_ref: ref} = state) when is_reference(ref), do: state
+
+  defp schedule_flush(%{flush_ref: {_ref, timer_ref}} = state) when is_reference(timer_ref),
+    do: state
 
   defp schedule_flush(state) do
     ref = make_ref()
-    Process.send_after(self(), {:group_replica_outbox_flush, ref}, state.flush_interval)
-    %{state | flush_ref: ref}
+
+    timer_ref =
+      Process.send_after(self(), {:group_replica_outbox_flush, ref}, state.flush_interval)
+
+    %{state | flush_ref: {ref, timer_ref}}
   end
 
   defp flush(%{pending_count: 0} = state), do: cancel_flush(state)
@@ -290,8 +330,8 @@ defmodule Group.Transport.Outbox.Worker do
 
   defp cancel_flush(%{flush_ref: nil} = state), do: state
 
-  defp cancel_flush(state) do
-    Process.cancel_timer(state.flush_ref)
+  defp cancel_flush(%{flush_ref: {_ref, timer_ref}} = state) do
+    Process.cancel_timer(timer_ref)
     %{state | flush_ref: nil}
   end
 

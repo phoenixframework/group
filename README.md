@@ -451,7 +451,9 @@ and exact snapshots close gaps after pruning. Exact snapshots are split into
 transport-neutral byte-bounded messages; loss, duplication, or reordering leaves
 the old visible slice and cursor untouched until all chunks arrive. Incomplete
 staging expires after a peer-lease interval without progress and is destroyed
-automatically with its owning shard. Named-cluster close uses only a temporary
+automatically with its owning shard. Rejected first chunks, nodedown,
+generation replacement, and retired epochs destroy matching staging
+immediately. Named-cluster close uses only a temporary
 local shard-completion barrier; the final shard removes it and all routing rows,
 including after a caller timeout or shard restart. Reconnect waits for that
 barrier so a prior close cannot erase newly accepted writes.
@@ -485,6 +487,13 @@ with `Group.Transport.Outbox.child_spec/1`. An outbox groups messages by
 target and invokes the adapter's `send_batch/4` callback. Calls that expire or
 return `:busy`/`:disconnected` are dropped without a local retry; the next
 anti-entropy exchange repairs them.
+
+The optional `peer_up/5` and `peer_down/4` callbacks report one shard lane at a
+time. A sideband adapter that shares a single node connection must retain it
+while any reported lane remains live and release it after the last lane goes
+down. `incoming/4` and `incoming_batch/4` return `:disconnected` and drop when
+their local shard is restarting; an ingress reader must treat that as an
+expected lossy delivery outcome.
 
 A message-oriented backend fits this callback shape by obtaining a connection
 once from `init_outbox/3`, then sending each `send_batch/4` result to a

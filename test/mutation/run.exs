@@ -131,7 +131,8 @@ defmodule Group.MutationCampaign do
       correct_source: """
             %{snapshot_seq: existing_seq} when existing_seq < snapshot_seq ->
               state = discard_snapshot_transfer(state, key)
-              {:ok, state, new_snapshot_transfer(snapshot_seq, manifest)}
+              transfer = new_snapshot_transfer(snapshot_seq, manifest)
+              {:ok, put_snapshot_transfer(state, key, transfer), transfer}
       """,
       faulty_source: """
             %{snapshot_seq: existing_seq} when existing_seq < snapshot_seq ->

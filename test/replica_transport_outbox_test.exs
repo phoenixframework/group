@@ -137,6 +137,33 @@ defmodule Group.ReplicaTransportOutboxTest do
     refute Process.alive?(receiver)
   end
 
+  test "incoming messages are dropped when the destination shard is unavailable" do
+    group = unique_group(:missing_ingress)
+    source_node = :"missing-ingress@test"
+
+    assert :disconnected = Group.Transport.incoming(group, source_node, 0, {:heads, 1, []})
+
+    assert :disconnected =
+             Group.Transport.incoming_batch(group, source_node, 0, [
+               {:heads, 1, []},
+               {:needs, 1, []}
+             ])
+  end
+
+  test "invalid outbox deadlines are rejected when the outbox supervisor boots" do
+    group = unique_group(:invalid_deadline)
+
+    assert_raise ArgumentError, ~r/:outbox_deadline/, fn ->
+      Group.Transport.Outbox.Supervisor.init(
+        name: group,
+        num_shards: 1,
+        backend: Backend,
+        controller: self(),
+        outbox_deadline: 0
+      )
+    end
+  end
+
   defp start_outboxes(group, opts) do
     base = [
       name: group,

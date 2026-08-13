@@ -175,11 +175,12 @@ defmodule Group.Jepsen.Transport.TCP do
   end
 
   @impl true
-  def peer_up(group, remote_node, descriptor, opts),
-    do: Delegate.peer_up(group, remote_node, descriptor, opts)
+  def peer_up(group, remote_node, shard, descriptor, opts),
+    do: Delegate.peer_up(group, remote_node, shard, descriptor, opts)
 
   @impl true
-  def peer_down(group, remote_node, opts), do: Delegate.peer_down(group, remote_node, opts)
+  def peer_down(group, remote_node, shard, opts),
+    do: Delegate.peer_down(group, remote_node, shard, opts)
 end
 
 defmodule Group.Jepsen.Transport.TCP.Supervisor do

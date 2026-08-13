@@ -25,6 +25,7 @@ release qualification rather than individual edits.
 |------|---------------|
 | `group_test.exs` | Single-node: register/unregister, join/leave, members, monitor/demonitor, named clusters, concurrent operations |
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts, and adversarial replica-transport loss/busy/snapshot recovery |
+| `anti_entropy_fault_regression_test.exs` | Three-node regressions for hidden-winner projection, crash-journal replay, claimless cluster cleanup, shard-zero view repair, and shard-scoped sideband lifecycle |
 | `replica_adversarial_test.exs` | Reproducible three-node mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
 | `replica_model_property_test.exs` | StreamData-generated and shrunk owner histories against an independent lifecycle oracle and scheduler-controlled replica transport |
 | `replica_snapshot_test.exs` | Pure byte partitioning and set-valued private-ETS snapshot staging |
@@ -286,7 +287,9 @@ registry or PG state.
 
 `replica_transport_outbox_test.exs` proves that a blocked sideband backend
 cannot delay the Group-facing local push, messages expire behind that backend,
-busy batches are not retried locally, and batching preserves per-target order.
+busy batches are not retried locally, batching preserves per-target order,
+invalid deadlines fail at boot, and ingress drops rather than raising while a
+destination shard is absent.
 The real three-node TCP recovery test runs through the same outbox path.
 
 `Group.TestCluster.assert_replica_consistent/1` checks the

@@ -4666,6 +4666,24 @@ defmodule Group.DistributedTest do
       ]
 
       start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        not is_nil(
+          TestCluster.rpc!(node_a, Group.Replica.Data, :remote_view_generation, [
+            name,
+            0,
+            node_b
+          ])
+        ) and
+          not is_nil(
+            TestCluster.rpc!(node_b, Group.Replica.Data, :remote_view_generation, [
+              name,
+              0,
+              node_a
+            ])
+          )
+      end)
+
       TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
       TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
 

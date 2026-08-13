@@ -36,7 +36,10 @@ defmodule Group.Replica do
   When a local claim loses, only its owner node appends the authoritative
   unregister and terminates the local process. Retaining hidden remote claims
   until their origin deletes them prevents a later winner change from orphaning
-  or permanently forgetting a live claim.
+  or permanently forgetting a live claim. Local unregister and process-DOWN
+  paths always re-project every affected key after deleting their claims. On a
+  shard restart, the complete claim/key union is projected again, closing the
+  crash window between journal application and the materialized winner write.
 
   PG memberships need no winner projection: the origin stream owns exactly the
   rows whose member processes live on that origin node.
@@ -71,6 +74,9 @@ defmodule Group.Replica do
   late messages fail their generation or epoch fence. Snapshot chunks may be
   lost, duplicated, reordered, or mixed across retransmissions at the same
   stream head; exact row counts and set insertion prevent partial commits.
+  Rejected first chunks destroy their staging table immediately. Node loss,
+  generation replacement, and retired cluster streams discard matching partial
+  assemblies immediately rather than waiting for their inactivity deadline.
 
   ## Bounded recovery
 
@@ -90,6 +96,10 @@ defmodule Group.Replica do
   The default replica adapter does the same. Transport callbacks return :ok,
   :busy, or :disconnected; failure drops the message and anti-entropy repairs it.
   Replica shards never remotely monitor or exit member processes.
+
+  Optional peer lifecycle callbacks are per shard lane. A sideband adapter that
+  shares one node connection across shards keeps that route until its final
+  live lane goes down; one flapping shard cannot disconnect healthy lanes.
 
   The transport need not order messages for correctness. The local shard
   serializes writes, sequence numbers establish per-stream order, and receivers
@@ -413,6 +423,13 @@ defmodule Group.Replica do
               Map.put(state.peer_transports, remote_node, {transport_id, transport_descriptor})
         }
 
+        state =
+          if replica_view_current?(state, remote_node) do
+            state
+          else
+            install_current_replica_lane(state, remote_node, generation)
+          end
+
         {:noreply, state}
 
       true ->
@@ -449,11 +466,12 @@ defmodule Group.Replica do
     remote_node = node(remote_pid)
 
     if version == WireProtocol.version() and transport_id == state.replica_transport.id() do
-      if function_exported?(state.replica_transport, :peer_up, 4) do
+      if function_exported?(state.replica_transport, :peer_up, 5) do
         :ok =
           state.replica_transport.peer_up(
             state.name,
             remote_node,
+            state.shard_index,
             transport_descriptor,
             state.replica_transport_opts
           )
@@ -1045,6 +1063,7 @@ defmodule Group.Replica do
 
   def handle_info({:nodedown, dead_node}, state) do
     state = flush_pending_replicated_message_barrier(state)
+    state = discard_snapshot_transfers_for_source(state, dead_node)
     %{name: name, shard_index: shard} = state
 
     # Remove cluster memberships from shared tables. Every shard calls this
@@ -1081,8 +1100,14 @@ defmodule Group.Replica do
     Data.delete_replica_cursors_for_origin(name, shard, dead_node)
     Data.delete_remote_replica_info(name, shard, dead_node)
 
-    if function_exported?(state.replica_transport, :peer_down, 3) do
-      :ok = state.replica_transport.peer_down(name, dead_node, state.replica_transport_opts)
+    if function_exported?(state.replica_transport, :peer_down, 4) do
+      :ok =
+        state.replica_transport.peer_down(
+          name,
+          dead_node,
+          shard,
+          state.replica_transport_opts
+        )
     end
 
     state = %{state | peer_transports: Map.delete(state.peer_transports, dead_node)}
@@ -1100,6 +1125,8 @@ defmodule Group.Replica do
     remote_node = node(pid)
 
     if remote_node != node() and Map.get(state.remote_shards, remote_node) == pid do
+      state = discard_snapshot_transfers_for_source(state, remote_node)
+
       # Remote shard process died — purge its cluster memberships and node data.
       # Unconditional (not gated on shard 0) — same reasoning as nodedown handler.
       Data.purge_cluster_node(name, remote_node)
@@ -1126,6 +1153,17 @@ defmodule Group.Replica do
       notify_monitors(name, events)
       state = %{state | remote_shards: Map.delete(state.remote_shards, remote_node)}
       state = %{state | monitors: Map.delete(state.monitors, pid)}
+
+      if function_exported?(state.replica_transport, :peer_down, 4) do
+        :ok =
+          state.replica_transport.peer_down(
+            name,
+            remote_node,
+            shard,
+            state.replica_transport_opts
+          )
+      end
+
       {:noreply, state}
     else
       if Map.has_key?(state.monitors, pid) do
@@ -1158,7 +1196,19 @@ defmodule Group.Replica do
         end)
 
         state = finish_process_down_records(state, sequenced_downs)
-        events = build_process_down_events(name, purged_reg, purged_pg, reason_by_pid)
+
+        affected_registry_keys =
+          pending_reg
+          |> Enum.map(fn {_pid, cluster, key, _meta} -> {cluster, key} end)
+          |> Enum.uniq()
+
+        {state, projection_events} =
+          reconcile_registry_keys(state, affected_registry_keys, reason, [])
+
+        events =
+          projection_events ++
+            build_process_down_events(name, purged_reg, purged_pg, reason_by_pid)
+
         notify_monitors(name, events)
         state = %{state | monitors: Map.drop(monitors, pids)}
         {:noreply, state}
@@ -1905,7 +1955,10 @@ defmodule Group.Replica do
             cluster: cluster
           })
 
-        notify_monitors(name, [event])
+        {state, projection_events} =
+          reconcile_registry_keys(state, [{cluster, key}], :unregister, [])
+
+        notify_monitors(name, projection_events ++ [event])
         {:ok, state}
 
       nil ->
@@ -2044,9 +2097,8 @@ defmodule Group.Replica do
 
     {events, local_pids} =
       Enum.reduce(clusters, {[], MapSet.new()}, fn cluster, {events, local_pids} ->
-        affected_keys = Data.purge_registry_claims_for_cluster(name, shard, cluster)
-        purged_reg = Data.delete_registry_keys(name, shard, cluster, affected_keys)
-        purged_pg = Data.delete_pg_cluster(name, shard, cluster)
+        _affected_keys = Data.purge_registry_claims_for_cluster(name, shard, cluster)
+        {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, :all)
 
         local_pids =
           Enum.reduce(purged_reg ++ purged_pg, local_pids, fn
@@ -2899,11 +2951,12 @@ defmodule Group.Replica do
   end
 
   defp notify_replica_transport_peer_up(state, remote_node, transport_descriptor) do
-    if function_exported?(state.replica_transport, :peer_up, 4) do
+    if function_exported?(state.replica_transport, :peer_up, 5) do
       :ok =
         state.replica_transport.peer_up(
           state.name,
           remote_node,
+          state.shard_index,
           transport_descriptor,
           state.replica_transport_opts
         )
@@ -3182,6 +3235,19 @@ defmodule Group.Replica do
     end)
   end
 
+  defp discard_snapshot_transfers_for_streams(state, stream_ids) do
+    stream_ids = MapSet.new(stream_ids)
+
+    Enum.reduce(state.snapshot_transfers, state, fn
+      {{_source_node, stream_id} = key, _transfer}, acc ->
+        if MapSet.member?(stream_ids, stream_id) do
+          discard_snapshot_transfer(acc, key)
+        else
+          acc
+        end
+    end)
+  end
+
   defp expire_replica_peer(state, remote_node) do
     state = discard_snapshot_transfers_for_source(state, remote_node)
     %{name: name, shard_index: shard} = state
@@ -3207,8 +3273,14 @@ defmodule Group.Replica do
       fan_out_to_siblings(state, {:replica_authority_removed_local, remote_node})
     end
 
-    if function_exported?(state.replica_transport, :peer_down, 3) do
-      :ok = state.replica_transport.peer_down(name, remote_node, state.replica_transport_opts)
+    if function_exported?(state.replica_transport, :peer_down, 4) do
+      :ok =
+        state.replica_transport.peer_down(
+          name,
+          remote_node,
+          shard,
+          state.replica_transport_opts
+        )
     end
 
     %{
@@ -3479,14 +3551,16 @@ defmodule Group.Replica do
   defp snapshot_transfer(state, key, snapshot_seq, manifest) do
     case Map.get(state.snapshot_transfers, key) do
       nil ->
-        {:ok, state, new_snapshot_transfer(snapshot_seq, manifest)}
+        transfer = new_snapshot_transfer(snapshot_seq, manifest)
+        {:ok, put_snapshot_transfer(state, key, transfer), transfer}
 
       %{snapshot_seq: existing_seq} when existing_seq > snapshot_seq ->
         {:ignore, state}
 
       %{snapshot_seq: existing_seq} when existing_seq < snapshot_seq ->
         state = discard_snapshot_transfer(state, key)
-        {:ok, state, new_snapshot_transfer(snapshot_seq, manifest)}
+        transfer = new_snapshot_transfer(snapshot_seq, manifest)
+        {:ok, put_snapshot_transfer(state, key, transfer), transfer}
 
       %{manifest: ^manifest} = transfer ->
         {:ok, state, transfer}
@@ -4088,6 +4162,7 @@ defmodule Group.Replica do
   defp maybe_purge_remote_generation(state, _remote_node, generation, generation), do: state
 
   defp maybe_purge_remote_generation(state, remote_node, _old_generation, _generation) do
+    state = discard_snapshot_transfers_for_source(state, remote_node)
     {_reg, _pg} = Data.purge_node(state.name, state.shard_index, remote_node)
 
     affected =
@@ -4123,6 +4198,8 @@ defmodule Group.Replica do
           epoch
         )
       end)
+
+    state = discard_snapshot_transfers_for_streams(state, stream_ids)
 
     affected_keys =
       Data.purge_registry_claims_for_streams(
@@ -4231,6 +4308,7 @@ defmodule Group.Replica do
          current_epochs,
          superseded
        ) do
+    state = discard_snapshot_transfers_for_streams(state, superseded)
     generation = Data.remote_generation(state.name, remote_node)
 
     superseded
@@ -4516,7 +4594,31 @@ defmodule Group.Replica do
         state.replicated_oplog_max_entries
       )
 
+    {state, _events} = rebuild_registry_projections(state)
     state
+  end
+
+  defp rebuild_registry_projections(state) do
+    claim_keys =
+      state.name
+      |> Data.reg_claim_by_key_table(state.shard_index)
+      |> :ets.select([
+        {{{:"$1", :"$2", :_, :_, :_}, :_, :_, :_, :_}, [], [{{:"$1", :"$2"}}]}
+      ])
+
+    visible_keys =
+      state.name
+      |> Data.reg_by_key_table(state.shard_index)
+      |> :ets.select([
+        {{{:"$1", :"$2"}, :_, :_, :_, :_}, [], [{{:"$1", :"$2"}}]}
+      ])
+
+    reconcile_registry_keys(
+      state,
+      Enum.uniq(claim_keys ++ visible_keys),
+      :journal_replay,
+      []
+    )
   end
 
   defp current_local_stream?(state, stream_id) do
@@ -4791,6 +4893,12 @@ defmodule Group.Replica do
       projection_reason,
       events
     )
+  end
+
+  defp reconcile_registry_keys(state, keys, reason, events) do
+    Enum.reduce(keys, {state, events}, fn {cluster, key}, {acc, inner_events} ->
+      reconcile_registry_projection(acc, cluster, key, reason, inner_events)
+    end)
   end
 
   defp select_registry_claim_winner(_state, _cluster, _key, []), do: nil
