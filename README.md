@@ -310,8 +310,9 @@ All operations are **eventually consistent**:
 - **`replicated_snapshot_chunk_target_bytes`** — target maximum encoded size
   of each exact-snapshot message. Defaults to 1 MiB and applies above every
   transport, including dist Erlang. A single row larger than the target is
-  sent alone. Receivers stage chunks in shard-owned private ETS and replace
-  visible state only after the complete exact slice is present.
+  sent alone. Receivers stage provisional chunks in shard-owned private ETS and
+  replace visible state only after the complete slice and its terminal manifest
+  are present.
 - **`replicated_anti_entropy_interval`** — interval in milliseconds for stream
   head advertisements and nonblocking control heartbeats. Defaults to 1,000.
 - **`replicated_peer_lease_timeout`** — time without a dist-Erlang control
@@ -479,10 +480,11 @@ There are no leaders, quorum acknowledgements, per-entry replicated tombstones,
 or known-membership retention barriers. Oplog memory is bounded locally and
 independently of slow peers. Deletes are normal ordered records while retained,
 and exact snapshots close gaps after pruning. Exact snapshots are split into
-transport-neutral byte-bounded messages; loss, duplication, or reordering leaves
-the old visible slice and cursor untouched until all chunks arrive. Incomplete
-staging expires after a peer-lease interval without progress and is destroyed
-automatically with its owning shard. Rejected first chunks, nodedown,
+transport-neutral byte-bounded provisional chunks followed by a small terminal
+manifest. Loss, duplication, reordering, or receipt of every chunk without that
+commit leaves the old visible slice and cursor untouched. Incomplete staging
+expires after a peer-lease interval without progress and is destroyed
+automatically with its owning shard. Rejected chunks or manifests, nodedown,
 generation replacement, and retired epochs destroy matching staging
 immediately. Named-cluster close uses only a temporary
 local shard-completion barrier; the final shard removes it and all routing rows,
@@ -520,17 +522,24 @@ target and invokes the adapter's `send_batch/4` callback. Calls that expire or
 return `:busy`/`:disconnected` are dropped without a local retry; the next
 anti-entropy exchange repairs them.
 
-Exact-snapshot row capture runs in at most one off-shard worker per shard. The
-worker sends only when the stream identity and fully-applied head are unchanged
-after its scans. A concurrent write invalidates the capture and periodic
-anti-entropy retries, keeping million-row scans off the Group control process.
-The worker holds at most one byte-targeted chunk on its process heap and keeps
-completed chunks in an unnamed private ETS table for that snapshot attempt.
-The receiver uses the same bounded-chunk shape plus minimal row-presence markers
-until exact commit. Both sides delete this ephemeral staging after completion or
-retry, and owner death deletes it automatically; it is not steady-state state
-or an additional authority source. Exact-install monitor events are likewise
-buffered into bounded private-ETS batches before the cursor becomes visible.
+Exact-snapshot scans run in at most one off-shard worker per shard. The worker
+validates the stream identity and fully-applied head both before and after one
+pass over the registry and PG tables. It streams each completed chunk
+immediately and retains only the current byte-targeted chunk on its heap. A
+concurrent write suppresses the terminal manifest, so every provisional chunk
+remains invisible and anti-entropy retries the newer head. Backpressure resumes
+from the first unsent chunk; if only the manifest was backpressured, the sender
+retains that small tuple and retries it without rescanning.
+
+The receiver necessarily retains one complete candidate in private ETS before
+beginning exact replacement: absence from the committed candidate is a delete.
+It also stores minimal row-presence markers to reject mixed/duplicate
+assemblies and bounded monitor-event batches until the cursor becomes visible.
+Transfer tables are cleared and pooled by the shard after completion or
+rejection instead of being created for every retry; shard death destroys active
+and pooled tables automatically. Sender memory is therefore O(chunk size),
+while receiver staging is O(the exact origin slice), with neither becoming a
+new authority source.
 
 The optional `peer_up/5` and `peer_down/4` callbacks report one shard lane at a
 time. A sideband adapter that shares a single node connection must retain it

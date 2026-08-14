@@ -17,11 +17,17 @@ defmodule Group.TestReplicaTransport do
              (is_tuple(mode) and tuple_size(mode) == 3 and elem(mode, 0) == :delay_types) or
              (is_tuple(mode) and tuple_size(mode) == 3 and
                 elem(mode, 0) == :accept_types_up_to) or
+             (is_tuple(mode) and tuple_size(mode) == 3 and
+                elem(mode, 0) == :capture_drop_pause_once) or
              (is_tuple(mode) and tuple_size(mode) == 2 and elem(mode, 0) == :chaos) do
     :persistent_term.put({__MODULE__, group}, mode)
 
     if is_tuple(mode) and tuple_size(mode) == 3 and elem(mode, 0) == :accept_types_up_to do
       :persistent_term.put({__MODULE__, group, :accepted}, 0)
+    end
+
+    if is_tuple(mode) and tuple_size(mode) == 3 and elem(mode, 0) == :capture_drop_pause_once do
+      :persistent_term.erase({__MODULE__, group, :paused})
     end
 
     :ok
@@ -40,6 +46,7 @@ defmodule Group.TestReplicaTransport do
     :persistent_term.erase({__MODULE__, group})
     :persistent_term.erase({__MODULE__, group, :captured})
     :persistent_term.erase({__MODULE__, group, :accepted})
+    :persistent_term.erase({__MODULE__, group, :paused})
     :ok
   end
 
@@ -97,11 +104,36 @@ defmodule Group.TestReplicaTransport do
         if message_type(message) in types, do: capture(group, target_node, shard, message)
         forward(group, target_node, shard, message)
 
+      {:capture_drop_pause_once, types, observer} ->
+        if message_type(message) in types do
+          capture(group, target_node, shard, message)
+          pause_once(group, message_type(message), observer)
+        end
+
+        :ok
+
       {:chaos, opts} ->
         chaos_forward(group, target_node, shard, message, opts)
 
       :pass ->
         forward(group, target_node, shard, message)
+    end
+  end
+
+  defp pause_once(group, message_type, observer) do
+    key = {__MODULE__, group, :paused}
+
+    if :persistent_term.get(key, false) do
+      :ok
+    else
+      :persistent_term.put(key, true)
+      send(observer, {:replica_transport_paused, self(), group, message_type})
+
+      receive do
+        {:resume_replica_transport, ^group} -> :ok
+      after
+        5_000 -> :ok
+      end
     end
   end
 

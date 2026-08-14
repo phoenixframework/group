@@ -17,13 +17,15 @@
   `Group.Replica.WireProtocol` to avoid overloading Elixir protocol terminology.
   The standalone TCP adapter is retained only as hidden test infrastructure;
   Group ships the transport contract, dist-Erlang adapter, and outbox helper.
-- **Breaking**: replica protocol v2 splits exact snapshots into
-  transport-neutral, byte-targeted chunks (`1 MiB` by default). Receivers stage
-  chunks in shard-owned private ETS and advance the stream cursor only after an
-  exact, authority-fenced assembly is complete; loss, duplication, reordering,
-  supersession, expiry, and shard crashes remain repairable by anti-entropy.
-  Single-chunk snapshots retain a direct fast path. Sideband transports can use
-  per-shard local outboxes for bounded batching without adding a hop to the
+- **Breaking**: replica protocol v3 streams exact snapshots as provisional,
+  transport-neutral byte-targeted chunks (`1 MiB` by default) followed by an
+  independently retryable terminal manifest. The sender scans once and retains
+  only its current chunk; a concurrent mutation suppresses commit. Receivers
+  stage in reusable shard-owned private ETS and advance the cursor only after
+  one exact, authority-fenced assembly is complete. Chunk/commit loss,
+  duplication, reordering, conflicting retransmission, supersession, expiry,
+  and shard crashes remain repairable by anti-entropy. Sideband transports can
+  use per-shard local outboxes for bounded batching without adding a hop to the
   default dist-Erlang adapter. Late-starting replica lanes now rebuild their
   view from shared exact authority when startup fanout races registration.
 - Replace replica state sends/snapshots with per-origin, generation- and

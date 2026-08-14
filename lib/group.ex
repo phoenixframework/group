@@ -250,7 +250,8 @@ defmodule Group do
     (default: `65_536`)
   - `:replicated_snapshot_chunk_target_bytes` — target maximum encoded size of
     each transport-neutral exact-snapshot chunk (default: `1_048_576`). A
-    single registry or membership row larger than the target remains one chunk.
+    single registry or membership row larger than the target remains one chunk;
+    a separate small terminal manifest commits the complete candidate.
   - `:replicated_anti_entropy_interval` — milliseconds between repeated stream
     head advertisements (default: `1_000`)
   - `:replicated_peer_lease_timeout` — milliseconds without a dist-Erlang

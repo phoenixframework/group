@@ -473,7 +473,8 @@ defmodule Group.AntiEntropyFaultRegressionTest do
       {:delta_batch, version, [:not_a_delta_run]},
       {:need, version, :not_a_stream, 1},
       {:needs, version, [:not_a_need]},
-      {:snapshot_chunk, version, :not_a_stream, 1, 1, 1, 0, 0, [], []},
+      {:snapshot_chunk, version, :not_a_stream, 1, 1, [], []},
+      {:snapshot_commit, version, :not_a_stream, 1, 1, 0, 0},
       {:delta_batch, version,
        [
          {stream_id, 1,

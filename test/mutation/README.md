@@ -6,11 +6,12 @@ contiguous sequence application, exact registry and PG snapshots, below-floor
 repair, process-down sequencing, conflict-loser retirement, authority fanout,
 per-lane authority installation, periodic head advertisement, interrupted
 journal/index repair, and named-cluster close completion. Snapshot calibration
-also covers incomplete commit, conflicting retransmission rows, newer-snapshot
+also covers missing/incomplete terminal commit, conflicting retransmission rows
+and manifests, source mutation during a single-pass scan, newer-snapshot
 supersession, stale-authority fencing, and staging expiry.
 Restart calibration covers per-lane eviction breadcrumbs and partially observed
 authority, while wire calibration rejects wrong-shard rows and unsequenced
-cluster lifecycle messages. The 64-mutant campaign also independently removes
+cluster lifecycle messages. The 68-mutant campaign also independently removes
 the generation and epoch fences, races authority changes against local-owner
 retirement, skips conflict reprojection after exact authority returns, bypasses
 shard-zero authority serialization, separates exact authority from its shared

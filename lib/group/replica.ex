@@ -95,8 +95,9 @@ defmodule Group.Replica do
   - delta_batch carries one or more contiguous stream runs.
   - need requests the receiver's next missing sequence.
   - snapshot_chunk carries a byte-bounded part of one exact origin slice when
-    the requested prefix has already been pruned. Receivers stage chunks in a
-    private ETS table and expose nothing until every chunk is present.
+    the requested prefix has already been pruned. snapshot_commit carries the
+    independently retryable terminal row/chunk counts. Receivers expose nothing
+    until one valid manifest and every provisional chunk are present.
 
   Every stream field is validated against the source node and
   current generation/epoch. An old generation, a closed epoch, a wrong shard,
@@ -104,8 +105,9 @@ defmodule Group.Replica do
   reordering is safe: early messages are ignored and repeated heads repair them;
   late messages fail their generation or epoch fence. Snapshot chunks may be
   lost, duplicated, reordered, or mixed across retransmissions at the same
-  stream head; exact row counts and set insertion prevent partial commits.
-  Rejected first chunks destroy their staging table immediately. Node loss,
+  stream head; exact row counts, set insertion, and conflicting-retransmission
+  checks prevent partial or mixed commits. Rejected chunks/manifests clear their
+  staging immediately. Node loss,
   generation replacement, and retired cluster streams discard matching partial
   assemblies immediately rather than waiting for their inactivity deadline.
   Unsequenced legacy state messages and malformed replica frames are rejected
@@ -172,15 +174,17 @@ defmodule Group.Replica do
   installed. This avoids a shard-wide claim scan while ensuring a current
   cursor can never strand an old visible winner.
 
-  Exact-snapshot row capture runs in at most one off-shard worker per shard. It
-  sends only if the local stream identity and fully-applied head are unchanged
-  after both row scans; overlapping writes discard the capture and periodic
-  anti-entropy retries. The worker builds at most one byte-targeted chunk on its
-  heap and retains completed chunks only in an unnamed private ETS table owned
-  by that attempt. Receiver payload chunks and exact-install monitor-event
-  batches use the same ephemeral private-ETS ownership. Completion, retry, or
-  owner death deletes them. This keeps million-row scans and whole-snapshot
-  heaps off the control process without adding steady-state indexes.
+  Exact-snapshot scans run in at most one off-shard worker per shard. The worker
+  validates the local stream identity and fully-applied head before and after a
+  single pass, sends completed provisional chunks immediately, and retains only
+  one byte-targeted chunk. Overlapping writes suppress the terminal commit and
+  periodic anti-entropy retries the newer head. A busy chunk resumes at its
+  index; a busy commit retains only its small manifest. Receivers retain the
+  complete candidate and exact-install events in private ETS because exact
+  absence-as-delete replacement must start from a complete set. Cleared tables are
+  pooled for reuse; shard death deletes active and pooled tables. This keeps
+  sender memory bounded at million-to-tens-of-millions scale without putting
+  whole-snapshot heaps on the control process.
 
   Incoming PG mutations retain the bulk receiver lane. Contiguous registry
   records in one stream run are projected together and emit one monitor event
@@ -241,6 +245,7 @@ defmodule Group.Replica do
     pending_registry_reprojections: %{},
     monitors: %{},
     snapshot_transfers: %{},
+    snapshot_staging_pool: [],
     snapshot_send: nil,
     snapshot_send_offsets: %{}
   ]
@@ -991,7 +996,14 @@ defmodule Group.Replica do
 
         {:resume, chunk_index} ->
           if current_snapshot_send?(state, snapshot_key) do
-            Map.put(state.snapshot_send_offsets, snapshot_key, chunk_index)
+            Map.put(state.snapshot_send_offsets, snapshot_key, {:chunk, chunk_index})
+          else
+            Map.delete(state.snapshot_send_offsets, snapshot_key)
+          end
+
+        {:resume_commit, manifest} ->
+          if current_snapshot_send?(state, snapshot_key) do
+            Map.put(state.snapshot_send_offsets, snapshot_key, {:commit, manifest})
           else
             Map.delete(state.snapshot_send_offsets, snapshot_key)
           end
@@ -3438,9 +3450,16 @@ defmodule Group.Replica do
         %{state | snapshot_transfers: transfers}
 
       {transfer, transfers} ->
-        :ok = Snapshot.delete_staging_table(transfer.table)
-        :ok = Snapshot.delete_staging_table(transfer.events)
-        %{state | snapshot_transfers: transfers}
+        :ok = Snapshot.clear_staging_table(transfer.table)
+        :ok = Snapshot.clear_staging_table(transfer.events)
+
+        %{
+          state
+          | snapshot_transfers: transfers,
+            snapshot_staging_pool: [
+              {transfer.table, transfer.events} | state.snapshot_staging_pool
+            ]
+        }
     end
   end
 
@@ -3653,22 +3672,12 @@ defmodule Group.Replica do
   defp handle_replica_message(
          state,
          source_node,
-         {:snapshot_chunk, version, stream_id, snapshot_seq, chunk_index, chunk_count,
-          registry_count, pg_count, reg_data, pg_data}
+         {:snapshot_chunk, version, stream_id, snapshot_seq, chunk_index, reg_data, pg_data}
        )
        when version == @protocol_version and is_integer(snapshot_seq) and snapshot_seq >= 0 and
-              is_integer(chunk_index) and is_integer(chunk_count) and
-              is_integer(registry_count) and is_integer(pg_count) and is_list(reg_data) and
-              is_list(pg_data) do
+              is_integer(chunk_index) and is_list(reg_data) and is_list(pg_data) do
     if valid_snapshot_stream?(state, source_node, stream_id, snapshot_seq) and
-         valid_snapshot_manifest?(
-           chunk_index,
-           chunk_count,
-           registry_count,
-           pg_count,
-           reg_data,
-           pg_data
-         ) and
+         valid_snapshot_chunk?(chunk_index, reg_data, pg_data) and
          valid_snapshot_rows?(state, source_node, stream_id, reg_data, pg_data) do
       stage_replica_snapshot_chunk(
         state,
@@ -3676,11 +3685,32 @@ defmodule Group.Replica do
         stream_id,
         snapshot_seq,
         chunk_index,
-        chunk_count,
-        registry_count,
-        pg_count,
         reg_data,
         pg_data
+      )
+    else
+      state
+    end
+  end
+
+  defp handle_replica_message(
+         state,
+         source_node,
+         {:snapshot_commit, version, stream_id, snapshot_seq, chunk_count, registry_count,
+          pg_count}
+       )
+       when version == @protocol_version and is_integer(snapshot_seq) and snapshot_seq >= 0 and
+              is_integer(chunk_count) and is_integer(registry_count) and is_integer(pg_count) do
+    if valid_snapshot_stream?(state, source_node, stream_id, snapshot_seq) and
+         valid_snapshot_commit_manifest?(chunk_count, registry_count, pg_count) do
+      stage_replica_snapshot_commit(
+        state,
+        source_node,
+        stream_id,
+        snapshot_seq,
+        chunk_count,
+        registry_count,
+        pg_count
       )
     else
       state
@@ -3712,22 +3742,17 @@ defmodule Group.Replica do
       snapshot_seq > Data.replica_cursor(state.name, state.shard_index, stream_id)
   end
 
-  defp valid_snapshot_manifest?(
-         chunk_index,
-         chunk_count,
-         registry_count,
-         pg_count,
-         reg_data,
-         pg_data
-       ) do
-    total_count = registry_count + pg_count
+  defp valid_snapshot_chunk?(chunk_index, reg_data, pg_data) do
     chunk_row_count = length(reg_data) + length(pg_data)
+    chunk_index > 0 and (chunk_row_count > 0 or chunk_index == 1)
+  end
 
-    chunk_count > 0 and chunk_index > 0 and chunk_index <= chunk_count and
-      registry_count >= 0 and pg_count >= 0 and
+  defp valid_snapshot_commit_manifest?(chunk_count, registry_count, pg_count) do
+    total_count = registry_count + pg_count
+
+    chunk_count > 0 and registry_count >= 0 and pg_count >= 0 and
       chunk_count <= max(total_count, 1) and
-      ((total_count == 0 and chunk_count == 1 and chunk_row_count == 0) or
-         (total_count > 0 and chunk_row_count > 0))
+      (total_count > 0 or chunk_count == 1)
   end
 
   defp valid_snapshot_rows?(state, source_node, stream_id, reg_data, pg_data) do
@@ -3803,26 +3828,25 @@ defmodule Group.Replica do
          stream_id,
          snapshot_seq,
          chunk_index,
-         chunk_count,
-         registry_count,
-         pg_count,
          reg_data,
          pg_data
        ) do
     key = {source_node, stream_id}
-    manifest = {chunk_count, registry_count, pg_count}
 
-    case snapshot_transfer(state, key, snapshot_seq, manifest) do
+    case snapshot_transfer(state, key, snapshot_seq) do
       {:ignore, state} ->
         state
 
       {:ok, state, transfer} ->
         cond do
-          MapSet.member?(transfer.received, chunk_index) ->
+          MapSet.member?(transfer.received, chunk_index) and
+              Snapshot.chunk_matches?(transfer.table, chunk_index, reg_data, pg_data) ->
             state
 
-          transfer.registry_seen + length(reg_data) > registry_count or
-              transfer.pg_seen + length(pg_data) > pg_count ->
+          MapSet.member?(transfer.received, chunk_index) ->
+            discard_snapshot_transfer(state, key)
+
+          not snapshot_chunk_within_manifest?(transfer, chunk_index, reg_data, pg_data) ->
             discard_snapshot_transfer(state, key)
 
           true ->
@@ -3846,10 +3870,43 @@ defmodule Group.Replica do
     end
   end
 
-  defp snapshot_transfer(state, key, snapshot_seq, manifest) do
+  defp stage_replica_snapshot_commit(
+         state,
+         source_node,
+         stream_id,
+         snapshot_seq,
+         chunk_count,
+         registry_count,
+         pg_count
+       ) do
+    key = {source_node, stream_id}
+    manifest = {chunk_count, registry_count, pg_count}
+
+    case snapshot_transfer(state, key, snapshot_seq) do
+      {:ignore, state} ->
+        state
+
+      {:ok, state, %{manifest: nil} = transfer} ->
+        if snapshot_transfer_within_manifest?(transfer, manifest) do
+          transfer = %{transfer | manifest: manifest, last_progress: monotonic_millis()}
+          state = put_snapshot_transfer(state, key, transfer)
+          maybe_commit_snapshot_transfer(state, key, source_node, stream_id)
+        else
+          discard_snapshot_transfer(state, key)
+        end
+
+      {:ok, state, %{manifest: ^manifest}} ->
+        maybe_commit_snapshot_transfer(state, key, source_node, stream_id)
+
+      {:ok, state, _conflicting_transfer} ->
+        discard_snapshot_transfer(state, key)
+    end
+  end
+
+  defp snapshot_transfer(state, key, snapshot_seq) do
     case Map.get(state.snapshot_transfers, key) do
       nil ->
-        transfer = new_snapshot_transfer(snapshot_seq, manifest)
+        {state, transfer} = new_snapshot_transfer(state, snapshot_seq)
         {:ok, put_snapshot_transfer(state, key, transfer), transfer}
 
       %{snapshot_seq: existing_seq} when existing_seq > snapshot_seq ->
@@ -3857,31 +3914,33 @@ defmodule Group.Replica do
 
       %{snapshot_seq: existing_seq} when existing_seq < snapshot_seq ->
         state = discard_snapshot_transfer(state, key)
-        transfer = new_snapshot_transfer(snapshot_seq, manifest)
+        {state, transfer} = new_snapshot_transfer(state, snapshot_seq)
         {:ok, put_snapshot_transfer(state, key, transfer), transfer}
 
-      %{manifest: ^manifest} = transfer ->
+      %{snapshot_seq: ^snapshot_seq} = transfer ->
         {:ok, state, transfer}
-
-      _conflicting_transfer ->
-        {:ignore, discard_snapshot_transfer(state, key)}
     end
   end
 
-  defp new_snapshot_transfer(snapshot_seq, {chunk_count, registry_count, pg_count} = manifest) do
-    %{
+  defp new_snapshot_transfer(state, snapshot_seq) do
+    {table, events, pool} =
+      case state.snapshot_staging_pool do
+        [{table, events} | pool] -> {table, events, pool}
+        [] -> {Snapshot.new_staging_table(), Snapshot.new_event_table(), []}
+      end
+
+    transfer = %{
       snapshot_seq: snapshot_seq,
-      manifest: manifest,
-      chunk_count: chunk_count,
-      registry_count: registry_count,
-      pg_count: pg_count,
+      manifest: nil,
       registry_seen: 0,
       pg_seen: 0,
       received: MapSet.new(),
       last_progress: monotonic_millis(),
-      table: Snapshot.new_staging_table(),
-      events: Snapshot.new_event_table()
+      table: table,
+      events: events
     }
+
+    {%{state | snapshot_staging_pool: pool}, transfer}
   end
 
   defp put_snapshot_transfer(state, key, transfer) do
@@ -3891,19 +3950,45 @@ defmodule Group.Replica do
   defp maybe_commit_snapshot_transfer(state, key, source_node, stream_id) do
     transfer = Map.fetch!(state.snapshot_transfers, key)
 
-    if MapSet.size(transfer.received) == transfer.chunk_count do
-      if transfer.registry_seen == transfer.registry_count and
-           transfer.pg_seen == transfer.pg_count do
-        commit_snapshot_transfer(state, key, source_node, stream_id, transfer)
-      else
-        discard_snapshot_transfer(state, key)
-      end
-    else
-      state
+    case transfer.manifest do
+      {chunk_count, registry_count, pg_count} ->
+        if MapSet.size(transfer.received) == chunk_count and
+             transfer.registry_seen == registry_count and transfer.pg_seen == pg_count do
+          commit_snapshot_transfer(state, key, source_node, stream_id, transfer)
+        else
+          state
+        end
+
+      nil ->
+        state
     end
   end
 
+  defp snapshot_chunk_within_manifest?(%{manifest: nil}, _chunk_index, _reg_data, _pg_data),
+    do: true
+
+  defp snapshot_chunk_within_manifest?(
+         %{manifest: {chunk_count, registry_count, pg_count}} = transfer,
+         chunk_index,
+         reg_data,
+         pg_data
+       ) do
+    chunk_index <= chunk_count and
+      transfer.registry_seen + length(reg_data) <= registry_count and
+      transfer.pg_seen + length(pg_data) <= pg_count
+  end
+
+  defp snapshot_transfer_within_manifest?(
+         transfer,
+         {chunk_count, registry_count, pg_count}
+       ) do
+    Enum.all?(transfer.received, &(&1 <= chunk_count)) and
+      transfer.registry_seen <= registry_count and transfer.pg_seen <= pg_count
+  end
+
   defp commit_snapshot_transfer(state, key, source_node, stream_id, transfer) do
+    {chunk_count, _registry_count, _pg_count} = transfer.manifest
+
     state =
       if valid_snapshot_stream?(state, source_node, stream_id, transfer.snapshot_seq) do
         state = flush_pending_replicated_barrier(state)
@@ -3926,7 +4011,7 @@ defmodule Group.Replica do
             stream_id,
             transfer.snapshot_seq,
             transfer.table,
-            transfer.chunk_count,
+            chunk_count,
             {state, event_buffer},
             fn key, {acc, buffer} ->
               {acc, events} = reconcile_registry_projection(acc, cluster, key, :reconcile, [])
@@ -3940,7 +4025,7 @@ defmodule Group.Replica do
             source_node,
             cluster,
             transfer.table,
-            transfer.chunk_count,
+            chunk_count,
             event_buffer
           )
 
@@ -4338,7 +4423,7 @@ defmodule Group.Replica do
       end)
       |> Map.new()
 
-    start_index = Map.get(offsets, snapshot_key, 1)
+    resume = Map.get(offsets, snapshot_key, {:chunk, 1})
 
     snapshot_context = %{
       name: state.name,
@@ -4352,12 +4437,12 @@ defmodule Group.Replica do
       spawn(fn ->
         result =
           try do
-            capture_and_send_replica_snapshot(
+            stream_replica_snapshot(
               snapshot_context,
               target_node,
               stream_id,
               head,
-              start_index
+              resume
             )
           catch
             kind, reason ->
@@ -4378,93 +4463,120 @@ defmodule Group.Replica do
     %{state | snapshot_send: {worker, token, snapshot_key}, snapshot_send_offsets: offsets}
   end
 
-  defp capture_and_send_replica_snapshot(state, target_node, stream_id, head, start_index) do
-    cluster = WireProtocol.stream_cluster(stream_id)
-    capture_table = Snapshot.new_capture_table()
-    envelope_bytes = Snapshot.capture_envelope_bytes(stream_id, head)
+  defp stream_replica_snapshot(
+         state,
+         target_node,
+         stream_id,
+         head,
+         {:commit, manifest}
+       ) do
+    if current_snapshot_send?(state, target_node, stream_id, head) do
+      send_replica_snapshot_commit(state, target_node, stream_id, head, manifest)
+    else
+      :complete
+    end
+  end
 
-    capture =
-      Snapshot.new_capture(
-        capture_table,
-        state.replicated_snapshot_chunk_target_bytes,
-        envelope_bytes
-      )
+  defp stream_replica_snapshot(state, target_node, stream_id, head, {:chunk, start_index}) do
+    if current_snapshot_send?(state, target_node, stream_id, head) do
+      do_stream_replica_snapshot(state, target_node, stream_id, head, start_index)
+    else
+      :complete
+    end
+  end
+
+  defp do_stream_replica_snapshot(state, target_node, stream_id, head, start_index) do
+    cluster = WireProtocol.stream_cluster(stream_id)
+    envelope_bytes = Snapshot.stream_envelope_bytes(stream_id, head)
+
+    emit = fn registry, pg, chunk_index ->
+      message =
+        {:snapshot_chunk, WireProtocol.version(), stream_id, head, chunk_index, registry, pg}
+
+      case state.replica_transport.outgoing(
+             state.name,
+             target_node,
+             state.shard_index,
+             message,
+             state.replica_transport_opts
+           ) do
+        :ok -> :ok
+        result when result in [:busy, :disconnected] -> throw({:snapshot_resume, chunk_index})
+      end
+    end
 
     try do
-      capture =
+      stream =
+        Snapshot.new_stream(
+          state.replicated_snapshot_chunk_target_bytes,
+          envelope_bytes,
+          start_index,
+          emit
+        )
+
+      stream =
         Data.reduce_registry_claim_batches_for_stream(
           state.name,
           state.shard_index,
           stream_id,
-          capture,
-          &Snapshot.capture_registry_many/2
+          stream,
+          &Snapshot.stream_registry_many/2
         )
 
-      capture =
+      stream =
         Data.reduce_pg_entry_batches_for_origin(
           state.name,
           state.shard_index,
           cluster,
           node(),
-          capture,
-          &Snapshot.capture_pg_many/2
+          stream,
+          &Snapshot.stream_pg_many/2
         )
 
-      capture = Snapshot.finish_capture(capture)
-      registry_count = capture.registry_count
-      pg_count = capture.pg_count
-      chunk_count = capture.chunk_count
+      stream = Snapshot.finish_stream(stream)
+      manifest = {stream.chunk_count, stream.registry_count, stream.pg_count}
 
-      {_floor, current_head, applied} =
-        Data.replica_stream_head(state.name, state.shard_index, stream_id)
-
-      # Appending advances the head before materializing its table changes.
-      # Therefore an unchanged, fully-applied head after both scans proves the
-      # private capture is one exact state at `head`; an overlapping write makes
-      # it disposable and anti-entropy retries without sending a partial view.
-      if Data.local_stream_id(state.name, state.shard_index, cluster) == stream_id and
-           current_head == head and applied == head and
-           target_node in Data.cluster_nodes(state.name, cluster) do
-        case Snapshot.reduce_capture_chunks(
-               capture_table,
-               chunk_count,
-               1,
-               fn reg_chunk, pg_chunk, chunk_index ->
-                 if chunk_index < start_index do
-                   {:cont, chunk_index + 1}
-                 else
-                   message =
-                     {:snapshot_chunk, WireProtocol.version(), stream_id, head, chunk_index,
-                      chunk_count, registry_count, pg_count, reg_chunk, pg_chunk}
-
-                   case state.replica_transport.outgoing(
-                          state.name,
-                          target_node,
-                          state.shard_index,
-                          message,
-                          state.replica_transport_opts
-                        ) do
-                     :ok ->
-                       {:cont, chunk_index + 1}
-
-                     result when result in [:busy, :disconnected] ->
-                       {:halt, {:resume, chunk_index}}
-                   end
-                 end
-               end
-             ) do
-          {:ok, _next_index} -> :complete
-          {:halt, result} -> result
-        end
+      # Chunks are provisional. Appending advances the head before changing
+      # materialized rows and advances `applied` only afterward, so an
+      # unchanged fully-applied head proves the completed scan is one exact
+      # state at `head`. Only the terminal commit makes those chunks visible.
+      if current_snapshot_send?(state, target_node, stream_id, head) do
+        send_replica_snapshot_commit(state, target_node, stream_id, head, manifest)
       else
         :complete
       end
-    after
-      Snapshot.delete_staging_table(capture_table)
+    catch
+      {:snapshot_resume, chunk_index} -> {:resume, chunk_index}
     end
   end
 
-  defp current_snapshot_send?(state, {target_node, stream_id, head}) do
+  defp send_replica_snapshot_commit(
+         state,
+         target_node,
+         stream_id,
+         head,
+         {chunk_count, registry_count, pg_count} = manifest
+       ) do
+    message =
+      {:snapshot_commit, WireProtocol.version(), stream_id, head, chunk_count, registry_count,
+       pg_count}
+
+    case state.replica_transport.outgoing(
+           state.name,
+           target_node,
+           state.shard_index,
+           message,
+           state.replica_transport_opts
+         ) do
+      :ok -> :complete
+      result when result in [:busy, :disconnected] -> {:resume_commit, manifest}
+    end
+  end
+
+  defp current_snapshot_send?(state, {target_node, stream_id, head}),
+    do: current_snapshot_send?(state, target_node, stream_id, head)
+
+  defp current_snapshot_send?(state, target_node, stream_id, head) do
     cluster = WireProtocol.stream_cluster(stream_id)
 
     {_floor, current_head, applied} =

@@ -28,8 +28,8 @@ release qualification rather than individual edits.
 | `anti_entropy_fault_regression_test.exs` | Three-node regressions for hidden-winner projection, receiver restart eviction, nodedown/lease lane retirement, authority gaps and cross-lane races, in-flight conflict fencing, crash-journal replay, cursorless/interrupted snapshot repair, malformed ingress, and sideband rediscovery |
 | `replica_adversarial_test.exs` | Reproducible three-node mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
 | `replica_model_property_test.exs` | StreamData-generated and shrunk owner histories against an independent lifecycle oracle and scheduler-controlled replica transport |
-| `replica_snapshot_test.exs` | Pure byte partitioning plus bounded private-ETS capture, receive staging, and event batching |
-| `replica_snapshot_distributed_test.exs` | Real-node exact-snapshot loss, reorder, duplicate, conflicting retransmission, supersession, authority fencing, expiry, and shard-crash recovery |
+| `replica_snapshot_test.exs` | Pure single-pass byte-bounded streaming, suffix resume, receive staging, and event batching |
+| `replica_snapshot_distributed_test.exs` | Real-node provisional-chunk/terminal-commit loss, reorder, duplicate, conflicting retransmission/manifest, concurrent-source invalidation, supersession, authority fencing, expiry, pooled staging, and shard-crash recovery |
 
 ## Model-based and formal checks
 

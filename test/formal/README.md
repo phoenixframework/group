@@ -11,11 +11,13 @@ contract. It covers:
 - fair convergence after healing.
 
 `SnapshotAssembly.tla` separately models the non-atomic wire delivery of an
-exact snapshot. It explores arbitrary chunk loss, duplication, reordering,
+exact snapshot. It explores independent provisional-chunk and terminal-commit
+loss, duplication, and reordering, source invalidation before commit emission,
 newer-snapshot supersession, authority epoch changes, staging expiry, and
 receiver crashes. Its invariants require visible data and the cursor to remain
-at a previously committed exact state until every chunk of one valid snapshot
-is present; stale or mixed partial state can never become visible.
+at a previously committed exact state until every chunk and a valid terminal
+commit for one snapshot are present; stale or mixed partial state can never
+become visible.
 
 `PeerEviction.tla` isolates the lifecycle boundary for a peer which never
 returns and for a later process using the same node name with a fresh
@@ -82,11 +84,12 @@ assembly, peer-eviction, authority-projection, and authority-hint models; set
 `TLA_EXTENDED=1` for the larger anti-entropy configuration.
 
 The checked three-node default explores 1,835,826 states, finds 490,236
-distinct states to a depth of 30, and completes in roughly 1 minute 40 seconds
-on the development machine used for the validation run.
+distinct states to a depth of 30, and completes in roughly one minute on the
+development machine used for the validation run.
 
-The snapshot-assembly model explores 15,681 states, finds 1,088 distinct states
-to a depth of 13, and completes in under a second on the same class of machine.
+The snapshot-assembly model generates 3,305,473 states, finds 167,936 distinct
+states to a depth of 23, and completes in roughly five seconds on the current
+development machine.
 
 The peer-eviction model explores 1,527,116 states, finds 238,120 distinct
 states to a depth of 26, and completes in roughly 20 seconds on the development

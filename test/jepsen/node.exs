@@ -96,11 +96,15 @@ defmodule Group.Jepsen.Transport.Common do
     end
   end
 
-  def record({:snapshot_chunk, _version, _stream, _seq, _index, chunk_count, _, _, _, _}) do
+  def record({:snapshot_chunk, _version, _stream, _seq, _index, _registry, _pg}) do
     Stats.increment(:snapshot_chunk)
+  end
+
+  def record({:snapshot_commit, _version, _stream, _seq, chunk_count, _, _}) do
+    Stats.increment(:snapshot_commit)
 
     if chunk_count > 1 do
-      Stats.increment(:multi_chunk_snapshot_chunk)
+      Stats.increment(:multi_chunk_snapshot)
     end
   end
 

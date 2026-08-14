@@ -596,7 +596,9 @@ defmodule Group.TestCluster do
     owner = Process.whereis(Group.Replica.shard_name(name, shard_index))
 
     :ets.all()
-    |> Enum.filter(fn table -> :ets.info(table, :owner) == owner end)
+    |> Enum.filter(fn table ->
+      :ets.info(table, :owner) == owner and :ets.info(table, :size) > 0
+    end)
   end
 
   @doc false

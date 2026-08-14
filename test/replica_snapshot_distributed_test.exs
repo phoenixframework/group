@@ -13,6 +13,167 @@ defmodule Group.ReplicaSnapshotDistributedTest do
     {:ok, node_a: node_a, node_b: node_b, node_c: node_c}
   end
 
+  test "complete provisional chunks expose nothing until terminal commit", context do
+    %{name: name, node_a: node_a, node_b: node_b} = start_pair(context)
+    :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+
+    entries =
+      for index <- 1..8 do
+        key = "snapshot/terminal-commit/#{index}"
+
+        {key,
+         TestCluster.spawn_register(node_a, name, key, %{
+           payload: String.duplicate("c", 160)
+         })}
+      end
+
+    TestCluster.flush_shards(node_a, name)
+    stream_id = local_stream(node_a, name, nil)
+    {chunks, commit} = capture_snapshot_with_commit(node_a, node_b, name, stream_id, 1)
+    assert length(chunks) > 1
+
+    deliver_frames(node_b, node_a, name, Enum.reverse(chunks))
+    TestCluster.flush_shards(node_b, name)
+
+    assert replica_cursor(node_b, name, stream_id) == 0
+
+    assert Enum.all?(entries, fn {key, _pid} ->
+             TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+           end)
+
+    deliver_frames(node_b, node_a, name, [commit])
+    TestCluster.flush_shards(node_b, name)
+    snapshot_seq = elem(commit, 3)
+
+    assert replica_cursor(node_b, name, stream_id) == snapshot_seq
+
+    assert Enum.all?(entries, fn {key, pid} ->
+             match?({^pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, key]))
+           end)
+  end
+
+  test "a source mutation during a single-pass scan prevents terminal commit", context do
+    %{name: name, node_a: node_a, node_b: node_b} = start_pair(context)
+    :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+
+    entries =
+      for index <- 1..8 do
+        key = "snapshot/concurrent-write/#{index}"
+
+        {key,
+         TestCluster.spawn_register(node_a, name, key, %{
+           payload: String.duplicate("s", 160)
+         })}
+      end
+
+    TestCluster.flush_shards(node_a, name)
+    stream_id = local_stream(node_a, name, nil)
+    :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :clear_captured, [name])
+
+    :ok =
+      TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
+        name,
+        {:capture_drop_pause_once, [:snapshot_chunk, :snapshot_commit], self()}
+      ])
+
+    :ok =
+      TestCluster.rpc!(node_a, Group.Transport, :incoming, [
+        name,
+        node_b,
+        0,
+        {:need, Group.Replica.WireProtocol.version(), stream_id, 1}
+      ])
+
+    assert_receive {:replica_transport_paused, worker, ^name, :snapshot_chunk}, 5_000
+
+    extra_key = "snapshot/concurrent-write/after-scan-started"
+    extra_pid = TestCluster.spawn_register(node_a, name, extra_key, %{after_start: true})
+    TestCluster.flush_shards(node_a, name)
+    send(worker, {:resume_replica_transport, name})
+
+    source = TestCluster.rpc!(node_a, Process, :whereis, [Group.Replica.shard_name(name, 0)])
+
+    TestCluster.assert_eventually(fn ->
+      TestCluster.rpc!(node_a, :sys, :get_state, [source]).snapshot_send == nil
+    end)
+
+    captured = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name])
+
+    chunks =
+      Enum.flat_map(captured, fn
+        {^node_b, 0, {:snapshot_chunk, _, ^stream_id, _, _, _, _} = chunk} -> [chunk]
+        _other -> []
+      end)
+
+    assert chunks != []
+
+    refute Enum.any?(captured, fn
+             {^node_b, 0, {:snapshot_commit, _, ^stream_id, _, _, _, _}} -> true
+             _other -> false
+           end)
+
+    deliver_frames(node_b, node_a, name, chunks)
+    assert replica_cursor(node_b, name, stream_id) == 0
+
+    assert Enum.all?(entries, fn {key, _pid} ->
+             TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+           end)
+
+    assert TestCluster.rpc!(node_b, Group, :lookup, [name, extra_key]) == nil
+
+    :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :pass])
+
+    :ok =
+      TestCluster.rpc!(node_a, Group.Transport, :incoming, [
+        name,
+        node_b,
+        0,
+        {:need, Group.Replica.WireProtocol.version(), stream_id, 1}
+      ])
+
+    TestCluster.assert_eventually(fn ->
+      Enum.all?(entries, fn {key, pid} ->
+        match?({^pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, key]))
+      end) and
+        match?(
+          {^extra_pid, _},
+          TestCluster.rpc!(node_b, Group, :lookup, [name, extra_key])
+        )
+    end)
+  end
+
+  test "conflicting terminal manifests discard the candidate instead of manufacturing commit",
+       context do
+    %{name: name, node_a: node_a, node_b: node_b} = start_pair(context)
+    :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+
+    entries =
+      for index <- 1..8 do
+        key = "snapshot/conflicting-commit/#{index}"
+        {key, TestCluster.spawn_register(node_a, name, key, %{index: index})}
+      end
+
+    TestCluster.flush_shards(node_a, name)
+    stream_id = local_stream(node_a, name, nil)
+    {chunks, commit} = capture_snapshot_with_commit(node_a, node_b, name, stream_id, 1)
+    conflicting_commit = put_elem(commit, 5, elem(commit, 5) + 1)
+
+    deliver_frames(node_b, node_a, name, chunks ++ [conflicting_commit])
+    assert replica_cursor(node_b, name, stream_id) == 0
+    assert snapshot_transfer_count(node_b, name) == 1
+
+    deliver_frames(node_b, node_a, name, [commit])
+    assert replica_cursor(node_b, name, stream_id) == 0
+    assert snapshot_transfer_count(node_b, name) == 0
+
+    deliver_frames(node_b, node_a, name, chunks ++ [commit])
+    assert replica_cursor(node_b, name, stream_id) == elem(commit, 3)
+
+    assert Enum.all?(entries, fn {key, pid} ->
+             match?({^pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, key]))
+           end)
+  end
+
   test "loss, reordering, and duplication expose nothing until exact commit", context do
     %{name: name, node_a: node_a, node_b: node_b} = start_pair(context)
 
@@ -191,20 +352,31 @@ defmodule Group.ReplicaSnapshotDistributedTest do
 
     TestCluster.flush_shards(node_a, name)
     stream_id = local_stream(node_a, name, nil)
-    [first, second | rest] = frames = capture_snapshot(node_a, node_b, name, stream_id, 1)
-    [first_row | _] = elem(first, 8)
-    [_second_row | second_tail] = elem(second, 8)
-    conflicting_second = put_elem(second, 8, [first_row | second_tail])
+    [first, second | rest] = capture_snapshot(node_a, node_b, name, stream_id, 1)
+    [first_row | first_tail] = elem(first, 5)
+    [second_row | second_tail] = elem(second, 5)
+    conflicting_first = put_elem(first, 5, [second_row | first_tail])
+    conflicting_second = put_elem(second, 5, [first_row | second_tail])
 
+    deliver_frames(node_b, node_a, name, [first, conflicting_first])
+
+    assert replica_cursor(node_b, name, stream_id) == 0
+    assert snapshot_transfer_count(node_b, name) == 0
+
+    assert Enum.all?(entries, fn {key, _pid} ->
+             TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+           end)
+
+    # A different chunk index cannot reuse an identity already staged by the
+    # first chunk to satisfy the terminal row count while omitting another row.
     deliver_frames(node_b, node_a, name, [first, conflicting_second | rest])
-
     assert replica_cursor(node_b, name, stream_id) == 0
 
     assert Enum.all?(entries, fn {key, _pid} ->
              TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
            end)
 
-    deliver_frames(node_b, node_a, name, frames)
+    deliver_frames(node_b, node_a, name, [first, second | rest])
 
     assert replica_cursor(node_b, name, stream_id) == elem(first, 3)
 
@@ -213,7 +385,7 @@ defmodule Group.ReplicaSnapshotDistributedTest do
            end)
   end
 
-  test "rejected first chunks do not leak their private staging tables", context do
+  test "rejected first chunks clear and reuse their private staging tables", context do
     %{name: name, node_a: node_a, node_b: node_b} = start_pair(context)
     :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
 
@@ -229,26 +401,36 @@ defmodule Group.ReplicaSnapshotDistributedTest do
 
     rows =
       frames
-      |> Enum.flat_map(&elem(&1, 8))
+      |> Enum.filter(&(elem(&1, 0) == :snapshot_chunk))
+      |> Enum.flat_map(&elem(&1, 5))
       |> Enum.take(2)
 
     assert [first_row, second_row] = rows
-    {:snapshot_chunk, version, ^stream_id, snapshot_seq, _, _, _, _, _, _} = hd(frames)
+    {:snapshot_chunk, version, ^stream_id, snapshot_seq, _, _, _} = hd(frames)
     assert snapshot_staging_tables(node_b, name) == []
 
+    commit = {:snapshot_commit, version, stream_id, snapshot_seq, 1, 1, 0}
+    deliver_frames(node_b, node_a, name, [commit])
+    assert snapshot_transfer_count(node_b, name) == 1
+    first_tables = snapshot_transfer_tables(node_b, name)
+
     overflow =
-      {:snapshot_chunk, version, stream_id, snapshot_seq, 1, 2, 1, 1, [first_row, second_row], []}
+      {:snapshot_chunk, version, stream_id, snapshot_seq, 1, [first_row, second_row], []}
 
     deliver_frames(node_b, node_a, name, [overflow])
     assert snapshot_transfer_count(node_b, name) == 0
     assert snapshot_staging_tables(node_b, name) == []
 
     duplicate =
-      {:snapshot_chunk, version, stream_id, snapshot_seq, 1, 2, 2, 0, [first_row, first_row], []}
+      {:snapshot_chunk, version, stream_id, snapshot_seq, 1, [first_row, first_row], []}
 
     deliver_frames(node_b, node_a, name, [duplicate])
     assert snapshot_transfer_count(node_b, name) == 0
     assert snapshot_staging_tables(node_b, name) == []
+
+    deliver_frames(node_b, node_a, name, [hd(frames)])
+    assert snapshot_transfer_count(node_b, name) == 1
+    assert snapshot_transfer_tables(node_b, name) == first_tables
   end
 
   test "an incomplete current-authority snapshot expires without touching visible state",
@@ -672,17 +854,25 @@ defmodule Group.ReplicaSnapshotDistributedTest do
     TestCluster.flush_shards(node_a, name)
     stream_id = local_stream(node_a, name, nil)
 
-    request_snapshot_window(node_a, node_b, name, stream_id, 2)
+    {chunk_count, registry_count, pg_count} =
+      drive_snapshot_chunks_until_commit_pending(node_a, node_b, name, stream_id, 100)
+
     TestCluster.flush_shards(node_b, name)
+    {received, manifest} = snapshot_transfer_progress(node_b, name)
+    assert received == chunk_count
+    assert manifest == nil
+    assert registry_count == length(entries)
+    assert pg_count == 0
+    assert replica_cursor(node_b, name, stream_id) == 0
 
-    {received, chunk_count} = snapshot_transfer_progress(node_b, name)
-    assert received == 2
-    assert chunk_count > received
+    assert Enum.all?(entries, fn {key, _pid} ->
+             TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+           end)
 
-    for _attempt <- 2..ceil_div(chunk_count, 2) do
-      request_snapshot_window(node_a, node_b, name, stream_id, 2)
-      TestCluster.flush_shards(node_b, name)
-    end
+    # The sender retained only the tiny terminal manifest after backpressure.
+    # Its next repair attempt sends that commit directly without rescanning or
+    # retransmitting the already staged chunks.
+    request_snapshot_window(node_a, node_b, name, stream_id, 1)
 
     TestCluster.assert_eventually(
       fn ->
@@ -742,7 +932,7 @@ defmodule Group.ReplicaSnapshotDistributedTest do
     :ok =
       TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
         name,
-        {:capture_drop, [:snapshot_chunk]}
+        {:capture_drop, [:snapshot_chunk, :snapshot_commit]}
       ])
 
     :ok =
@@ -760,33 +950,51 @@ defmodule Group.ReplicaSnapshotDistributedTest do
         snapshot_send =
           TestCluster.rpc!(node_a, :sys, :get_state, [Group.Replica.shard_name(name, 0)]).snapshot_send
 
-        Enum.any?(captured, fn
-          {^node_b, 0, {:snapshot_chunk, _, ^stream_id, _, _, _, _, _, _, _}} -> true
-          _ -> false
-        end) and is_nil(snapshot_send)
+        has_chunk? =
+          Enum.any?(captured, fn
+            {^node_b, 0, {:snapshot_chunk, _, ^stream_id, _, _, _, _}} -> true
+            _ -> false
+          end)
+
+        has_commit? =
+          Enum.any?(captured, fn
+            {^node_b, 0, {:snapshot_commit, _, ^stream_id, _, _, _, _}} -> true
+            _ -> false
+          end)
+
+        has_chunk? and has_commit? and is_nil(snapshot_send)
       end,
       timeout: 5_000,
       interval: 10
     )
 
-    TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name])
-    |> Enum.flat_map(fn
-      {^node_b, 0,
-       {:snapshot_chunk, _version, ^stream_id, _seq, _index, _count, _reg_count, _pg_count, _reg,
-        _pg} = frame} ->
-        [frame]
+    messages =
+      TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name])
+      |> Enum.flat_map(fn
+        {^node_b, 0, {:snapshot_chunk, _, ^stream_id, _, _, _, _} = frame} -> [frame]
+        {^node_b, 0, {:snapshot_commit, _, ^stream_id, _, _, _, _} = frame} -> [frame]
+        _other -> []
+      end)
 
-      _other ->
-        []
-    end)
-    |> Enum.sort_by(&elem(&1, 4))
+    chunks =
+      messages
+      |> Enum.filter(&(elem(&1, 0) == :snapshot_chunk))
+      |> Enum.sort_by(&elem(&1, 4))
+
+    [commit] = Enum.filter(messages, &(elem(&1, 0) == :snapshot_commit))
+    chunks ++ [commit]
+  end
+
+  defp capture_snapshot_with_commit(node_a, node_b, name, stream_id, next_seq) do
+    frames = capture_snapshot(node_a, node_b, name, stream_id, next_seq)
+    {Enum.drop(frames, -1), List.last(frames)}
   end
 
   defp request_snapshot_window(node_a, node_b, name, stream_id, limit) do
     :ok =
       TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
         name,
-        {:accept_types_up_to, [:snapshot_chunk], limit}
+        {:accept_types_up_to, [:snapshot_chunk, :snapshot_commit], limit}
       ])
 
     :ok =
@@ -814,10 +1022,37 @@ defmodule Group.ReplicaSnapshotDistributedTest do
       TestCluster.rpc!(node, :sys, :get_state, [Group.Replica.shard_name(name, 0)])
 
     [{_key, transfer}] = Map.to_list(state.snapshot_transfers)
-    {MapSet.size(transfer.received), transfer.chunk_count}
+    {MapSet.size(transfer.received), transfer.manifest}
   end
 
-  defp ceil_div(value, divisor), do: div(value + divisor - 1, divisor)
+  defp drive_snapshot_chunks_until_commit_pending(
+         node_a,
+         node_b,
+         name,
+         stream_id,
+         attempts_left
+       )
+       when attempts_left > 0 do
+    request_snapshot_window(node_a, node_b, name, stream_id, 1)
+    TestCluster.flush_shards(node_b, name)
+
+    state =
+      TestCluster.rpc!(node_a, :sys, :get_state, [Group.Replica.shard_name(name, 0)])
+
+    case Map.values(state.snapshot_send_offsets) do
+      [{:commit, manifest}] ->
+        manifest
+
+      [{:chunk, _next_index}] ->
+        drive_snapshot_chunks_until_commit_pending(
+          node_a,
+          node_b,
+          name,
+          stream_id,
+          attempts_left - 1
+        )
+    end
+  end
 
   defp deliver_frames(node_b, node_a, name, frames) do
     Enum.each(frames, fn frame ->
@@ -845,6 +1080,14 @@ defmodule Group.ReplicaSnapshotDistributedTest do
     TestCluster.rpc!(node, :erlang, :map_size, [
       TestCluster.rpc!(node, :sys, :get_state, [Group.Replica.shard_name(name, 0)]).snapshot_transfers
     ])
+  end
+
+  defp snapshot_transfer_tables(node, name) do
+    state =
+      TestCluster.rpc!(node, :sys, :get_state, [Group.Replica.shard_name(name, 0)])
+
+    [{_key, transfer}] = Map.to_list(state.snapshot_transfers)
+    {transfer.table, transfer.events}
   end
 
   defp snapshot_staging_tables(node, name) do

@@ -2,10 +2,11 @@
 EXTENDS Integers, FiniteSets, TLC
 
 (*
-Finite model of the exact-snapshot chunk assembly boundary. It deliberately
-models two snapshots in one authority epoch plus a new-epoch snapshot so TLC
-can explore loss, duplication, reordering, supersession, stale final chunks,
-expiry, and receiver crashes independently of the larger anti-entropy model.
+Finite model of the exact-snapshot assembly boundary. Snapshot chunks are
+provisional: a separately lossy, duplicable, and reorderable terminal commit
+is required before a complete candidate can replace visible state. Two
+snapshots share an authority epoch and one belongs to a replacement epoch so
+TLC also explores supersession, expiry, receiver crashes, and stale messages.
 *)
 
 Snapshots == {1, 2, 3}
@@ -37,7 +38,8 @@ ChunkRows(snapshot, chunk) ==
     [] snapshot = 3 /\ chunk = 1 -> {"a"}
     [] snapshot = 3 /\ chunk = 2 -> {"d"}
 
-Message == [snapshot : Snapshots, chunk : Chunks]
+Message ==
+  [kind : {"chunk", "commit"}, snapshot : Snapshots, chunk : {0} \union Chunks]
 
 VARIABLES authorityEpoch,
           cursor,
@@ -45,11 +47,13 @@ VARIABLES authorityEpoch,
           stagedSnapshot,
           stagedChunks,
           stagedRows,
+          stagedCommitted,
+          commitAllowed,
           messages
 
 vars ==
   <<authorityEpoch, cursor, visible, stagedSnapshot, stagedChunks,
-    stagedRows, messages>>
+    stagedRows, stagedCommitted, commitAllowed, messages>>
 
 Init ==
   /\ authorityEpoch = 1
@@ -58,95 +62,135 @@ Init ==
   /\ stagedSnapshot = 0
   /\ stagedChunks = {}
   /\ stagedRows = {}
+  /\ stagedCommitted = FALSE
+  /\ commitAllowed = Snapshots
   /\ messages = {}
 
-Send(snapshot, chunk) ==
+SendChunk(snapshot, chunk) ==
   /\ messages' = messages \union
-       {[snapshot |-> snapshot, chunk |-> chunk]}
+       {[kind |-> "chunk", snapshot |-> snapshot, chunk |-> chunk]}
   /\ UNCHANGED <<authorityEpoch, cursor, visible, stagedSnapshot,
-                 stagedChunks, stagedRows>>
+                 stagedChunks, stagedRows, stagedCommitted, commitAllowed>>
 
-Valid(message) ==
-  /\ SnapshotEpoch(message.snapshot) = authorityEpoch
-  /\ SnapshotSeq(message.snapshot) > cursor
+SendCommit(snapshot) ==
+  /\ snapshot \in commitAllowed
+  /\ messages' = messages \union
+       {[kind |-> "commit", snapshot |-> snapshot, chunk |-> 0]}
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, stagedSnapshot,
+                 stagedChunks, stagedRows, stagedCommitted, commitAllowed>>
 
-StartsNewAssembly(message) ==
-  /\ Valid(message)
+InvalidateBeforeCommit(snapshot) ==
+  /\ snapshot \in commitAllowed
+  /\ commitAllowed' = commitAllowed \ {snapshot}
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, stagedSnapshot,
+                 stagedChunks, stagedRows, stagedCommitted, messages>>
+
+Valid(snapshot) ==
+  /\ SnapshotEpoch(snapshot) = authorityEpoch
+  /\ SnapshotSeq(snapshot) > cursor
+
+StartsNewAssembly(snapshot) ==
+  /\ Valid(snapshot)
   /\ \/ stagedSnapshot = 0
      \/ SnapshotEpoch(stagedSnapshot) # authorityEpoch
-     \/ SnapshotSeq(message.snapshot) > SnapshotSeq(stagedSnapshot)
+     \/ SnapshotSeq(snapshot) > SnapshotSeq(stagedSnapshot)
 
-StartAssembly(message) ==
-  /\ StartsNewAssembly(message)
+StartChunk(message) ==
+  /\ message.kind = "chunk"
+  /\ StartsNewAssembly(message.snapshot)
   /\ stagedSnapshot' = message.snapshot
   /\ stagedChunks' = {message.chunk}
   /\ stagedRows' = ChunkRows(message.snapshot, message.chunk)
-  /\ UNCHANGED <<authorityEpoch, cursor, visible, messages>>
+  /\ stagedCommitted' = FALSE
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, commitAllowed, messages>>
 
-ContinueAssembly(message) ==
-  /\ Valid(message)
+StartCommit(message) ==
+  /\ message.kind = "commit"
+  /\ StartsNewAssembly(message.snapshot)
+  /\ stagedSnapshot' = message.snapshot
+  /\ stagedChunks' = {}
+  /\ stagedRows' = {}
+  /\ stagedCommitted' = TRUE
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, commitAllowed, messages>>
+
+ContinueChunk(message) ==
+  /\ message.kind = "chunk"
+  /\ Valid(message.snapshot)
   /\ stagedSnapshot = message.snapshot
   /\ LET nextChunks == stagedChunks \union {message.chunk}
-         nextRows == stagedRows \union
-                       ChunkRows(message.snapshot, message.chunk)
-     IN IF nextChunks = Chunks
+         nextRows == stagedRows \union ChunkRows(message.snapshot, message.chunk)
+     IN IF stagedCommitted /\ nextChunks = Chunks
         THEN /\ cursor' = SnapshotSeq(message.snapshot)
              /\ visible' = SnapshotRows(message.snapshot)
              /\ stagedSnapshot' = 0
              /\ stagedChunks' = {}
              /\ stagedRows' = {}
-        ELSE /\ UNCHANGED <<cursor, visible, stagedSnapshot>>
+             /\ stagedCommitted' = FALSE
+        ELSE /\ UNCHANGED <<cursor, visible, stagedSnapshot, stagedCommitted>>
              /\ stagedChunks' = nextChunks
              /\ stagedRows' = nextRows
-  /\ UNCHANGED <<authorityEpoch, messages>>
+  /\ UNCHANGED <<authorityEpoch, commitAllowed, messages>>
 
-IgnoreChunk(message) ==
-  /\ ~StartsNewAssembly(message)
-  /\ ~(/\ Valid(message)
+ContinueCommit(message) ==
+  /\ message.kind = "commit"
+  /\ Valid(message.snapshot)
+  /\ stagedSnapshot = message.snapshot
+  /\ IF stagedChunks = Chunks
+     THEN /\ cursor' = SnapshotSeq(message.snapshot)
+          /\ visible' = SnapshotRows(message.snapshot)
+          /\ stagedSnapshot' = 0
+          /\ stagedChunks' = {}
+          /\ stagedRows' = {}
+          /\ stagedCommitted' = FALSE
+     ELSE /\ stagedCommitted' = TRUE
+          /\ UNCHANGED <<cursor, visible, stagedSnapshot, stagedChunks, stagedRows>>
+  /\ UNCHANGED <<authorityEpoch, commitAllowed, messages>>
+
+Ignore(message) ==
+  /\ ~StartsNewAssembly(message.snapshot)
+  /\ ~(/\ Valid(message.snapshot)
         /\ stagedSnapshot = message.snapshot)
   /\ UNCHANGED vars
 
 Deliver(message) ==
   /\ message \in messages
-  /\ \/ StartAssembly(message)
-     \/ ContinueAssembly(message)
-     \/ IgnoreChunk(message)
+  /\ \/ StartChunk(message)
+     \/ StartCommit(message)
+     \/ ContinueChunk(message)
+     \/ ContinueCommit(message)
+     \/ Ignore(message)
 
 Drop(message) ==
   /\ message \in messages
   /\ messages' = messages \ {message}
   /\ UNCHANGED <<authorityEpoch, cursor, visible, stagedSnapshot,
-                 stagedChunks, stagedRows>>
+                 stagedChunks, stagedRows, stagedCommitted, commitAllowed>>
 
 InstallNewAuthority ==
   /\ authorityEpoch = 1
   /\ authorityEpoch' = 2
   /\ cursor' = 0
   /\ visible' = {}
-  (* The implementation may retain invisible old staging until expiry. *)
-  /\ UNCHANGED <<stagedSnapshot, stagedChunks, stagedRows, messages>>
+  (* Invisible old staging may remain until expiry, but can never commit. *)
+  /\ UNCHANGED <<stagedSnapshot, stagedChunks, stagedRows, stagedCommitted,
+                 commitAllowed, messages>>
 
-ExpireStaging ==
+DiscardStaging ==
   /\ stagedSnapshot # 0
   /\ stagedSnapshot' = 0
   /\ stagedChunks' = {}
   /\ stagedRows' = {}
-  /\ UNCHANGED <<authorityEpoch, cursor, visible, messages>>
-
-CrashReceiver ==
-  /\ stagedSnapshot # 0
-  /\ stagedSnapshot' = 0
-  /\ stagedChunks' = {}
-  /\ stagedRows' = {}
-  /\ UNCHANGED <<authorityEpoch, cursor, visible, messages>>
+  /\ stagedCommitted' = FALSE
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, commitAllowed, messages>>
 
 Next ==
-  \/ \E snapshot \in Snapshots, chunk \in Chunks : Send(snapshot, chunk)
+  \/ \E snapshot \in Snapshots, chunk \in Chunks : SendChunk(snapshot, chunk)
+  \/ \E snapshot \in Snapshots : SendCommit(snapshot)
+  \/ \E snapshot \in Snapshots : InvalidateBeforeCommit(snapshot)
   \/ \E message \in messages : Deliver(message)
   \/ \E message \in messages : Drop(message)
   \/ InstallNewAuthority
-  \/ ExpireStaging
-  \/ CrashReceiver
+  \/ DiscardStaging
 
 TypeOK ==
   /\ authorityEpoch \in {1, 2}
@@ -155,6 +199,8 @@ TypeOK ==
   /\ stagedSnapshot \in {0} \union Snapshots
   /\ stagedChunks \subseteq Chunks
   /\ stagedRows \subseteq Rows
+  /\ stagedCommitted \in BOOLEAN
+  /\ commitAllowed \subseteq Snapshots
   /\ messages \subseteq Message
 
 VisibleIsAnExactCommittedSnapshot ==
@@ -166,15 +212,13 @@ VisibleIsAnExactCommittedSnapshot ==
      /\ \/ /\ cursor = 0 /\ visible = {}
         \/ /\ cursor = 1 /\ visible = SnapshotRows(3)
 
-StagingNeverLeaksIntoVisible ==
-  stagedSnapshot # 0 /\ stagedChunks # Chunks =>
-    VisibleIsAnExactCommittedSnapshot
-
 StagingBelongsToOneSnapshot ==
   stagedSnapshot # 0 =>
-    /\ stagedRows =
-         UNION {ChunkRows(stagedSnapshot, chunk) : chunk \in stagedChunks}
-    /\ stagedChunks # Chunks
+    stagedRows = UNION {ChunkRows(stagedSnapshot, chunk) : chunk \in stagedChunks}
+
+NoCommitMeansNoInstall ==
+  stagedSnapshot # 0 /\ ~stagedCommitted =>
+    SnapshotSeq(stagedSnapshot) > cursor
 
 Spec == Init /\ [][Next]_vars
 

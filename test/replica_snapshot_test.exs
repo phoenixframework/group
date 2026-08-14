@@ -3,7 +3,7 @@ defmodule Group.ReplicaSnapshotTest do
 
   alias Group.Replica.Snapshot
 
-  test "partitions a complete exact slice into byte-bounded deterministic chunks" do
+  test "streams a complete exact slice in byte-bounded chunks without retaining prior chunks" do
     pid = self()
     metadata = %{payload: String.duplicate("x", 96)}
 
@@ -19,42 +19,62 @@ defmodule Group.ReplicaSnapshotTest do
 
     target = 2_048
     stream_id = {:group, node(), make_ref(), 0, nil, make_ref()}
-    envelope = Snapshot.frame_envelope_bytes(stream_id, 123, 80, 80)
+    envelope = Snapshot.stream_envelope_bytes(stream_id, 123)
+    owner = self()
 
-    snapshot =
-      Snapshot.chunk_rows(Enum.reverse(registry_rows), Enum.reverse(pg_rows), target, envelope)
+    emit = fn registry, pg, index ->
+      send(owner, {:chunk, index, registry, pg})
+      :ok
+    end
 
-    assert snapshot.registry_count == 80
-    assert snapshot.pg_count == 80
-    assert length(snapshot.chunks) > 1
+    stream = Snapshot.new_stream(target, envelope, 1, emit)
+    stream = Snapshot.stream_registry_many(registry_rows, stream)
+    stream = Snapshot.stream_pg_many(pg_rows, stream)
+    stream = Snapshot.finish_stream(stream)
 
-    assert snapshot.chunks ==
-             Snapshot.chunk_rows(registry_rows, pg_rows, target, envelope).chunks
+    assert stream.registry_count == 80
+    assert stream.pg_count == 80
+    assert stream.chunk_count > 1
+    assert stream.registry == []
+    assert stream.pg == []
 
-    assert snapshot.chunks |> Enum.flat_map(&elem(&1, 0)) |> MapSet.new() ==
-             MapSet.new(registry_rows)
+    chunks =
+      for index <- 1..stream.chunk_count do
+        assert_receive {:chunk, ^index, registry, pg}
 
-    assert snapshot.chunks |> Enum.flat_map(&elem(&1, 1)) |> MapSet.new() ==
-             MapSet.new(pg_rows)
+        {registry, pg}
+      end
 
-    chunk_count = length(snapshot.chunks)
+    assert chunks |> Enum.flat_map(&elem(&1, 0)) == registry_rows
+    assert chunks |> Enum.flat_map(&elem(&1, 1)) == pg_rows
 
-    Enum.with_index(snapshot.chunks, 1)
+    Enum.with_index(chunks, 1)
     |> Enum.each(fn {{registry, pg}, index} ->
       frame =
-        {:snapshot_chunk, Group.Replica.WireProtocol.version(), stream_id, 123, index,
-         chunk_count, snapshot.registry_count, snapshot.pg_count, registry, pg}
+        {:snapshot_chunk, Group.Replica.WireProtocol.version(), stream_id, 123, index, registry,
+         pg}
 
       assert :erlang.external_size(frame) <= target
     end)
   end
 
-  test "represents an empty exact slice and permits one intrinsically oversized row" do
-    assert Snapshot.chunk_rows([], [], 1_024).chunks == [{[], []}]
+  test "streams an empty exact slice and permits one intrinsically oversized row" do
+    owner = self()
+
+    emit = fn registry, pg, index ->
+      send(owner, {:chunk, index, registry, pg})
+      :ok
+    end
+
+    empty = Snapshot.new_stream(1_024, 512, 1, emit) |> Snapshot.finish_stream()
+    assert empty.chunk_count == 1
+    assert_receive {:chunk, 1, [], []}
 
     row = {"large", self(), String.duplicate("x", 4_096), 1}
-    snapshot = Snapshot.chunk_rows([row], [], 1_024)
-    assert snapshot.chunks == [{[row], []}]
+    large = Snapshot.new_stream(1_024, 512, 1, emit)
+    large = Snapshot.stream_registry_many([row], large) |> Snapshot.finish_stream()
+    assert large.chunk_count == 1
+    assert_receive {:chunk, 1, [^row], []}
   end
 
   test "staging is set-valued across chunks and remains private to its owner" do
@@ -74,59 +94,48 @@ defmodule Group.ReplicaSnapshotTest do
     assert :ets.info(table) == :undefined
   end
 
-  test "capture tables emit deterministic chunks with only one bounded chunk on the heap" do
-    table = Snapshot.new_capture_table()
+  test "a resumed stream recounts the exact snapshot but emits only the requested suffix" do
     pid = self()
     metadata = %{payload: String.duplicate("x", 96)}
 
     registry_rows =
-      for index <- 80..1//-1 do
+      for index <- 1..80 do
         {"registry/#{index}", pid, metadata, index}
-      end
-
-    pg_rows =
-      for index <- 80..1//-1 do
-        {"pg/#{index}", pid, metadata, index}
       end
 
     target = 2_048
     stream_id = {:group, node(), make_ref(), 0, nil, make_ref()}
-    envelope = Snapshot.capture_envelope_bytes(stream_id, 123)
+    envelope = Snapshot.stream_envelope_bytes(stream_id, 123)
 
-    capture = Snapshot.new_capture(table, target, envelope)
-    capture = Snapshot.capture_registry_many(registry_rows, capture)
-    capture = Snapshot.capture_pg_many(pg_rows, capture)
-    capture = Snapshot.finish_capture(capture)
-    chunk_count = capture.chunk_count
+    emit_all = fn _registry, _pg, index ->
+      send(self(), {:first_pass, index})
+      :ok
+    end
 
-    assert chunk_count > 1
-    assert :ets.info(table, :size) == chunk_count
-    assert capture.registry == []
-    assert capture.pg == []
+    first = Snapshot.new_stream(target, envelope, 1, emit_all)
+    first = Snapshot.stream_registry_many(registry_rows, first) |> Snapshot.finish_stream()
+    assert first.chunk_count > 3
 
-    assert {:ok, chunks} =
-             Snapshot.reduce_capture_chunks(table, chunk_count, [], fn registry, pg, acc ->
-               {:cont, [{registry, pg} | acc]}
-             end)
+    for index <- 1..first.chunk_count do
+      assert_receive {:first_pass, ^index}
+    end
 
-    chunks = Enum.reverse(chunks)
-    assert length(chunks) == chunk_count
+    emit_suffix = fn registry, pg, index ->
+      send(self(), {:suffix, index, registry, pg})
+      :ok
+    end
 
-    chunks
-    |> Enum.with_index(1)
-    |> Enum.each(fn {{registry, pg}, index} ->
-      frame =
-        {:snapshot_chunk, Group.Replica.WireProtocol.version(), stream_id, 123, index,
-         chunk_count, 80, 80, registry, pg}
+    resumed = Snapshot.new_stream(target, envelope, 3, emit_suffix)
+    resumed = Snapshot.stream_registry_many(registry_rows, resumed) |> Snapshot.finish_stream()
 
-      assert :erlang.external_size(frame) <= target
-    end)
+    assert resumed.chunk_count == first.chunk_count
+    assert resumed.registry_count == 80
+    refute_receive {:suffix, 1, _, _}
+    refute_receive {:suffix, 2, _, _}
 
-    assert chunks |> Enum.flat_map(&elem(&1, 0)) |> MapSet.new() == MapSet.new(registry_rows)
-    assert chunks |> Enum.flat_map(&elem(&1, 1)) |> MapSet.new() == MapSet.new(pg_rows)
-    assert :ets.info(table, :size) == chunk_count
-
-    assert :ok = Snapshot.delete_staging_table(table)
+    for index <- 3..resumed.chunk_count do
+      assert_receive {:suffix, ^index, _, _}
+    end
   end
 
   test "event buffering preserves every event across bounded ETS chunks" do
