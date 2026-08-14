@@ -2354,14 +2354,27 @@ defmodule Group.DistributedTest do
 
       # --- Phase 4: verify all data converged on all nodes ---
       # Check registrations: every node should see every registration
-      for {_reg_node, cluster, key} <- reg_pids do
+      for {reg_node, cluster, key} <- reg_pids do
         TestCluster.assert_eventually(
           fn ->
             Enum.all?(nodes, fn check_node ->
               TestCluster.rpc!(check_node, Group, :lookup, [name, key, [cluster: cluster]]) != nil
             end)
           end,
-          timeout: 10_000
+          timeout: 10_000,
+          diagnostic: fn ->
+            Map.new(nodes, fn check_node ->
+              state =
+                TestCluster.rpc!(
+                  check_node,
+                  Group.TestCluster,
+                  :replica_registry_replication_state,
+                  [name, cluster, key, reg_node]
+                )
+
+              {check_node, state}
+            end)
+          end
         )
       end
 
@@ -3702,11 +3715,11 @@ defmodule Group.DistributedTest do
       assert Enum.map(left_events, & &1.key) |> Enum.sort() == Enum.sort(keys)
     end
 
-    test "partition heal (cluster_state merge) batches new entries into one message" do
-      peers = TestCluster.start_peers(2)
+    test "partition-heal delta catch-up batches same-stream entries into one message" do
+      peers = TestCluster.start_peers(3)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
-      [{_, node_a}, {_, node_b}] = peers
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
       num_shards = 4
       name = :"batch_heal_#{System.unique_integer([:positive])}"
       opts = [name: name, shards: num_shards]
@@ -3714,7 +3727,18 @@ defmodule Group.DistributedTest do
       start_group_on_peers(peers, opts)
 
       TestCluster.assert_eventually(fn ->
-        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+        Enum.sort(TestCluster.rpc!(node_a, Group, :nodes, [name])) ==
+          Enum.sort([node_b, node_c])
+      end)
+
+      survivor_key = "heal_batch/survivor"
+      survivor = TestCluster.spawn_register(node_c, name, survivor_key, %{owner: :c})
+
+      TestCluster.assert_eventually(fn ->
+        match?(
+          {^survivor, %{owner: :c}},
+          TestCluster.rpc!(node_b, Group, :lookup, [name, survivor_key])
+        )
       end)
 
       # Partition
@@ -3740,7 +3764,7 @@ defmodule Group.DistributedTest do
       forwarder = TestCluster.spawn_batch_forwarder(node_b, name, :all, self())
       assert_receive {:monitor_ready, ^forwarder}, 1000
 
-      # Reconnect — cluster_state exchange merges all 3 entries in one handler turn
+      # Reconnect — one contiguous delta run applies all 3 entries in one turn.
       TestCluster.reconnect_nodes(node_a, node_b)
 
       # All 3 :registered events should arrive in a single batch
@@ -3748,6 +3772,9 @@ defmodule Group.DistributedTest do
       reg_events = Enum.filter(events, &(&1.type == :registered))
       assert length(reg_events) == 3
       assert Enum.map(reg_events, & &1.key) |> Enum.sort() == Enum.sort(keys)
+
+      assert {^survivor, %{owner: :c}} =
+               TestCluster.rpc!(node_b, Group, :lookup, [name, survivor_key])
     end
 
     test "Group.connect on existing cluster batches incoming data" do
@@ -3784,7 +3811,7 @@ defmodule Group.DistributedTest do
 
       assert_receive {:monitor_ready, ^forwarder}, 1000
 
-      # A connects — receives cluster_state with all 3 entries from B
+      # A connects — stream heads trigger sequenced catch-up for all 3 entries.
       TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
 
       # All 3 :joined events should arrive in a single batch
@@ -4244,7 +4271,7 @@ defmodule Group.DistributedTest do
     end
 
     @tag timeout: 60_000
-    test "full authority is installed once on shard zero while incremental control stays sharded" do
+    test "full and incremental authority install once through shard zero" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -4465,7 +4492,8 @@ defmodule Group.DistributedTest do
       TestCluster.rpc!(node_b, :erlang, :send, [
         shard_name(name, 2),
         {:replica_heartbeat, a_lane, Group.Replica.WireProtocol.version(),
-         TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name]), latest_revision}
+         TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name]), latest_revision,
+         Group.Transport.DistErl.id(), Group.Transport.DistErl.descriptor(name, [])}
       ])
 
       TestCluster.assert_eventually(fn ->
@@ -4511,6 +4539,25 @@ defmodule Group.DistributedTest do
 
       TestCluster.assert_eventually(fn ->
         node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      a_generation =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
+
+      Enum.each([1, 2], fn shard_index ->
+        b_lane = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, shard_index)])
+
+        TestCluster.assert_eventually(fn ->
+          b_lane_state = TestCluster.rpc!(node_b, :sys, :get_state, [b_lane])
+
+          Map.has_key?(b_lane_state.peer_last_seen, node_a) and
+            TestCluster.rpc!(
+              node_b,
+              Group.Replica.Data,
+              :remote_view_generation,
+              [name, shard_index, node_a]
+            ) == a_generation
+        end)
       end)
 
       b_control = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 0)])
@@ -4573,6 +4620,21 @@ defmodule Group.DistributedTest do
         node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
       end)
 
+      a_lane = TestCluster.rpc!(node_a, Process, :whereis, [shard_name(name, 1)])
+
+      TestCluster.assert_eventually(fn ->
+        lane_state = TestCluster.rpc!(node_a, :sys, :get_state, [a_lane])
+
+        Map.has_key?(lane_state.peer_last_seen, node_b) and
+          not is_nil(
+            TestCluster.rpc!(node_a, Group.Replica.Data, :remote_view_generation, [
+              name,
+              1,
+              node_b
+            ])
+          )
+      end)
+
       :ok =
         TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
           name,
@@ -4622,11 +4684,10 @@ defmodule Group.DistributedTest do
                stream_id
              ]) == 0
 
-      a_lane = TestCluster.rpc!(node_a, Process, :whereis, [shard_name(name, 1)])
-
       TestCluster.rpc!(node_b, :erlang, :send, [
         shard_name(name, 1),
-        {:replica_heartbeat, a_lane, Group.Replica.WireProtocol.version(), generation, revision}
+        {:replica_heartbeat, a_lane, Group.Replica.WireProtocol.version(), generation, revision,
+         Group.TestReplicaTransport.id(), Group.TestReplicaTransport.descriptor(name, [])}
       ])
 
       TestCluster.assert_eventually(fn ->
@@ -4844,6 +4905,42 @@ defmodule Group.DistributedTest do
       end)
 
       Enum.each(generation_frames, fn {_target, shard, frame} ->
+        :ok =
+          TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+            name,
+            node_a,
+            shard,
+            frame
+          ])
+      end)
+
+      TestCluster.flush_shards(node_b, name)
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, generation_key]) == nil
+
+      # The global stream epoch normally equals its generation, so a replayed
+      # old frame is rejected by both guards. Rewrite only the epoch to the
+      # current one to prove that the generation fence independently rejects a
+      # semantically impossible mixed-generation stream instead of advancing
+      # its cursor or materializing its rows.
+      current_generation =
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_generation, [name, node_a])
+
+      mixed_generation_frames =
+        Enum.map(generation_frames, fn {target, shard, {:delta_batch, version, runs}} ->
+          runs =
+            Enum.map(runs, fn
+              {{stream_name, origin, old_generation, stream_shard, nil, _old_epoch}, first_seq,
+               records, advertised_head} ->
+                stream_id =
+                  {stream_name, origin, old_generation, stream_shard, nil, current_generation}
+
+                {stream_id, first_seq, records, advertised_head}
+            end)
+
+          {target, shard, {:delta_batch, version, runs}}
+        end)
+
+      Enum.each(mixed_generation_frames, fn {_target, shard, frame} ->
         :ok =
           TestCluster.rpc!(node_b, Group.Transport, :incoming, [
             name,
@@ -5272,10 +5369,11 @@ defmodule Group.DistributedTest do
 
     @tag timeout: 120_000
     test "concurrent many-cluster controls converge every revision before replica writes" do
-      peers = TestCluster.start_peers(2)
+      peers = TestCluster.start_peers(3)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
-      [{_, node_a}, {_, node_b}] = peers
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      nodes = [node_a, node_b, node_c]
       name = :"anti_entropy_many_controls_#{System.unique_integer([:positive])}"
       clusters = for i <- 1..512, do: "tenant/#{i}"
 
@@ -5294,15 +5392,15 @@ defmodule Group.DistributedTest do
       end)
 
       tasks =
-        for node <- [node_a, node_b] do
+        for node <- nodes do
           Task.async(fn -> TestCluster.connect_many_concurrently(node, name, clusters) end)
         end
 
-      assert [:ok, :ok] = Task.await_many(tasks, 60_000)
+      assert [:ok, :ok, :ok] = Task.await_many(tasks, 60_000)
 
       TestCluster.assert_eventually(
         fn ->
-          Enum.all?([node_a, node_b], fn node ->
+          Enum.all?(nodes, fn node ->
             expected = MapSet.new([nil | clusters])
 
             actual =
@@ -5312,8 +5410,9 @@ defmodule Group.DistributedTest do
             MapSet.subset?(expected, actual)
           end) and
             Enum.all?(clusters, fn cluster ->
-              length(TestCluster.rpc!(node_a, Group, :nodes, [name, cluster])) == 2 and
-                length(TestCluster.rpc!(node_b, Group, :nodes, [name, cluster])) == 2
+              Enum.all?(nodes, fn node ->
+                length(TestCluster.rpc!(node, Group, :nodes, [name, cluster])) == 3
+              end)
             end)
         end,
         timeout: 30_000,
@@ -5330,7 +5429,12 @@ defmodule Group.DistributedTest do
 
       TestCluster.assert_eventually(
         fn ->
-          TestCluster.rpc!(node_b, Group.TestCluster, :registry_entries_present?, [name, entries])
+          Enum.all?([node_b, node_c], fn node ->
+            TestCluster.rpc!(node, Group.TestCluster, :registry_entries_present?, [
+              name,
+              entries
+            ])
+          end)
         end,
         timeout: 30_000,
         interval: 100
@@ -5364,26 +5468,43 @@ defmodule Group.DistributedTest do
         node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
       end)
 
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+      end)
+
       :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
       key = "anti-entropy/mixed-generation"
       meta = %{forged: true}
-      pid = TestCluster.spawn_register(node_a, name, key, meta)
+      pid = TestCluster.spawn_register_in_cluster(node_a, name, key, meta, "game")
       TestCluster.flush_shards(node_a, name)
 
       current_generation =
         TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
 
+      current_epoch =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :local_cluster_epoch, [name, "game"])
+
+      forged_generation =
+        current_generation
+        |> elem(0)
+        |> Kernel.-(1)
+        |> max(1)
+        |> then(&{&1, make_ref()})
+
       stream_id =
         Group.Replica.WireProtocol.stream_id(
           name,
           node_a,
-          make_ref(),
+          forged_generation,
           0,
-          nil,
-          current_generation
+          "game",
+          current_epoch
         )
 
-      mutation = {:register, nil, key, pid, meta, System.monotonic_time(), node_a}
+      mutation = {:register, "game", key, pid, meta, System.monotonic_time(), node_a}
 
       :ok =
         TestCluster.rpc!(node_b, Group.Transport, :incoming, [
@@ -5395,7 +5516,8 @@ defmodule Group.DistributedTest do
         ])
 
       TestCluster.flush_shards(node_b, name)
-      assert TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, key, [cluster: "game"]]) == nil
 
       assert TestCluster.rpc!(node_b, Group.Replica.Data, :replica_cursor, [name, 0, stream_id]) ==
                0
@@ -5587,7 +5709,14 @@ defmodule Group.DistributedTest do
       a_control = TestCluster.rpc!(node_a, Process, :whereis, [shard_name(name, 0)])
       b_control = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 0)])
       b_lane = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 1)])
-      new_generation = make_ref()
+
+      {old_generation_counter, _old_generation_identity} =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
+
+      # Generation counters are ordered only within the origin BEAM. Construct
+      # the injected restart generation relative to node A's actual authority;
+      # using this test runner's independent counter makes the test flaky.
+      new_generation = {old_generation_counter + 1, make_ref()}
 
       new_key =
         Enum.find(Stream.iterate(0, &(&1 + 1)), fn suffix ->

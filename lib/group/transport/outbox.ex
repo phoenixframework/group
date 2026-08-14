@@ -37,8 +37,10 @@ defmodule Group.Transport.Outbox do
       default `1`
     * `:outbox_deadline` - maximum useful residence time for an outgoing message
       in milliseconds, default `100`
+    * `:outbox_max_messages` - maximum accepted messages across the local
+      mailbox, pending batch, and backend send, default `1_024`
 
-  The deadline bounds stale work, not mailbox memory. A backend must also put a
+  Admission bounds mailbox growth by message count. A backend must also put a
   finite bound on every socket enqueue or write it performs. Exact snapshot
   messages are independently bounded by `:replicated_snapshot_chunk_target_bytes`.
   Other logical messages or a whole batch may still exceed `:outbox_batch_bytes`;
@@ -91,11 +93,21 @@ defmodule Group.Transport.Outbox do
   def push(group, target_node, shard, message, opts)
       when is_atom(group) and is_atom(target_node) and is_integer(shard) and shard >= 0 and
              is_list(opts) do
-    case Process.whereis(name(group, shard)) do
-      pid when is_pid(pid) ->
-        deadline = monotonic_ms() + deadline(opts)
-        send(pid, {:group_replica_outbox_push, target_node, deadline, message})
-        :ok
+    expires_at = monotonic_ms() + deadline(opts)
+
+    case :persistent_term.get(admission_key(group, shard), nil) do
+      {pid, admission, max_messages} when is_pid(pid) ->
+        if Process.whereis(name(group, shard)) == pid do
+          if :atomics.add_get(admission, 1, 1) <= max_messages do
+            send(pid, {:group_replica_outbox_push, target_node, expires_at, message})
+            :ok
+          else
+            :atomics.sub(admission, 1, 1)
+            :busy
+          end
+        else
+          :disconnected
+        end
 
       nil ->
         :disconnected
@@ -106,6 +118,9 @@ defmodule Group.Transport.Outbox do
   def name(group, shard), do: :"#{group}_replica_transport_outbox_#{shard}"
 
   @doc false
+  def admission_key(group, shard), do: {__MODULE__, group, shard, :admission}
+
+  @doc false
   def monotonic_ms, do: System.monotonic_time(:millisecond)
 
   @doc false
@@ -113,6 +128,7 @@ defmodule Group.Transport.Outbox do
     deadline(opts)
     positive_opt(opts, :outbox_batch_size, 64)
     positive_opt(opts, :outbox_batch_bytes, 1_048_576)
+    positive_opt(opts, :outbox_max_messages, 1_024)
     non_negative_opt(opts, :outbox_flush_interval, 1)
     :ok
   end
@@ -194,6 +210,7 @@ defmodule Group.Transport.Outbox.Worker do
   @default_batch_size 64
   @default_batch_bytes 1_048_576
   @default_flush_interval 1
+  @default_max_messages 1_024
 
   def start_link(opts, shard) do
     group = Keyword.fetch!(opts, :name)
@@ -206,6 +223,9 @@ defmodule Group.Transport.Outbox.Worker do
     group = Keyword.fetch!(opts, :name)
     backend = Keyword.fetch!(opts, :backend)
     {:ok, backend_state} = backend.init_outbox(group, shard, opts)
+    admission = :atomics.new(1, signed: false)
+    max_messages = positive_opt(opts, :outbox_max_messages, @default_max_messages)
+    :persistent_term.put(Outbox.admission_key(group, shard), {self(), admission, max_messages})
 
     {:ok,
      %{
@@ -213,6 +233,7 @@ defmodule Group.Transport.Outbox.Worker do
        shard: shard,
        backend: backend,
        backend_state: backend_state,
+       admission: admission,
        batch_size: positive_opt(opts, :outbox_batch_size, @default_batch_size),
        batch_bytes: positive_opt(opts, :outbox_batch_bytes, @default_batch_bytes),
        flush_interval: non_negative_opt(opts, :outbox_flush_interval, @default_flush_interval),
@@ -224,10 +245,25 @@ defmodule Group.Transport.Outbox.Worker do
   end
 
   @impl true
+  def terminate(_reason, state) do
+    key = Outbox.admission_key(state.group, state.shard)
+
+    case :persistent_term.get(key, nil) do
+      {pid, _admission, _max_messages} when pid == self() ->
+        :persistent_term.erase(key)
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
+  @impl true
   def handle_info({:group_replica_outbox_push, target_node, deadline, message}, state)
       when is_atom(target_node) and is_integer(deadline) do
     if deadline <= Outbox.monotonic_ms() do
-      {:noreply, state}
+      {:noreply, release_admission(state, 1)}
     else
       bytes = :erlang.external_size({target_node, message})
 
@@ -288,6 +324,7 @@ defmodule Group.Transport.Outbox.Worker do
   defp flush(%{pending_count: 0} = state), do: cancel_flush(state)
 
   defp flush(state) do
+    released = state.pending_count
     state = cancel_flush(state)
     now = Outbox.monotonic_ms()
 
@@ -319,13 +356,20 @@ defmodule Group.Transport.Outbox.Worker do
         end
       end)
 
-    %{
+    state = %{
       state
       | backend_state: backend_state,
         pending: [],
         pending_count: 0,
         pending_bytes: 0
     }
+
+    release_admission(state, released)
+  end
+
+  defp release_admission(state, count) do
+    :atomics.sub(state.admission, 1, count)
+    state
   end
 
   defp cancel_flush(%{flush_ref: nil} = state), do: state

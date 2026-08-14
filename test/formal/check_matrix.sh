@@ -16,6 +16,8 @@ run_check() {
 run_check GroupAntiEntropy GroupAntiEntropy
 run_check SnapshotAssembly SnapshotAssembly
 run_check PeerEviction PeerEviction
+run_check AuthorityProjection AuthorityProjection
+run_check AuthorityHint AuthorityHint
 
 if [[ "${TLA_EXTENDED:-0}" == "1" ]]; then
   run_check GroupAntiEntropy GroupAntiEntropyExtended

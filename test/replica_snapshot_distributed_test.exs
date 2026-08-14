@@ -7,10 +7,10 @@ defmodule Group.ReplicaSnapshotDistributedTest do
   alias Group.TestCluster
 
   setup_all do
-    peers = TestCluster.start_peers(2, schedulers: 4)
+    peers = TestCluster.start_peers(3, schedulers: 4)
     on_exit(fn -> TestCluster.stop_peers(peers) end)
-    [{_, node_a}, {_, node_b}] = peers
-    {:ok, node_a: node_a, node_b: node_b}
+    [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+    {:ok, node_a: node_a, node_b: node_b, node_c: node_c}
   end
 
   test "loss, reordering, and duplication expose nothing until exact commit", context do
@@ -237,6 +237,52 @@ defmodule Group.ReplicaSnapshotDistributedTest do
     assert snapshot_staging_tables(node_b, name) == []
   end
 
+  test "an incomplete current-authority snapshot expires without touching visible state",
+       context do
+    %{name: name, node_a: node_a, node_b: node_b} =
+      start_pair(context,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 250
+      )
+
+    :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+
+    entries =
+      for index <- 1..8 do
+        key = "snapshot/expiry/#{index}"
+
+        {key,
+         TestCluster.spawn_register(node_a, name, key, %{
+           payload: String.duplicate("x", 160)
+         })}
+      end
+
+    TestCluster.flush_shards(node_a, name)
+    stream_id = local_stream(node_a, name, nil)
+    frames = capture_snapshot(node_a, node_b, name, stream_id, 1)
+    assert length(frames) > 1
+
+    deliver_frames(node_b, node_a, name, [hd(frames)])
+    assert snapshot_transfer_count(node_b, name) == 1
+    assert replica_cursor(node_b, name, stream_id) == 0
+
+    assert Enum.all?(entries, fn {key, _pid} ->
+             TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+           end)
+
+    TestCluster.assert_eventually(
+      fn -> snapshot_transfer_count(node_b, name) == 0 end,
+      timeout: 2_000,
+      interval: 25
+    )
+
+    assert replica_cursor(node_b, name, stream_id) == 0
+
+    assert Enum.all?(entries, fn {key, _pid} ->
+             TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+           end)
+  end
+
   test "nodedown immediately destroys partial staging owned by the retired source", context do
     %{name: name, node_a: node_a, node_b: node_b} = start_pair(context)
     on_exit(fn -> TestCluster.reconnect_nodes(node_a, node_b) end)
@@ -321,7 +367,9 @@ defmodule Group.ReplicaSnapshotDistributedTest do
       not is_nil(epoch) and epoch != old_epoch
     end)
 
-    deliver_frames(node_b, node_a, name, [last])
+    # Replay the entire retired snapshot. A receiver that checks authority only
+    # when the transfer was first created would now stage and commit it.
+    deliver_frames(node_b, node_a, name, partial ++ [last])
     TestCluster.flush_shards(node_b, name)
 
     assert Enum.all?(old_entries, fn {key, _pid} ->
@@ -498,7 +546,7 @@ defmodule Group.ReplicaSnapshotDistributedTest do
       replicated_peer_lease_timeout: 120_000
     ]
 
-    for node <- [context.node_a, context.node_b] do
+    for node <- [context.node_a, context.node_b, context.node_c] do
       {:ok, _pid} = TestCluster.start_group(node, opts)
     end
 
@@ -584,6 +632,58 @@ defmodule Group.ReplicaSnapshotDistributedTest do
     end)
   end
 
+  test "a bounded transport makes forward progress across a snapshot larger than its window",
+       context do
+    %{name: name, node_a: node_a, node_b: node_b} =
+      start_pair(context,
+        replicated_sender_buffer_size: 1,
+        replicated_oplog_max_entries: 2,
+        replicated_snapshot_chunk_target_bytes: 700,
+        replicated_anti_entropy_interval: 60_000,
+        replicated_peer_lease_timeout: 120_000
+      )
+
+    :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+
+    entries =
+      for index <- 1..20 do
+        key = "snapshot/window/#{index}"
+
+        {key,
+         TestCluster.spawn_register(node_a, name, key, %{
+           payload: String.duplicate("w", 160)
+         })}
+      end
+
+    TestCluster.flush_shards(node_a, name)
+    stream_id = local_stream(node_a, name, nil)
+
+    request_snapshot_window(node_a, node_b, name, stream_id, 2)
+    TestCluster.flush_shards(node_b, name)
+
+    {received, chunk_count} = snapshot_transfer_progress(node_b, name)
+    assert received == 2
+    assert chunk_count > received
+
+    for _attempt <- 2..ceil_div(chunk_count, 2) do
+      request_snapshot_window(node_a, node_b, name, stream_id, 2)
+      TestCluster.flush_shards(node_b, name)
+    end
+
+    TestCluster.assert_eventually(
+      fn ->
+        Enum.all?(entries, fn {key, pid} ->
+          match?({^pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, key]))
+        end)
+      end,
+      timeout: 5_000,
+      interval: 25
+    )
+
+    assert snapshot_transfer_count(node_b, name) == 0
+    assert :ok = TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+  end
+
   defp start_pair(context, extra_opts \\ []) do
     name = :"snapshot_chunks_#{System.unique_integer([:positive])}"
 
@@ -602,16 +702,24 @@ defmodule Group.ReplicaSnapshotDistributedTest do
         extra_opts
       )
 
-    for node <- [context.node_a, context.node_b] do
+    for node <- [context.node_a, context.node_b, context.node_c] do
       {:ok, _pid} = TestCluster.start_group(node, opts)
     end
 
     TestCluster.assert_eventually(fn ->
       context.node_b in TestCluster.rpc!(context.node_a, Group, :nodes, [name]) and
-        context.node_a in TestCluster.rpc!(context.node_b, Group, :nodes, [name])
+        context.node_c in TestCluster.rpc!(context.node_a, Group, :nodes, [name]) and
+        context.node_a in TestCluster.rpc!(context.node_b, Group, :nodes, [name]) and
+        context.node_a in TestCluster.rpc!(context.node_c, Group, :nodes, [name])
     end)
 
-    %{name: name, node_a: context.node_a, node_b: context.node_b, opts: opts}
+    %{
+      name: name,
+      node_a: context.node_a,
+      node_b: context.node_b,
+      node_c: context.node_c,
+      opts: opts
+    }
   end
 
   defp capture_snapshot(node_a, node_b, name, stream_id, next_seq) do
@@ -631,7 +739,21 @@ defmodule Group.ReplicaSnapshotDistributedTest do
         {:needs, Group.Replica.WireProtocol.version(), [{stream_id, next_seq}]}
       ])
 
-    TestCluster.flush_shards(node_a, name)
+    TestCluster.assert_eventually(
+      fn ->
+        captured = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name])
+
+        snapshot_send =
+          TestCluster.rpc!(node_a, :sys, :get_state, [Group.Replica.shard_name(name, 0)]).snapshot_send
+
+        Enum.any?(captured, fn
+          {^node_b, 0, {:snapshot_chunk, _, ^stream_id, _, _, _, _, _, _, _}} -> true
+          _ -> false
+        end) and is_nil(snapshot_send)
+      end,
+      timeout: 5_000,
+      interval: 10
+    )
 
     TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name])
     |> Enum.flat_map(fn
@@ -645,6 +767,43 @@ defmodule Group.ReplicaSnapshotDistributedTest do
     end)
     |> Enum.sort_by(&elem(&1, 4))
   end
+
+  defp request_snapshot_window(node_a, node_b, name, stream_id, limit) do
+    :ok =
+      TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
+        name,
+        {:accept_types_up_to, [:snapshot_chunk], limit}
+      ])
+
+    :ok =
+      TestCluster.rpc!(node_a, Group.Transport, :incoming, [
+        name,
+        node_b,
+        0,
+        {:needs, Group.Replica.WireProtocol.version(), [{stream_id, 1}]}
+      ])
+
+    source = TestCluster.rpc!(node_a, Process, :whereis, [Group.Replica.shard_name(name, 0)])
+    _state = TestCluster.rpc!(node_a, :sys, :get_state, [source])
+
+    TestCluster.assert_eventually(
+      fn ->
+        TestCluster.rpc!(node_a, :sys, :get_state, [source]).snapshot_send == nil
+      end,
+      timeout: 5_000,
+      interval: 10
+    )
+  end
+
+  defp snapshot_transfer_progress(node, name) do
+    state =
+      TestCluster.rpc!(node, :sys, :get_state, [Group.Replica.shard_name(name, 0)])
+
+    [{_key, transfer}] = Map.to_list(state.snapshot_transfers)
+    {MapSet.size(transfer.received), transfer.chunk_count}
+  end
+
+  defp ceil_div(value, divisor), do: div(value + divisor - 1, divisor)
 
   defp deliver_frames(node_b, node_a, name, frames) do
     Enum.each(frames, fn frame ->

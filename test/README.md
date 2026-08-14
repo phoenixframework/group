@@ -25,7 +25,7 @@ release qualification rather than individual edits.
 |------|---------------|
 | `group_test.exs` | Single-node: register/unregister, join/leave, members, monitor/demonitor, named clusters, concurrent operations |
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts, and adversarial replica-transport loss/busy/snapshot recovery |
-| `anti_entropy_fault_regression_test.exs` | Three-node regressions for hidden-winner projection, crash-journal replay, claimless cluster cleanup, shard-zero view repair, and shard-scoped sideband lifecycle |
+| `anti_entropy_fault_regression_test.exs` | Three-node regressions for hidden-winner projection, receiver restart eviction, nodedown/lease lane retirement, authority gaps and cross-lane races, in-flight conflict fencing, crash-journal replay, cursorless/interrupted snapshot repair, malformed ingress, and sideband rediscovery |
 | `replica_adversarial_test.exs` | Reproducible three-node mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
 | `replica_model_property_test.exs` | StreamData-generated and shrunk owner histories against an independent lifecycle oracle and scheduler-controlled replica transport |
 | `replica_snapshot_test.exs` | Pure byte partitioning and set-valued private-ETS snapshot staging |
@@ -247,8 +247,9 @@ TestCluster.start_group(
 )
 ```
 
-The resolver uses "most recent wins" — keeps the registration with the higher
-timestamp.
+The resolver ranks each claim by timestamp. Group chooses the maximum
+`{rank, pid}`, so every peer reaches the same winner regardless of claim arrival
+order.
 
 ### Replica transport fault injection
 
@@ -272,7 +273,8 @@ losing its cluster-close fence and require the lane to sweep the stale registry
 and PG slices from shared authority. Authority topology tests suspend every
 receiver shard and inspect the queued protocol: only shard 0 may receive/install
 the full epoch snapshot, nonzero shards receive constant-size lane hellos, and
-incremental opens stay on their matching shard. Separate tests suspend a
+incremental controls arriving on any lane are serialized through shard 0.
+Separate tests suspend a
 backlogged authority shard while other replica lanes continue converging and
 deliver data before authority to prove rejection does not advance the cursor
 and the same message applies after authority repair. Concurrent snapshot tests
@@ -285,17 +287,49 @@ disconnects one origin's real socket, prunes its oplog, reconnects it, and
 requires snapshot recovery without changing the third node's independent
 registry or PG state.
 
+Authority races also replace authority while conflict resolution is paused,
+remove the local shard-zero owner, and deliver `nodedown` while a sibling lane
+is suspended. The assertions require that stale remote winners cannot terminate
+local owners, that retained conflict claims are reprojected after an authority
+gap closes even when their stream cursor is already current, and that each lane
+keeps its own restart breadcrumb until its rows and cursor are gone.
+The same conflict-gap schedule is held open until lease expiry to prove a source
+that never returns leaves no deferred projection key, claim, cursor, or visible
+remote winner behind. A separate nodedown regression proves the immediate
+retirement path cannot strand that deferred state after removing its lease.
+Newer-generation and same-generation heartbeat schedules assert the persisted
+hint fences every lane before exact repair, rejects delayed exact/incremental
+authority, and reconstructs its retirement deadline after a lane crash. Once
+the peer is fully retired, replayed heartbeats and lane hellos must create no
+hint, lease, or outbound route. A separate compare-and-install regression races
+a newer hint across an older incremental control and requires no epoch row or
+lane view to become authoritative.
+The inverse ordering is forced independently: a first-time lane hello is
+processed while shard zero is suspended, then exact authority must trigger an
+immediate shard-local re-probe without first admitting the speculative route.
+Exact-authority regression also activates a local cluster alongside a remote
+epoch install and requires the authority plus both cluster indexes to become
+visible as one operation; the high-volume control test repeats the projection
+check over three nodes before admitting replica writes.
+Interrupted lifecycle tests suspend the notification shard, stop after the
+durable activation/deactivation mutation, and require activation routing to be
+complete immediately and close cleanup to finish after the shard resumes. This
+proves neither path relies on the API caller remaining alive.
+
 `replica_transport_outbox_test.exs` proves that a blocked sideband backend
 cannot delay the Group-facing local push, messages expire behind that backend,
 busy batches are not retried locally, batching preserves per-target order,
 invalid deadlines fail at boot, and ingress drops rather than raising while a
-destination shard is absent.
+destination shard is absent. Admission is bounded across the local mailbox,
+pending batch, and backend send.
 The real three-node TCP recovery test runs through the same outbox path.
 
 `Group.TestCluster.assert_replica_consistent/1` checks the
-public dual indexes plus registry claim authority, oplog/order equivalence, and
-contiguous retained stream ranges. Seeded tests additionally require every PID
-retained as authority to still be alive after convergence.
+public dual indexes plus exact deterministic registry projection, row/shard
+placement, lane authority revisions, registry/PG origin authority,
+oplog/order equivalence, and contiguous retained stream ranges. Seeded tests
+additionally require every PID retained as authority to still be alive after
+convergence.
 
 The isolated mutation runner in `test/mutation/` disables individual protocol
 guards and repair steps only in copied checkouts. See

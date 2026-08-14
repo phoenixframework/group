@@ -10,9 +10,8 @@ defmodule Group.Transport do
   Erlang distribution remains Group's control plane and supplies the stable
   node identity used here. A sideband adapter can use its `descriptor/2` in the
   control hello to exchange endpoints and pass incoming messages to
-  `incoming/4` or `incoming_batch/4`. Group trusts the `source_node` supplied
-  by the adapter and validates stream origins and member pids against it; peer
-  authentication, when needed, belongs to the transport.
+  `incoming/4` or `incoming_batch/4`. `source_node` is routing metadata supplied
+  by the adapter; Group uses it to validate stream origins and member pids.
 
   Adapters do not need to preserve ordering. Group serializes writes per shard
   and sequences each origin/generation/shard/cluster/epoch stream; receivers
@@ -74,9 +73,9 @@ defmodule Group.Transport do
   @doc """
   Passes an incoming replica message to the corresponding local shard.
 
-  This is a local mailbox operation. `source_node` is the trusted peer identity
-  established by the adapter. Stream generation, epoch, group, shard, origin,
-  and member-pid ownership are validated by the replica.
+  This is a local mailbox operation. `source_node` identifies the peer whose
+  replica lane supplied the message. Stream generation, epoch, group, shard,
+  origin, and member-pid ownership are validated by the replica.
 
   Returns `:disconnected` and drops the message if that shard is not currently
   registered, for example while its supervisor is restarting.
@@ -98,7 +97,7 @@ defmodule Group.Transport do
 
   A finite-message transport may segment the encoded batch on the wire, but it
   must reassemble every segment before calling this function. Group never
-  observes or applies a partial batch. `source_node` has the same trusted-peer
+  observes or applies a partial batch. `source_node` has the same routing
   meaning as in `incoming/4`.
 
   Like `incoming/4`, this returns `:disconnected` if the destination shard is

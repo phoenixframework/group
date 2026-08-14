@@ -267,12 +267,13 @@ All operations are **eventually consistent**:
   `Logger.error` events and busy distribution links remain `Logger.warning`
   events. The level can be changed at runtime with `Group.log_level/2`.
 - **`resolve_registry_conflict`** — `{module, function, extra_args}` callback
-  invoked as `apply(mod, fun, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
-  Called when partition healing or concurrent registration finds the same key
-  registered on two nodes. Must return the winning pid (or neither pid to
-  reject both). Group records an authoritative delete and terminates a losing
-  owner only on that owner's local node. The callback runs synchronously inside
-  the shard GenServer, so it must return quickly and never block.
+  invoked once per competing claim as
+  `apply(mod, fun, [name, key, {pid, meta, time} | extra_args])`. It must return
+  a deterministic Erlang term used as the claim's rank. Group chooses the
+  maximum `{rank, pid}`, making the winner independent of delivery order and
+  grouping. Group records an authoritative delete and terminates a losing owner
+  only on that owner's local node. The callback runs synchronously inside the
+  shard GenServer, so it must return quickly and never block.
 - **`extract_meta`** — `{module, function, args}` or `fun(meta)` applied to
   metadata on reads and lifecycle events. Useful for stripping internal fields.
 - **`replicated_pg_receiver_buffer_size`** — max buffered replicated PG
@@ -413,12 +414,26 @@ batched, and installed by shard 0 into one node-wide authority table. The
 highest observed revision keeps heartbeats constant-size during a burst; after
 the burst becomes quiet, one authoritative hello closes any gaps left by
 dropped or reordered controls. Per-shard view rows record only constant-size
-lane readiness; they do not copy the epoch map. Snapshot capture is serialized
-with local epoch activation, so its revision and epoch rows are one coherent
-point-in-time value. The highest observed incremental revision is tracked
-separately and can never promote a partial view to exact authority. Discovery
-hints never mutate membership on their own. Authority installation fans a
-local fence to every lane, which sweeps only that lane's retained receive
+lane readiness; they do not copy the epoch map. The highest observed
+incremental revision, complete applied revision, and last exact revision are
+tracked separately. Data installs a contiguous incremental batch only if its
+expected generation/revision still matches the applied authority, observation,
+and persisted hint in the same serialized callback; a raced heartbeat rejects
+the whole batch. A persisted `{generation, revision}` hint fences every lane
+when any heartbeat observes newer authority. It can refine only an already
+known peer: after complete retirement, delayed heartbeats and lane hellos cannot
+recreate authority, a transport route, or a lease. Only an exact dist-Erlang
+hello reintroduces the peer. Discovery hints never mutate membership on their
+own.
+The exact authority and its shared-cluster forward/reverse index rows are
+replaced in one serialized Data operation. This closes the race where a local
+cluster connect and a remote exact install could each miss the other's state
+and permanently omit a valid replica route. Local activation likewise installs
+its epoch, self route, and already-exact remote routes in one Data turn. Local
+deactivation removes admission and queues idempotent old-epoch cleanup on every
+shard before returning; API timeout or caller death cannot strand rows, routes,
+or a close barrier. Authority installation then fans a local fence to every
+lane, which sweeps only that lane's retained receive
 streams. Shared authority may become visible before that fanout reaches a lane,
 but the lane's constant-size view is not marked installed until its purge
 finishes; data validation requires that marker. A heartbeat or lane hello can
@@ -426,6 +441,22 @@ confirm an installed view but cannot promote a pending one. Because PG rows
 intentionally do not carry protocol epochs, a superseded origin/cluster slice
 is cleared and its current cursor reset so the next head reconstructs it from
 retained deltas or an exact snapshot.
+
+If a receiver shard restarts while Data retains remote rows, it reconstructs
+lease candidates from constant-size authority/view metadata rather than
+scanning registry or PG entries. A live Group refreshes through discovery; a
+Group that never returns is purged after the normal bounded lease timeout.
+Each lane removes that persisted view only after purging its own rows and
+cursors, so shard 0 cannot erase a suspended sibling's restart breadcrumb.
+Shard 0 also reconstructs any pending applied/observed-versus-exact authority
+repair. Persisted hints seed the same bounded retirement lease after a lane
+restart, and final route cleanup rechecks that no newer exact authority or hint
+was installed while an older cleanup caller was delayed.
+Registry conflicts reconciled during that temporary authority gap retain a
+bounded set of affected keys in the receiving lane. Installing the exact view
+reprojects those keys before normal processing resumes, so retained current
+claims cannot be hidden forever behind a stale visible winner and authority
+repair never requires scanning every claim in the shard.
 
 Replica state itself does not travel on the control plane. Once the hello is
 fenced, stream-head exchange on the replica transport catches the peer up.
@@ -477,7 +508,8 @@ authority and membership remain on dist Erlang:
 replica_transport:
   {MyApp.GroupTransport,
    [outbox_batch_size: 64, outbox_batch_bytes: 1_048_576,
-    outbox_flush_interval: 1, outbox_deadline: 100]}
+    outbox_flush_interval: 1, outbox_deadline: 100,
+    outbox_max_messages: 1_024]}
 ```
 
 The default `Group.Transport.DistErl` adapter sends directly to the remote shard and
@@ -488,19 +520,28 @@ target and invokes the adapter's `send_batch/4` callback. Calls that expire or
 return `:busy`/`:disconnected` are dropped without a local retry; the next
 anti-entropy exchange repairs them.
 
+Exact-snapshot row capture runs in at most one off-shard worker per shard. The
+worker sends only when the stream identity and fully-applied head are unchanged
+after its scans. A concurrent write invalidates the capture and periodic
+anti-entropy retries, keeping million-row scans off the Group control process.
+
 The optional `peer_up/5` and `peer_down/4` callbacks report one shard lane at a
 time. A sideband adapter that shares a single node connection must retain it
 while any reported lane remains live and release it after the last lane goes
 down. `incoming/4` and `incoming_batch/4` return `:disconnected` and drop when
 their local shard is restarting; an ingress reader must treat that as an
-expected lossy delivery outcome.
+expected lossy delivery outcome. Group invokes `peer_up/5` and records an
+outbound lane only after exact/current authority admits it; a delayed lane hello
+after peer retirement remains a side-effect-free request for exact authority.
+When a hello legitimately outruns first-time exact authority, authority fanout
+immediately re-probes that shard without retaining a speculative route or
+waiting for the periodic anti-entropy interval.
 
 A message-oriented backend fits this callback shape by obtaining a connection
 once from `init_outbox/3`, then sending each `send_batch/4` result to a
 registered incoming name on the target node. Queue pressure maps to `:busy` and
-a missing session maps to `:disconnected`. The adapter passes its trusted peer
-identity as the source node; Group verifies that stream origins and member pids
-match that identity but does not authenticate the sideband connection itself.
+a missing session maps to `:disconnected`. The adapter passes its peer node as
+`source_node`; Group verifies that stream origins and member pids match it.
 Exact snapshots are already bounded by Group. A transport with a smaller
 maximum frame may additionally segment an encoded batch, but it must completely
 reassemble that batch before calling

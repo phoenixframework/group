@@ -15,8 +15,15 @@ defmodule Group.TestReplicaTransport do
              (is_tuple(mode) and tuple_size(mode) == 2 and
                 elem(mode, 0) in [:drop_types, :duplicate_types, :capture_drop, :capture_pass]) or
              (is_tuple(mode) and tuple_size(mode) == 3 and elem(mode, 0) == :delay_types) or
+             (is_tuple(mode) and tuple_size(mode) == 3 and
+                elem(mode, 0) == :accept_types_up_to) or
              (is_tuple(mode) and tuple_size(mode) == 2 and elem(mode, 0) == :chaos) do
     :persistent_term.put({__MODULE__, group}, mode)
+
+    if is_tuple(mode) and tuple_size(mode) == 3 and elem(mode, 0) == :accept_types_up_to do
+      :persistent_term.put({__MODULE__, group, :accepted}, 0)
+    end
+
     :ok
   end
 
@@ -32,6 +39,7 @@ defmodule Group.TestReplicaTransport do
   def clear(group) do
     :persistent_term.erase({__MODULE__, group})
     :persistent_term.erase({__MODULE__, group, :captured})
+    :persistent_term.erase({__MODULE__, group, :accepted})
     :ok
   end
 
@@ -64,6 +72,22 @@ defmodule Group.TestReplicaTransport do
       {:delay_types, delays, default_delay} ->
         delay = Map.get(delays, message_type(message), default_delay)
         delayed_forward(group, target_node, shard, message, delay)
+
+      {:accept_types_up_to, types, limit}
+      when is_list(types) and is_integer(limit) and limit > 0 ->
+        if message_type(message) in types do
+          key = {__MODULE__, group, :accepted}
+          accepted = :persistent_term.get(key, 0)
+
+          if accepted < limit do
+            :persistent_term.put(key, accepted + 1)
+            forward(group, target_node, shard, message)
+          else
+            :busy
+          end
+        else
+          forward(group, target_node, shard, message)
+        end
 
       {:capture_drop, types} ->
         if message_type(message) in types, do: capture(group, target_node, shard, message)

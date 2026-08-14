@@ -80,6 +80,31 @@ defmodule Group.ReplicaTransportOutboxTest do
     refute_receive {:outbox_batch, ^group, 0, ^target, [:expires_behind_backend], _deadline}, 300
   end
 
+  test "bounded admission drops excess messages before the local mailbox grows" do
+    group = unique_group(:bounded_admission)
+    target = :"outbox-bounded@test"
+
+    start_outboxes(group,
+      outbox_max_messages: 8,
+      outbox_batch_size: 8,
+      outbox_flush_interval: 1_000
+    )
+
+    outbox = Process.whereis(Outbox.name(group, 0))
+    :ok = :sys.suspend(outbox)
+
+    results =
+      for message <- 1..32 do
+        Outbox.push(group, target, 0, message, outbox_deadline: 1_000)
+      end
+
+    assert Enum.count(results, &(&1 == :ok)) == 8
+    assert Enum.count(results, &(&1 == :busy)) == 24
+    assert {:message_queue_len, 8} = Process.info(outbox, :message_queue_len)
+
+    :ok = :sys.resume(outbox)
+  end
+
   test "expired messages and backend backpressure are dropped without local retries" do
     expired_group = unique_group(:expired)
     target = :"outbox-expired@test"
@@ -160,6 +185,16 @@ defmodule Group.ReplicaTransportOutboxTest do
         backend: Backend,
         controller: self(),
         outbox_deadline: 0
+      )
+    end
+
+    assert_raise ArgumentError, ~r/:outbox_max_messages/, fn ->
+      Group.Transport.Outbox.Supervisor.init(
+        name: group,
+        num_shards: 1,
+        backend: Backend,
+        controller: self(),
+        outbox_max_messages: 0
       )
     end
   end

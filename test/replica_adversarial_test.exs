@@ -275,9 +275,21 @@ defmodule Group.ReplicaAdversarialTest do
         args = [name, key, cluster_opts(cluster)]
         values = Map.new(nodes, &{&1, TestCluster.rpc!(&1, Group, :lookup, args)})
 
-        if values |> Map.values() |> Enum.uniq() |> length() == 1,
-          do: [],
-          else: [{:registry, cluster, key, values}]
+        if values |> Map.values() |> Enum.uniq() |> length() == 1 do
+          []
+        else
+          replica =
+            Map.new(nodes, fn node ->
+              {node,
+               TestCluster.rpc!(node, Group.TestCluster, :replica_registry_key_state, [
+                 name,
+                 cluster,
+                 key
+               ])}
+            end)
+
+          [{:registry, cluster, key, values, replica}]
+        end
       end)
       |> Enum.take(10)
 

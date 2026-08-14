@@ -2,22 +2,6 @@ defmodule GroupTest.ExtractMeta do
   def strip(meta), do: Map.take(meta, [:public])
 end
 
-defmodule GroupTest.ResolveRegistryConflict do
-  def pick(
-        _name,
-        _key,
-        {local_pid, _local_meta, _local_time},
-        {remote_pid, _remote_meta, _remote_time},
-        winner
-      ) do
-    case winner do
-      :local -> local_pid
-      :remote -> remote_pid
-      :none -> :none
-    end
-  end
-end
-
 defmodule GroupTest do
   use ExUnit.Case, async: true
 
@@ -46,6 +30,52 @@ defmodule GroupTest do
         assert error.message =~ ":shards"
         assert error.message =~ "positive integer"
       end
+    end
+  end
+
+  describe "replica ingress fairness" do
+    test "an oversized incoming batch yields to an already queued local write", %{name: name} do
+      key =
+        1..1_000
+        |> Enum.map(&"ingress-fairness/#{&1}")
+        |> Enum.find(&(Group.Replica.shard_index_for(nil, &1, 4) == 0))
+
+      shard = Process.whereis(Group.Replica.shard_name(name, 0))
+      :ok = :sys.suspend(shard)
+
+      on_exit(fn ->
+        if Process.alive?(shard), do: :erlang.trace(shard, false, [:call])
+        :erlang.trace_pattern({Group.Replica, :handle_replica_message, 3}, false, [:local])
+        Group.TestCluster.resume_if_alive(shard)
+      end)
+
+      parent = self()
+      owner = spawn(fn -> replica_ingress_fairness_owner(parent) end)
+
+      :erlang.trace(shard, true, [:call, {:tracer, owner}])
+      :erlang.trace_pattern({Group.Replica, :handle_replica_message, 3}, true, [:local])
+
+      source_node = :"ingress-source@test"
+      batch_size = 65
+      messages = List.duplicate({:malformed_replica_message, make_ref()}, batch_size)
+
+      assert :ok = Group.Transport.incoming_batch(name, source_node, 0, messages)
+
+      epoch = Group.Replica.Data.local_cluster_epoch(name, nil)
+      send(owner, {:write, shard, {:register, nil, epoch, key, owner, %{kind: :local}}})
+
+      wait_until(fn ->
+        match?(
+          {:message_queue_len, length} when length >= 2,
+          Process.info(shard, :message_queue_len)
+        )
+      end)
+
+      :ok = :sys.resume(shard)
+
+      assert_receive {:local_write_finished, ^owner, :ok, calls_before_local}, 5_000
+      assert calls_before_local < batch_size
+      assert match?({^owner, %{kind: :local}}, Group.lookup(name, key))
     end
   end
 
@@ -195,6 +225,42 @@ defmodule GroupTest do
 
       # Metadata is updated
       [{_pid, %{v: 2}}] = Group.members(name, key)
+    end
+  end
+
+  describe "named-cluster mutation fencing" do
+    test "a shard rejects registry and PG writes after their cluster epoch retires", %{name: name} do
+      cluster = "retired/#{System.unique_integer([:positive])}"
+      registry_key = "retired/registry"
+      pg_key = "retired/pg"
+
+      assert :ok = Group.connect(name, cluster)
+      old_epoch = Group.Replica.Data.local_cluster_epoch(name, cluster)
+      assert :ok = Group.disconnect(name, cluster)
+      assert :ok = Group.connect(name, cluster)
+      refute Group.Replica.Data.local_cluster_epoch(name, cluster) == old_epoch
+
+      registry_shard = Group.Replica.shard_for(name, cluster, registry_key)
+      pg_shard = Group.Replica.shard_for(name, cluster, pg_key)
+
+      registry_result =
+        Group.Replica.local_request(
+          registry_shard,
+          {:register, cluster, old_epoch, registry_key, self(), %{stale: true}},
+          5_000
+        )
+
+      pg_result =
+        Group.Replica.local_request(
+          pg_shard,
+          {:join, cluster, old_epoch, pg_key, self(), %{stale: true}},
+          5_000
+        )
+
+      assert registry_result == {:error, :stale_cluster_epoch}
+      assert pg_result == {:error, :stale_cluster_epoch}
+      assert Group.lookup(name, registry_key, cluster: cluster) == nil
+      assert Group.members(name, pg_key, cluster: cluster) == []
     end
   end
 
@@ -767,9 +833,20 @@ defmodule GroupTest do
 
         disconnect_queued? =
           Enum.any?(messages, fn
-            {:group_local_request, _alias, {:cluster_disconnect, [^cluster]}} -> true
-            {:group_local_request, _caller, _ref, {:cluster_disconnect, [^cluster]}} -> true
-            _ -> false
+            {:group_local_request, _alias, {:cluster_disconnect, [^cluster]}} ->
+              true
+
+            {:group_local_request, _alias, {:cluster_disconnect, [^cluster], _epochs}} ->
+              true
+
+            {:group_local_request, _caller, _ref, {:cluster_disconnect, [^cluster]}} ->
+              true
+
+            {:group_local_request, _caller, _ref, {:cluster_disconnect, [^cluster], _epochs}} ->
+              true
+
+            _ ->
+              false
           end)
 
         not Group.connected?(name, cluster) and disconnect_queued?
@@ -1404,296 +1481,75 @@ defmodule GroupTest do
       assert Group.members(name, key, cluster: cluster) == [{self(), %{epoch: :new}}]
       assert :ok = Group.TestCluster.assert_replica_consistent(name)
     end
+
+    test "a delayed duplicate disconnect cannot purge a reconnected epoch" do
+      name = start_single_shard_group()
+      cluster = "duplicate-disconnect/#{System.unique_integer([:positive])}"
+      reg_key = "duplicate-disconnect/registry/#{System.unique_integer([:positive])}"
+      pg_key = "duplicate-disconnect/pg/#{System.unique_integer([:positive])}"
+
+      :ok = Group.connect(name, cluster)
+      old_epoch = Group.Replica.Data.local_cluster_epoch(name, cluster)
+      :ok = Group.disconnect(name, cluster)
+      :ok = Group.connect(name, cluster)
+      :ok = Group.register(name, reg_key, %{epoch: :new}, cluster: cluster)
+      :ok = Group.join(name, pg_key, %{epoch: :new}, cluster: cluster)
+
+      # A concurrent second disconnect that observed the already-closed local
+      # epoch can queue either an unfenced request or the completed old epoch.
+      # Model both arriving only after reconnect.
+      for stale_epoch <- [nil, old_epoch] do
+        assert :ok =
+                 Group.Replica.local_request(
+                   Group.Replica.shard_name(name, 0),
+                   {:cluster_disconnect, [cluster], [{cluster, stale_epoch}]},
+                   5_000
+                 )
+
+        assert Group.connected?(name, cluster)
+        assert Group.lookup(name, reg_key, cluster: cluster) == {self(), %{epoch: :new}}
+        assert Group.members(name, pg_key, cluster: cluster) == [{self(), %{epoch: :new}}]
+      end
+
+      assert :ok = Group.TestCluster.assert_replica_consistent(name)
+    end
   end
 
   describe "local request fairness" do
-    test "local register gets a turn ahead of replicated registry backlog" do
-      name =
-        start_single_shard_group(
-          replicated_registry_receiver_buffer_size: 1,
-          replicated_registry_receiver_flush_interval: 60_000
-        )
-
+    test "a control flood yields to a queued local request after bounded work" do
+      name = start_single_shard_group()
       shard = suspend_only_shard(name)
-      remote_pid = spawn_forever()
-      local_key = "fair/register/local/#{System.unique_integer([:positive])}"
-      backlog_prefix = "fair/register/backlog/#{System.unique_integer([:positive])}"
+      remote_node = :"missing-control-peer@nohost"
+      key = "fair/control/local/#{System.unique_integer([:positive])}"
 
-      on_exit(fn ->
-        kill_if_alive(remote_pid)
-      end)
+      send(
+        shard,
+        {:group_replica_frame, remote_node, {:heads, Group.Replica.WireProtocol.version(), []}}
+      )
 
-      enqueue_replicated_registry_backlog(shard, backlog_prefix, remote_pid, 1_000)
+      for _ <- 1..10_000 do
+        send(shard, {:nodedown, remote_node})
+      end
 
-      caller =
-        spawn_requester(
-          fn ->
-            Group.register(name, local_key, %{local: true})
-          end,
-          :local_register_result
-        )
+      ref = make_ref()
+      epoch = Group.Replica.Data.generation(name)
 
-      on_exit(fn -> kill_if_alive(caller) end)
-      Process.sleep(20)
+      send(
+        shard,
+        {:group_local_request, self(), ref, {:register, nil, epoch, key, self(), %{local: true}}}
+      )
+
+      wait_until(fn -> shard_message_queue_len(shard) >= 10_002 end, 2_000)
       :ok = :sys.resume(shard)
 
-      assert_receive {:local_register_result, ^caller, :ok}, 1_000
-      assert shard_message_queue_len(shard) > 0
-      assert Group.lookup(name, local_key) == {caller, %{local: true}}
-      wait_until(fn -> shard_message_queue_len(shard) == 0 end, 5_000)
-    end
+      assert_receive {:group_local_reply, ^ref, :ok}, 100
+      assert Group.lookup(name, key) == {self(), %{local: true}}
 
-    test "local join gets a turn ahead of replicated registry backlog" do
-      name =
-        start_single_shard_group(
-          replicated_registry_receiver_buffer_size: 1,
-          replicated_registry_receiver_flush_interval: 60_000
-        )
-
-      shard = suspend_only_shard(name)
-      remote_pid = spawn_forever()
-      local_key = "fair/join-registry/local/#{System.unique_integer([:positive])}"
-      backlog_prefix = "fair/join-registry/backlog/#{System.unique_integer([:positive])}"
-
-      on_exit(fn ->
-        kill_if_alive(remote_pid)
-      end)
-
-      enqueue_replicated_registry_backlog(shard, backlog_prefix, remote_pid, 1_000)
-
-      caller =
-        spawn_requester(
-          fn ->
-            Group.join(name, local_key, %{local: true})
-          end,
-          :local_join_result
-        )
-
-      on_exit(fn -> kill_if_alive(caller) end)
-      Process.sleep(20)
-      :ok = :sys.resume(shard)
-
-      assert_receive {:local_join_result, ^caller, :ok}, 1_000
-      assert shard_message_queue_len(shard) > 0
-      assert Group.members(name, local_key) == [{caller, %{local: true}}]
-      wait_until(fn -> shard_message_queue_len(shard) == 0 end, 5_000)
-    end
-
-    test "local join gets a turn ahead of replicated PG backlog" do
-      name =
-        start_single_shard_group(
-          replicated_pg_receiver_buffer_size: 1,
-          replicated_pg_receiver_flush_interval: 60_000
-        )
-
-      shard = suspend_only_shard(name)
-      remote_pid = spawn_forever()
-      local_key = "fair/join/local/#{System.unique_integer([:positive])}"
-      backlog_prefix = "fair/join/backlog/#{System.unique_integer([:positive])}"
-
-      on_exit(fn ->
-        kill_if_alive(remote_pid)
-      end)
-
-      enqueue_replicated_pg_backlog(shard, backlog_prefix, remote_pid, 1_000)
-
-      caller =
-        spawn_requester(
-          fn ->
-            Group.join(name, local_key, %{local: true})
-          end,
-          :local_join_result
-        )
-
-      on_exit(fn -> kill_if_alive(caller) end)
-      Process.sleep(20)
-      :ok = :sys.resume(shard)
-
-      assert_receive {:local_join_result, ^caller, :ok}, 1_000
-      assert shard_message_queue_len(shard) > 0
-      assert Group.members(name, local_key) == [{caller, %{local: true}}]
-      wait_until(fn -> shard_message_queue_len(shard) == 0 end, 5_000)
-    end
-
-    test "local connect and disconnect each get a turn ahead of replicated PG backlog" do
-      name =
-        start_single_shard_group(
-          replicated_pg_receiver_buffer_size: 1,
-          replicated_pg_receiver_flush_interval: 60_000
-        )
-
-      shard = suspend_only_shard(name)
-      remote_pid = spawn_forever()
-      cluster = "fair/connect/#{System.unique_integer([:positive])}"
-      connect_prefix = "fair/connect/backlog/#{System.unique_integer([:positive])}"
-
-      on_exit(fn ->
-        kill_if_alive(remote_pid)
-      end)
-
-      enqueue_replicated_pg_backlog(shard, connect_prefix, remote_pid, 1_000)
-
-      connect_caller =
-        spawn_requester(
-          fn ->
-            Group.connect(name, cluster)
-          end,
-          :local_connect_result
-        )
-
-      on_exit(fn -> kill_if_alive(connect_caller) end)
-      Process.sleep(20)
-      :ok = :sys.resume(shard)
-
-      assert_receive {:local_connect_result, ^connect_caller, :ok}, 1_000
-      assert shard_message_queue_len(shard) > 0
-      assert Group.connected?(name, cluster)
-      wait_until(fn -> shard_message_queue_len(shard) == 0 end, 5_000)
-
-      :ok = :sys.suspend(shard)
-
-      disconnect_prefix = "fair/disconnect/backlog/#{System.unique_integer([:positive])}"
-
-      enqueue_replicated_pg_backlog(shard, disconnect_prefix, remote_pid, 1_000)
-
-      disconnect_caller =
-        spawn_requester(
-          fn ->
-            Group.disconnect(name, cluster)
-          end,
-          :local_disconnect_result
-        )
-
-      on_exit(fn -> kill_if_alive(disconnect_caller) end)
-      Process.sleep(20)
-      :ok = :sys.resume(shard)
-
-      assert_receive {:local_disconnect_result, ^disconnect_caller, :ok}, 1_000
-      assert shard_message_queue_len(shard) > 0
-      refute Group.connected?(name, cluster)
-      wait_until(fn -> shard_message_queue_len(shard) == 0 end, 5_000)
-    end
-
-    test "fairness preserves FIFO within the local request lane" do
-      name =
-        start_single_shard_group(
-          replicated_pg_receiver_buffer_size: 1,
-          replicated_pg_receiver_flush_interval: 60_000
-        )
-
-      shard = suspend_only_shard(name)
-      remote_pid = spawn_forever()
-      backlog_prefix = "fair/fifo/backlog/#{System.unique_integer([:positive])}"
-      key1 = "fair/fifo/local/#{System.unique_integer([:positive])}/1"
-      key2 = "fair/fifo/local/#{System.unique_integer([:positive])}/2"
-
-      on_exit(fn ->
-        kill_if_alive(remote_pid)
-      end)
-
-      enqueue_replicated_pg_backlog(shard, backlog_prefix, remote_pid, 1_000)
-
-      caller1 =
-        spawn_requester(
-          fn ->
-            Group.join(name, key1, %{order: 1})
-          end,
-          :fifo_result
-        )
-
-      Process.sleep(20)
-
-      caller2 =
-        spawn_requester(
-          fn ->
-            Group.join(name, key2, %{order: 2})
-          end,
-          :fifo_result
-        )
-
-      on_exit(fn ->
-        kill_if_alive(caller1)
-        kill_if_alive(caller2)
-      end)
-
-      Process.sleep(20)
-      :ok = :sys.resume(shard)
-
-      assert_receive {:fifo_result, ^caller1, :ok}, 1_000
-      assert_receive {:fifo_result, ^caller2, :ok}, 1_000
-      assert shard_message_queue_len(shard) > 0
-      assert Group.members(name, key1) == [{caller1, %{order: 1}}]
-      assert Group.members(name, key2) == [{caller2, %{order: 2}}]
-      wait_until(fn -> shard_message_queue_len(shard) == 0 end, 5_000)
-    end
-
-    test "configurable local fairness quota drains multiple local requests before older non-local work" do
-      name =
-        start_single_shard_group(
-          replicated_pg_receiver_buffer_size: 1,
-          replicated_pg_receiver_flush_interval: 60_000,
-          replicated_pg_receiver_local_request_quota: 2
-        )
-
-      shard = suspend_only_shard(name)
-      remote_pid = spawn_forever()
-      remote_key1 = "fair/quota/remote/#{System.unique_integer([:positive])}/1"
-      remote_key2 = "fair/quota/remote/#{System.unique_integer([:positive])}/2"
-      local_key1 = "fair/quota/local/#{System.unique_integer([:positive])}/1"
-      local_key2 = "fair/quota/local/#{System.unique_integer([:positive])}/2"
-      local_key3 = "fair/quota/local/#{System.unique_integer([:positive])}/3"
-
-      on_exit(fn ->
-        kill_if_alive(remote_pid)
-      end)
-
-      send(shard, replicated_pg_join(nil, remote_key1, remote_pid, %{remote: 1}, :join))
-      send(shard, replicated_pg_join(nil, remote_key2, remote_pid, %{remote: 2}, :join))
-      send(shard, {:group_dispatch, [self()], {:quota_marker, shard}})
-
-      caller1 =
-        spawn_requester(
-          fn ->
-            Group.join(name, local_key1, %{order: 1})
-          end,
-          :quota_result
-        )
-
-      caller2 =
-        spawn_requester(
-          fn ->
-            Group.join(name, local_key2, %{order: 2})
-          end,
-          :quota_result
-        )
-
-      caller3 =
-        spawn_requester(
-          fn ->
-            Group.join(name, local_key3, %{order: 3})
-          end,
-          :quota_result
-        )
-
-      on_exit(fn ->
-        kill_if_alive(caller1)
-        kill_if_alive(caller2)
-        kill_if_alive(caller3)
-      end)
-
-      wait_until(fn -> shard_message_queue_len(shard) >= 6 end, 1_000)
-      :ok = :sys.resume(shard)
-
-      assert_receive {:quota_result, ^caller1, :ok}, 1_000
-      assert_receive {:quota_result, ^caller2, :ok}, 1_000
-      assert_receive {:quota_result, ^caller3, :ok}, 1_000
-      assert_receive {:quota_marker, ^shard}, 1_000
-
-      assert Group.members(name, remote_key1) == [{remote_pid, %{remote: 1}}]
-      assert Group.members(name, remote_key2) == [{remote_pid, %{remote: 2}}]
-      assert Group.members(name, local_key1) == [{caller1, %{order: 1}}]
-      assert Group.members(name, local_key2) == [{caller2, %{order: 2}}]
-      assert Group.members(name, local_key3) == [{caller3, %{order: 3}}]
+      # The assertion has already proved bounded yielding. Drop the synthetic
+      # duplicate-control tail instead of charging every PR for draining it.
+      old_shard = Process.whereis(shard)
+      Process.exit(old_shard, :kill)
+      wait_until(fn -> is_pid(Process.whereis(shard)) and Process.whereis(shard) != old_shard end)
     end
 
     test "local PG batching applies mixed join and leave requests correctly" do
@@ -2421,509 +2277,41 @@ defmodule GroupTest do
   end
 
   describe "replicated PG receiver buffering" do
-    test "flushes buffered replicated joins when buffer size is reached" do
-      name =
-        start_single_shard_group(
-          replicated_pg_receiver_buffer_size: 2,
-          replicated_pg_receiver_flush_interval: 60_000
-        )
-
+    test "legacy unsequenced ingress cannot materialize or delete rows" do
+      name = start_single_shard_group()
       shard = Group.Replica.shard_name(name, 0)
-      key1 = "replicated/size/#{System.unique_integer([:positive])}/1"
-      key2 = "replicated/size/#{System.unique_integer([:positive])}/2"
-      pid1 = spawn_forever()
-      pid2 = spawn_forever()
+      registry_key = "legacy-ingress/registry/#{System.unique_integer([:positive])}"
+      pg_key = "legacy-ingress/pg/#{System.unique_integer([:positive])}"
+      cluster_state_key = "legacy-ingress/cluster-state/#{System.unique_integer([:positive])}"
+      retained_key = "legacy-ingress/retained/#{System.unique_integer([:positive])}"
+      owner = spawn_forever()
 
-      on_exit(fn ->
-        kill_if_alive(pid1)
-        kill_if_alive(pid2)
-      end)
+      on_exit(fn -> kill_if_alive(owner) end)
 
-      :ok = Group.monitor(name, :all)
+      send(shard, replicated_register(nil, registry_key, owner, %{legacy: true}, :register))
+      send(shard, replicated_pg_join(nil, pg_key, owner, %{legacy: true}, :join))
+      send(shard, {:cluster_state, nil, [{cluster_state_key, owner, %{}, 1}], []})
 
-      send(shard, replicated_pg_join(nil, key1, pid1, %{v: 1}, :join))
+      :ok = Group.register(name, retained_key, %{retained: true})
 
-      assert Group.members(name, key1) == []
-      refute_receive {:group, _events, _info}, 50
+      # Pre-AE cluster lifecycle messages were unsequenced and unfenced. A
+      # delayed copy must not purge current rows while leaving their stream
+      # cursor advanced.
+      send(shard, {:cluster_disconnect, [nil], self()})
 
-      send(shard, replicated_pg_join(nil, key2, pid2, %{v: 2}, :join))
+      send(
+        shard,
+        {:replicate_process_down_batch,
+         [{self(), nil, retained_key, %{retained: true}, :legacy_delete}], []}
+      )
 
-      assert_receive {:group, events, _}, 1000
-      assert Enum.map(events, & &1.key) == [key1, key2]
-      assert Enum.map(events, & &1.type) == [:joined, :joined]
-      assert Group.members(name, key1) == [{pid1, %{v: 1}}]
-      assert Group.members(name, key2) == [{pid2, %{v: 2}}]
-    end
+      _state = :sys.get_state(shard)
 
-    test "barrier messages flush buffered replicated ops in order" do
-      name =
-        start_single_shard_group(
-          replicated_pg_receiver_buffer_size: 32,
-          replicated_pg_receiver_flush_interval: 60_000
-        )
-
-      shard = Group.Replica.shard_name(name, 0)
-      key = "replicated/barrier/#{System.unique_integer([:positive])}"
-      pid = spawn_forever()
-
-      on_exit(fn -> kill_if_alive(pid) end)
-
-      :ok = Group.monitor(name, :all)
-
-      send(shard, replicated_pg_join(nil, key, pid, %{v: 1}, :join))
-      send(shard, replicated_pg_join(nil, key, pid, %{v: 2}, :update))
-      send(shard, replicated_pg_leave(nil, key, pid, %{v: 2}, :leave))
-
-      assert Group.members(name, key) == []
-      flush_replicated_pg_barrier(shard)
-
-      assert_receive {:group, events, _}, 1000
-
-      assert [
-               %Group.Event{
-                 type: :joined,
-                 key: ^key,
-                 pid: ^pid,
-                 meta: %{v: 1},
-                 previous_meta: nil
-               },
-               %Group.Event{
-                 type: :joined,
-                 key: ^key,
-                 pid: ^pid,
-                 meta: %{v: 2},
-                 previous_meta: %{v: 1}
-               },
-               %Group.Event{type: :left, key: ^key, pid: ^pid, meta: %{v: 2}, reason: :leave}
-             ] = events
-
-      assert_receive {:replicated_pg_buffer_flushed, ^shard}, 1000
-      assert Group.members(name, key) == []
-    end
-
-    test "batchable traffic can flush an overdue buffer without relying on the timer" do
-      name =
-        start_single_shard_group(
-          replicated_pg_receiver_buffer_size: 32,
-          replicated_pg_receiver_flush_interval: 1_000
-        )
-
-      shard = Group.Replica.shard_name(name, 0)
-      key1 = "replicated/due/#{System.unique_integer([:positive])}/1"
-      key2 = "replicated/due/#{System.unique_integer([:positive])}/2"
-      pid1 = spawn_forever()
-      pid2 = spawn_forever()
-
-      on_exit(fn ->
-        kill_if_alive(pid1)
-        kill_if_alive(pid2)
-      end)
-
-      :ok = Group.monitor(name, :all)
-
-      send(shard, replicated_pg_join(nil, key1, pid1, %{v: 1}, :join))
-      Process.sleep(10)
-
-      :sys.replace_state(shard, fn state ->
-        %{
-          state
-          | pending_replicated_pg_started_at: System.monotonic_time(:millisecond) - 5_000,
-            pending_replicated_pg_flush_ref: nil
-        }
-      end)
-
-      send(shard, replicated_pg_join(nil, key2, pid2, %{v: 2}, :join))
-
-      assert_receive {:group, events, _}, 1000
-      assert Enum.map(events, & &1.key) == [key1, key2]
-
-      state = :sys.get_state(shard)
-      assert state.pending_replicated_pg_len == 0
-      assert Group.members(name, key1) == [{pid1, %{v: 1}}]
-      assert Group.members(name, key2) == [{pid2, %{v: 2}}]
-    end
-
-    test "terminate flushes buffered replicated ops before shard restart" do
-      name =
-        start_single_shard_group(
-          replicated_pg_receiver_buffer_size: 32,
-          replicated_pg_receiver_flush_interval: 60_000
-        )
-
-      shard = Group.Replica.shard_name(name, 0)
-      shard_pid = Process.whereis(shard)
-      key = "replicated/terminate/#{System.unique_integer([:positive])}"
-      pid = spawn_forever()
-
-      on_exit(fn -> kill_if_alive(pid) end)
-
-      :ok = Group.monitor(name, :all)
-
-      send(shard, replicated_pg_join(nil, key, pid, %{v: 1}, :join))
-      assert Group.members(name, key) == []
-
-      ref = Process.monitor(shard_pid)
-      :ok = GenServer.stop(shard_pid, :shutdown)
-      assert_receive {:DOWN, ^ref, :process, ^shard_pid, :shutdown}, 1000
-      assert_receive {:group, [%Group.Event{type: :joined, key: ^key, pid: ^pid}], _}, 1000
-
-      wait_until(fn ->
-        case Process.whereis(shard) do
-          nil -> false
-          new_pid -> new_pid != shard_pid
-        end
-      end)
-
-      assert Group.members(name, key) == [{pid, %{v: 1}}]
-    end
-  end
-
-  describe "replicated registry receiver buffering" do
-    test "barrier messages flush buffered replicated register and unregister ops in order" do
-      name =
-        start_single_shard_group(
-          replicated_registry_receiver_buffer_size: 32,
-          replicated_registry_receiver_flush_interval: 60_000
-        )
-
-      shard = Group.Replica.shard_name(name, 0)
-      key = "replicated-registry/barrier/#{System.unique_integer([:positive])}"
-      pid = spawn_forever()
-      time1 = System.system_time()
-      time2 = time1 + 1
-
-      on_exit(fn -> kill_if_alive(pid) end)
-
-      :ok = Group.monitor(name, :all)
-
-      send(shard, replicated_register(nil, key, pid, %{v: 1}, :register, time1))
-      send(shard, replicated_register(nil, key, pid, %{v: 2}, :update, time2))
-      send(shard, replicated_unregister(nil, key, pid, %{v: 2}, :unregister))
-
-      assert Group.lookup(name, key) == nil
-      flush_replicated_registry_barrier(shard)
-
-      assert_receive {:group, events, _}, 1_000
-
-      assert [
-               %Group.Event{
-                 type: :registered,
-                 key: ^key,
-                 pid: ^pid,
-                 meta: %{v: 1},
-                 previous_meta: nil
-               },
-               %Group.Event{
-                 type: :registered,
-                 key: ^key,
-                 pid: ^pid,
-                 meta: %{v: 2},
-                 previous_meta: %{v: 1}
-               },
-               %Group.Event{
-                 type: :unregistered,
-                 key: ^key,
-                 pid: ^pid,
-                 meta: %{v: 2},
-                 reason: :unregister
-               }
-             ] = events
-
-      assert_receive {:replicated_registry_buffer_flushed, ^shard}, 1_000
-      assert Group.lookup(name, key) == nil
-    end
-
-    test "batchable registry traffic can flush an overdue buffer without relying on the timer" do
-      name =
-        start_single_shard_group(
-          replicated_registry_receiver_buffer_size: 32,
-          replicated_registry_receiver_flush_interval: 1_000
-        )
-
-      shard = Group.Replica.shard_name(name, 0)
-      key1 = "replicated-registry/due/#{System.unique_integer([:positive])}/1"
-      key2 = "replicated-registry/due/#{System.unique_integer([:positive])}/2"
-      pid1 = spawn_forever()
-      pid2 = spawn_forever()
-
-      on_exit(fn ->
-        kill_if_alive(pid1)
-        kill_if_alive(pid2)
-      end)
-
-      :ok = Group.monitor(name, :all)
-
-      send(shard, replicated_register(nil, key1, pid1, %{v: 1}, :register))
-      Process.sleep(10)
-
-      :sys.replace_state(shard, fn state ->
-        %{
-          state
-          | pending_replicated_registry_started_at: System.monotonic_time(:millisecond) - 5_000,
-            pending_replicated_registry_flush_ref: nil
-        }
-      end)
-
-      send(shard, replicated_register(nil, key2, pid2, %{v: 2}, :register))
-
-      assert_receive {:group, events, _}, 1_000
-      assert Enum.map(events, & &1.key) == [key1, key2]
-
-      state = :sys.get_state(shard)
-      assert state.pending_replicated_registry_len == 0
-      assert Group.lookup(name, key1) == {pid1, %{v: 1}}
-      assert Group.lookup(name, key2) == {pid2, %{v: 2}}
-    end
-
-    test "restart purges a flushed legacy registry row that has no authoritative claim" do
-      name =
-        start_single_shard_group(
-          replicated_registry_receiver_buffer_size: 32,
-          replicated_registry_receiver_flush_interval: 60_000
-        )
-
-      shard = Group.Replica.shard_name(name, 0)
-      shard_pid = Process.whereis(shard)
-      key = "replicated-registry/terminate/#{System.unique_integer([:positive])}"
-      pid = spawn_forever()
-
-      on_exit(fn -> kill_if_alive(pid) end)
-
-      :ok = Group.monitor(name, :all)
-
-      send(shard, replicated_register(nil, key, pid, %{v: 1}, :register))
-      assert Group.lookup(name, key) == nil
-
-      ref = Process.monitor(shard_pid)
-      :ok = GenServer.stop(shard_pid, :shutdown)
-      assert_receive {:DOWN, ^ref, :process, ^shard_pid, :shutdown}, 1_000
-      assert_receive {:group, [%Group.Event{type: :registered, key: ^key, pid: ^pid}], _}, 1_000
-
-      wait_until(fn ->
-        case Process.whereis(shard) do
-          nil -> false
-          new_pid -> new_pid != shard_pid
-        end
-      end)
-
-      assert Group.lookup(name, key) == nil
+      assert Group.lookup(name, registry_key) == nil
+      assert Group.members(name, pg_key) == []
+      assert Group.lookup(name, cluster_state_key) == nil
+      assert Group.lookup(name, retained_key) == {self(), %{retained: true}}
       assert :ok = Group.TestCluster.assert_replica_consistent(name)
-    end
-
-    test "replaces stale remote registry owner and clears the old by-pid entry" do
-      name =
-        start_single_shard_group(
-          replicated_registry_receiver_buffer_size: 32,
-          replicated_registry_receiver_flush_interval: 60_000
-        )
-
-      shard = Group.Replica.shard_name(name, 0)
-      key = "replicated-registry/replace/#{System.unique_integer([:positive])}"
-      old_pid = spawn_forever()
-      new_pid = spawn_forever()
-      time1 = System.system_time()
-      time2 = time1 + 1
-
-      on_exit(fn ->
-        kill_if_alive(old_pid)
-        kill_if_alive(new_pid)
-      end)
-
-      Group.Replica.Data.registry_insert(
-        name,
-        0,
-        nil,
-        key,
-        old_pid,
-        %{v: 1},
-        time1,
-        :"remote_a@127.0.0.1"
-      )
-
-      send(shard, replicated_register(nil, key, new_pid, %{v: 2}, :register, time2))
-      flush_replicated_registry_barrier(shard)
-
-      assert_receive {:replicated_registry_buffer_flushed, ^shard}, 1_000
-      assert Group.lookup(name, key) == {new_pid, %{v: 2}}
-      assert Group.Replica.Data.registry_lookup_by_pid(name, 0, old_pid) == []
-
-      assert [{nil, ^key, %{v: 2}, ^time2, _entry_node}] =
-               Group.Replica.Data.registry_lookup_by_pid(name, 0, new_pid)
-    end
-
-    test "custom conflict resolver selects winner and Group terminates only the local loser" do
-      key = "replicated-registry/custom-loser/#{System.unique_integer([:positive])}"
-
-      name =
-        start_single_shard_group(
-          replicated_registry_receiver_buffer_size: 1,
-          resolve_registry_conflict: {GroupTest.ResolveRegistryConflict, :pick, [:remote]}
-        )
-
-      parent = self()
-
-      local_owner =
-        spawn(fn ->
-          :ok = Group.register(name, key, %{owner: :local})
-          send(parent, {:custom_conflict_owner_ready, self()})
-          Process.sleep(:infinity)
-        end)
-
-      remote_pid = spawn_forever()
-
-      on_exit(fn ->
-        kill_if_alive(local_owner)
-        kill_if_alive(remote_pid)
-      end)
-
-      assert_receive {:custom_conflict_owner_ready, ^local_owner}, 1_000
-      owner_ref = Process.monitor(local_owner)
-      shard = Group.Replica.shard_name(name, 0)
-
-      send(
-        shard,
-        replicated_register(
-          nil,
-          key,
-          remote_pid,
-          %{owner: :remote},
-          :register,
-          System.system_time()
-        )
-      )
-
-      wait_until(fn ->
-        Group.lookup(name, key) == {remote_pid, %{owner: :remote}}
-      end)
-
-      assert_receive {:DOWN, ^owner_ref, :process, ^local_owner,
-                      {:group_registry_conflict, ^key, %{owner: :remote}}},
-                     1_000
-    end
-
-    test "batched remote conflict keeps the staged local winner when later unregister arrives" do
-      key = "replicated-registry/conflict-local/#{System.unique_integer([:positive])}"
-
-      name =
-        start_single_shard_group(
-          replicated_registry_receiver_buffer_size: 32,
-          replicated_registry_receiver_flush_interval: 60_000,
-          resolve_registry_conflict: {GroupTest.ResolveRegistryConflict, :pick, [:local]}
-        )
-
-      parent = self()
-
-      local_owner =
-        spawn(fn ->
-          :ok = Group.register(name, key, %{owner: :local})
-          send(parent, {:local_registry_owner_ready, self()})
-          Process.sleep(:infinity)
-        end)
-
-      remote_pid = spawn_forever()
-
-      on_exit(fn ->
-        kill_if_alive(local_owner)
-        kill_if_alive(remote_pid)
-      end)
-
-      assert_receive {:local_registry_owner_ready, ^local_owner}, 1_000
-      assert Group.lookup(name, key) == {local_owner, %{owner: :local}}
-
-      :ok = Group.monitor(name, :all)
-      shard = Group.Replica.shard_name(name, 0)
-
-      send(
-        shard,
-        replicated_register(
-          nil,
-          key,
-          remote_pid,
-          %{owner: :remote},
-          :register,
-          System.system_time()
-        )
-      )
-
-      send(shard, replicated_unregister(nil, key, remote_pid, %{owner: :remote}, :unregister))
-      flush_replicated_registry_barrier(shard)
-
-      assert_receive {:replicated_registry_buffer_flushed, ^shard}, 1_000
-      refute_receive {:group, _events, _info}, 50
-      assert Group.lookup(name, key) == {local_owner, %{owner: :local}}
-      assert Group.Replica.Data.registry_lookup_by_pid(name, 0, remote_pid) == []
-    end
-
-    test "batched remote conflict removes the staged remote winner when later unregister arrives" do
-      key = "replicated-registry/conflict-remote/#{System.unique_integer([:positive])}"
-
-      name =
-        start_single_shard_group(
-          replicated_registry_receiver_buffer_size: 32,
-          replicated_registry_receiver_flush_interval: 60_000,
-          resolve_registry_conflict: {GroupTest.ResolveRegistryConflict, :pick, [:remote]}
-        )
-
-      parent = self()
-
-      local_owner =
-        spawn(fn ->
-          :ok = Group.register(name, key, %{owner: :local})
-          send(parent, {:remote_registry_owner_ready, self()})
-          Process.sleep(:infinity)
-        end)
-
-      remote_pid = spawn_forever()
-
-      on_exit(fn ->
-        kill_if_alive(local_owner)
-        kill_if_alive(remote_pid)
-      end)
-
-      assert_receive {:remote_registry_owner_ready, ^local_owner}, 1_000
-      assert Group.lookup(name, key) == {local_owner, %{owner: :local}}
-
-      :ok = Group.monitor(name, :all)
-      shard = Group.Replica.shard_name(name, 0)
-
-      send(
-        shard,
-        replicated_register(
-          nil,
-          key,
-          remote_pid,
-          %{owner: :remote},
-          :register,
-          System.system_time()
-        )
-      )
-
-      send(shard, replicated_unregister(nil, key, remote_pid, %{owner: :remote}, :unregister))
-      flush_replicated_registry_barrier(shard)
-
-      assert_receive {:group, events, _}, 1_000
-
-      assert [
-               %Group.Event{
-                 type: :unregistered,
-                 key: ^key,
-                 pid: ^local_owner,
-                 meta: %{owner: :local},
-                 reason: :resolve_conflict
-               },
-               %Group.Event{
-                 type: :unregistered,
-                 key: ^key,
-                 pid: ^remote_pid,
-                 meta: %{owner: :remote},
-                 reason: :unregister
-               }
-             ] = events
-
-      assert_receive {:replicated_registry_buffer_flushed, ^shard}, 1_000
-      assert Group.lookup(name, key) == nil
-      assert Group.Replica.Data.registry_lookup_by_pid(name, 0, local_owner) == []
-      assert Group.Replica.Data.registry_lookup_by_pid(name, 0, remote_pid) == []
     end
   end
 
@@ -3157,16 +2545,17 @@ defmodule GroupTest do
 
       stream_id = Group.Replica.Data.local_stream_id(name, 0, cluster)
       old_epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
+      old_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+      :ok = :sys.suspend(old_shard)
 
       # Group.disconnect/3 closes authority and routing before its request
-      # reaches every shard. Model a shard kill in that exact window.
+      # reaches every shard. Hold the durable cleanup message in the shard's
+      # mailbox, then model a kill in that exact window.
       assert [{^cluster, ^old_epoch}] =
                Group.Replica.Data.deactivate_local_clusters(name, [cluster])
 
-      :ok = Group.Replica.Data.remove_cluster_node(name, [cluster], node())
       assert Group.Replica.Data.closed_local_clusters(name) == [cluster]
 
-      old_shard = Process.whereis(Group.Replica.shard_name(name, 0))
       Process.exit(old_shard, :kill)
 
       Group.TestCluster.assert_eventually(fn ->
@@ -3182,9 +2571,326 @@ defmodule GroupTest do
       assert :ets.lookup(Group.Replica.Data.replica_stream_meta_table(name, 0), stream_id) == []
       assert :ok = Group.TestCluster.assert_replica_consistent(name)
     end
+
+    test "the last close acknowledgement atomically removes all cluster routing" do
+      name = start_single_shard_group()
+      cluster = "close/terminal-ack/#{System.unique_integer([:positive])}"
+      remote_route = :"close-terminal-ack@remote"
+
+      :ok = Group.connect(name, cluster)
+      :ok = Group.Replica.Data.add_cluster_node(name, [cluster], remote_route)
+
+      shard = Process.whereis(Group.Replica.shard_name(name, 0))
+      :ok = :sys.suspend(shard)
+
+      on_exit(fn -> Group.TestCluster.resume_if_alive(shard) end)
+
+      # Model the durable deactivation caller and the final shard both dying
+      # immediately after the final acknowledgement. Once the close marker is
+      # gone there is no later recovery hook, so routing must already be gone.
+      assert [{^cluster, epoch}] =
+               Group.Replica.Data.deactivate_local_clusters_durable(name, [cluster])
+
+      assert is_reference(epoch)
+
+      assert [] =
+               Group.Replica.Data.mark_closed_cluster_shard(name, [{cluster, make_ref()}], 0)
+
+      assert Group.Replica.Data.closed_local_clusters(name) == [cluster]
+
+      assert [^cluster] =
+               Group.Replica.Data.mark_closed_cluster_shard(name, [{cluster, epoch}], 0)
+
+      assert Group.Replica.Data.closed_local_clusters(name) == []
+      assert Group.Replica.Data.cluster_nodes(name, cluster) == []
+      assert Group.Replica.Data.clusters_for_node(name, remote_route) == []
+    end
+
+    test "delayed restart cleanup cannot remove a reactivated cluster's routes" do
+      name = start_single_shard_group()
+      cluster = "close/reactivated-cleanup/#{System.unique_integer([:positive])}"
+      remote_route = :"close-reactivated-cleanup@remote"
+
+      :ok = Group.connect(name, cluster)
+      :ok = Group.Replica.Data.add_cluster_node(name, [cluster], remote_route)
+
+      # Model repair_primary_replica_rows/2 observing this cluster while it was
+      # inactive, followed by a concurrent reconnect completing before repair's
+      # serialized routing cleanup runs.
+      :ok = Group.Replica.Data.remove_clusters(name, [cluster])
+
+      assert Enum.sort(Group.Replica.Data.cluster_nodes(name, cluster)) ==
+               Enum.sort([node(), remote_route])
+
+      assert cluster in Group.Replica.Data.clusters_for_node(name, node())
+      assert cluster in Group.Replica.Data.clusters_for_node(name, remote_route)
+    end
+
+    test "the last expired replica lane atomically removes peer routing" do
+      name = start_single_shard_group()
+      remote_node = :"terminal-peer-retirement@remote"
+      generation = Group.Replica.WireProtocol.new_generation()
+
+      assert {nil, []} =
+               Group.Replica.Data.put_remote_replica_info(
+                 name,
+                 0,
+                 remote_node,
+                 generation,
+                 0,
+                 [{nil, generation}]
+               )
+
+      :ok =
+        Group.Replica.Data.put_remote_view_info(
+          name,
+          0,
+          remote_node,
+          generation,
+          0,
+          0
+        )
+
+      assert remote_node in Group.Replica.Data.cluster_nodes(name, nil)
+      assert [nil] = Group.Replica.Data.clusters_for_node(name, remote_node)
+
+      # Once this call removes the last persisted lane view, no shard restart
+      # can reconstruct an expiry obligation for the peer. Its routing must be
+      # gone before the terminal retirement is acknowledged.
+      assert :node_retired =
+               Group.Replica.Data.expire_remote_replica_lane(name, 0, remote_node)
+
+      assert Group.Replica.Data.cluster_nodes(name, nil) |> Enum.member?(remote_node) == false
+      assert Group.Replica.Data.clusters_for_node(name, remote_node) == []
+      assert Group.Replica.Data.remote_generation(name, remote_node) == nil
+    end
+
+    test "nodedown removes a retired peer's pending authority repair" do
+      name = start_single_shard_group()
+      remote_node = :"retired-authority-repair@remote"
+      shard = Group.Replica.shard_name(name, 0)
+
+      send(shard, {:replica_authority_dirty_local, remote_node})
+
+      assert %{cluster_control_dirty: %{^remote_node => _timestamp}} = :sys.get_state(shard)
+
+      send(shard, {:nodedown, remote_node})
+
+      refute Map.has_key?(:sys.get_state(shard).cluster_control_dirty, remote_node)
+    end
+
+    test "delayed peer cleanup cannot remove a rediscovered generation's routes" do
+      name = start_single_shard_group()
+      remote_node = :"rediscovered-peer-route@remote"
+      old_generation = Group.Replica.WireProtocol.new_generation()
+
+      assert {nil, []} =
+               Group.Replica.Data.put_remote_replica_info(
+                 name,
+                 0,
+                 remote_node,
+                 old_generation,
+                 0,
+                 [{nil, old_generation}]
+               )
+
+      :ok =
+        Group.Replica.Data.put_remote_view_info(
+          name,
+          0,
+          remote_node,
+          old_generation,
+          0,
+          0
+        )
+
+      assert :node_retired =
+               Group.Replica.Data.expire_remote_replica_lane(name, 0, remote_node)
+
+      new_generation = Group.Replica.WireProtocol.new_generation()
+
+      assert {nil, []} =
+               Group.Replica.Data.put_remote_replica_info(
+                 name,
+                 0,
+                 remote_node,
+                 new_generation,
+                 0,
+                 [{nil, new_generation}]
+               )
+
+      # Model the old expiry/nodedown caller resuming only after rediscovery.
+      :ok = Group.Replica.Data.purge_cluster_node(name, remote_node)
+
+      assert remote_node in Group.Replica.Data.cluster_nodes(name, nil)
+      assert [nil] = Group.Replica.Data.clusters_for_node(name, remote_node)
+      assert Group.Replica.Data.remote_generation(name, remote_node) == new_generation
+    end
+
+    test "a lane restart reconstructs retirement from a persisted authority hint" do
+      name = :"group_hint_restart_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {Group,
+         name: name,
+         shards: 2,
+         log: false,
+         replicated_anti_entropy_interval: 25,
+         replicated_peer_lease_timeout: 150}
+      )
+
+      remote_node = :"hint-restart-retirement@remote"
+      old_generation = Group.Replica.WireProtocol.new_generation()
+
+      assert {nil, []} =
+               Group.Replica.Data.put_remote_replica_info(
+                 name,
+                 0,
+                 remote_node,
+                 old_generation,
+                 0,
+                 [{nil, old_generation}]
+               )
+
+      generation = Group.Replica.WireProtocol.new_generation()
+
+      assert Group.Replica.Data.observe_remote_replica_hint(
+               name,
+               remote_node,
+               generation,
+               0
+             )
+
+      old_lane = Process.whereis(Group.Replica.shard_name(name, 1))
+      monitor = Process.monitor(old_lane)
+      Process.exit(old_lane, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^old_lane, :killed}, 5_000
+
+      wait_until(fn ->
+        case Process.whereis(Group.Replica.shard_name(name, 1)) do
+          pid when is_pid(pid) -> pid != old_lane
+          _ -> false
+        end
+      end)
+
+      wait_until(
+        fn ->
+          Group.Replica.Data.remote_replica_authority_hint(name, remote_node) == nil
+        end,
+        2_000
+      )
+
+      refute Map.has_key?(
+               :sys.get_state(Group.Replica.shard_name(name, 1)).peer_last_seen,
+               remote_node
+             )
+    end
   end
 
   describe "replica authority snapshots" do
+    test "a raced authority hint prevents a partial incremental view install", %{name: name} do
+      remote_node = :"incremental-authority-race@remote"
+      generation = Group.Replica.WireProtocol.new_generation()
+      cluster = "incremental-authority-race/cluster"
+      epoch = make_ref()
+
+      assert {nil, []} =
+               Group.Replica.Data.put_remote_replica_info(
+                 name,
+                 0,
+                 remote_node,
+                 generation,
+                 0,
+                 [{nil, generation}]
+               )
+
+      :ok =
+        Group.Replica.Data.put_remote_view_info(
+          name,
+          0,
+          remote_node,
+          generation,
+          0,
+          0
+        )
+
+      assert Group.Replica.Data.observe_remote_replica_hint(
+               name,
+               remote_node,
+               generation,
+               2
+             )
+
+      assert :stale =
+               Group.Replica.Data.put_remote_cluster_epochs(
+                 name,
+                 0,
+                 remote_node,
+                 generation,
+                 0,
+                 1,
+                 [{cluster, epoch}]
+               )
+
+      assert Group.Replica.Data.remote_cluster_epoch(name, remote_node, cluster) == nil
+
+      assert :stale =
+               Group.Replica.Data.put_remote_view_info(
+                 name,
+                 0,
+                 remote_node,
+                 generation,
+                 0,
+                 2
+               )
+
+      refute Group.Replica.Data.remote_registry_claim_authoritative?(
+               name,
+               0,
+               remote_node,
+               generation,
+               nil,
+               generation
+             )
+    end
+
+    test "a newer-generation hint atomically rejects an old lane view", %{name: name} do
+      remote_node = :"lane-view-generation-race@remote"
+      old_generation = Group.Replica.WireProtocol.new_generation()
+
+      assert {nil, []} =
+               Group.Replica.Data.put_remote_replica_info(
+                 name,
+                 0,
+                 remote_node,
+                 old_generation,
+                 0,
+                 [{nil, old_generation}]
+               )
+
+      new_generation = Group.Replica.WireProtocol.new_generation()
+      assert Group.Replica.WireProtocol.generation_newer?(new_generation, old_generation)
+
+      assert Group.Replica.Data.observe_remote_replica_hint(
+               name,
+               remote_node,
+               new_generation,
+               0
+             )
+
+      assert :stale =
+               Group.Replica.Data.put_remote_view_info(
+                 name,
+                 1,
+                 remote_node,
+                 old_generation,
+                 0,
+                 0
+               )
+
+      assert Group.Replica.Data.remote_view_generation(name, 1, remote_node) == nil
+    end
+
     test "revision and epoch rows remain coherent during concurrent activation", %{name: name} do
       clusters = for i <- 1..1_000, do: "authority/#{i}"
 
@@ -3255,32 +2961,8 @@ defmodule GroupTest do
      [{:join, cluster, key, pid, meta, System.system_time(), reason, node(pid)}]}
   end
 
-  defp replicated_pg_leave(cluster, key, pid, meta, reason) do
-    {:replicate_pg_batch, [{:leave, cluster, key, pid, meta, reason}]}
-  end
-
   defp replicated_register(cluster, key, pid, meta, _reason, time \\ System.system_time()) do
     {:replicate_registry_batch, [{:register, cluster, key, pid, meta, time, node(pid)}]}
-  end
-
-  defp replicated_unregister(cluster, key, pid, meta, reason) do
-    {:replicate_registry_batch, [{:unregister, cluster, key, pid, meta, reason}]}
-  end
-
-  defp enqueue_replicated_pg_backlog(shard, key_prefix, pid, count) do
-    for i <- 1..count do
-      send(shard, replicated_pg_join(nil, "#{key_prefix}/#{i}", pid, %{}, :join))
-    end
-
-    :ok
-  end
-
-  defp enqueue_replicated_registry_backlog(shard, key_prefix, pid, count) do
-    for i <- 1..count do
-      send(shard, replicated_register(nil, "#{key_prefix}/#{i}", pid, %{seq: i}, :register))
-    end
-
-    :ok
   end
 
   defp spawn_requester(fun, tag) do
@@ -3298,10 +2980,6 @@ defmodule GroupTest do
       {:message_queue_len, len} -> len
       nil -> 0
     end
-  end
-
-  defp flush_replicated_pg_barrier(shard) do
-    send(shard, {:group_dispatch, [self()], {:replicated_pg_buffer_flushed, shard}})
   end
 
   defp flush_replicated_registry_barrier(shard) do
@@ -3330,6 +3008,28 @@ defmodule GroupTest do
 
   defp spawn_forever do
     spawn(fn -> Process.sleep(:infinity) end)
+  end
+
+  defp replica_ingress_fairness_owner(parent) do
+    receive do
+      {:write, shard, request} ->
+        ref = make_ref()
+        send(shard, {:group_local_request, self(), ref, request})
+        {reply, calls} = receive_local_write_with_trace(shard, ref, 0)
+        send(parent, {:local_write_finished, self(), reply, calls})
+        Process.sleep(:infinity)
+    end
+  end
+
+  defp receive_local_write_with_trace(shard, ref, calls) do
+    receive do
+      {:trace, ^shard, :call,
+       {Group.Replica, :handle_replica_message, [_state, _source_node, _message]}} ->
+        receive_local_write_with_trace(shard, ref, calls + 1)
+
+      {:group_local_reply, ^ref, reply} ->
+        {reply, calls}
+    end
   end
 
   defp kill_if_alive(pid) do

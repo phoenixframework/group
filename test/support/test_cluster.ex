@@ -60,11 +60,57 @@ defmodule Group.TestCluster do
     :ok
   end
 
+  @doc false
+  def expire_replica_lane(name, shard, remote_node) do
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+    now = System.monotonic_time(:millisecond)
+
+    :sys.replace_state(replica, fn state ->
+      expired_at = now - state.replicated_peer_lease_timeout - 1
+      %{state | peer_last_seen: Map.put(state.peer_last_seen, remote_node, expired_at)}
+    end)
+
+    state = :sys.get_state(replica)
+    send(replica, {:group_replica_anti_entropy, state.anti_entropy_ref})
+    _state = :sys.get_state(replica)
+    :ok
+  end
+
+  @doc false
+  def put_pending_registry_reprojection(replica, remote_node, cluster, key) do
+    :sys.replace_state(replica, fn state ->
+      pending =
+        Map.update(
+          state.pending_registry_reprojections,
+          remote_node,
+          MapSet.new([{cluster, key}]),
+          &MapSet.put(&1, {cluster, key})
+        )
+
+      %{state | pending_registry_reprojections: pending}
+    end)
+
+    :ok
+  end
+
   @doc "Call a function on a remote node, raise on badrpc"
   def rpc!(node, mod, fun, args) do
     case :rpc.call(node, mod, fun, args) do
       {:badrpc, reason} -> raise "RPC to #{node} failed: #{inspect(reason)}"
       result -> result
+    end
+  end
+
+  @doc false
+  def spawn_trace_forwarder(node, target_pid) do
+    :erpc.call(node, fn -> spawn(fn -> forward_trace_messages(target_pid) end) end)
+  end
+
+  defp forward_trace_messages(target_pid) do
+    receive do
+      message ->
+        send(target_pid, {:forwarded_trace, message})
+        forward_trace_messages(target_pid)
     end
   end
 
@@ -175,14 +221,14 @@ defmodule Group.TestCluster do
 
   @doc "Spawn a process on a remote node that registers, joins, and sleeps forever.
   Waits for both operations to complete before returning."
-  def spawn_register_and_join(node, name, reg_key, reg_meta, join_key, join_meta) do
+  def spawn_register_and_join(node, name, reg_key, reg_meta, join_key, join_meta, opts \\ []) do
     :erpc.call(node, fn ->
       parent = self()
 
       pid =
         spawn(fn ->
-          :ok = Group.register(name, reg_key, reg_meta)
-          :ok = Group.join(name, join_key, join_meta)
+          :ok = Group.register(name, reg_key, reg_meta, opts)
+          :ok = Group.join(name, join_key, join_meta, opts)
           send(parent, {:ready, self()})
           Process.sleep(:infinity)
         end)
@@ -730,13 +776,47 @@ defmodule Group.TestCluster do
     num_shards = Group.get_config(name).num_shards
 
     for shard <- 0..(num_shards - 1) do
+      assert_rows_on_matching_shard(name, shard, num_shards)
       assert_registry_claim_indexes(name, shard)
       assert_registry_projection_has_authority(name, shard)
+      assert_registry_claim_authority(name, shard)
+      assert_pg_row_authority(name, shard)
       assert_oplog_indexes(name, shard)
       assert_replica_cursor_authority(name, shard)
     end
 
     :ok
+  end
+
+  defp assert_rows_on_matching_shard(name, shard, num_shards) do
+    checks = [
+      {Group.Replica.Data.reg_by_key_table(name, shard),
+       fn
+         {{cluster, key}, _pid, _meta, _time, _origin} -> {cluster, key}
+       end},
+      {Group.Replica.Data.reg_claim_by_key_table(name, shard),
+       fn
+         {{cluster, key, _origin, _generation, _epoch}, _pid, _meta, _time, _seq} ->
+           {cluster, key}
+       end},
+      {Group.Replica.Data.pg_by_key_table(name, shard),
+       fn
+         {{cluster, key, _pid}, _meta, _time, _origin} -> {cluster, key}
+       end}
+    ]
+
+    Enum.each(checks, fn {table, key_fun} ->
+      case Enum.find(:ets.tab2list(table), fn row ->
+             {cluster, key} = key_fun.(row)
+             Group.Replica.shard_index_for(cluster, key, num_shards) != shard
+           end) do
+        nil ->
+          :ok
+
+        row ->
+          raise "row stored on wrong shard in #{name} shard #{shard}: #{inspect(row)}"
+      end
+    end)
   end
 
   @doc false
@@ -785,6 +865,7 @@ defmodule Group.TestCluster do
     end
 
     unless is_nil(Group.Replica.Data.remote_generation(name, origin)) and
+             is_nil(Group.Replica.Data.remote_replica_authority_hint(name, origin)) and
              Group.Replica.Data.clusters_for_node(name, origin) == [] do
       raise "replica origin retained shared authority after purge: #{inspect(origin)}"
     end
@@ -836,6 +917,94 @@ defmodule Group.TestCluster do
     end
   end
 
+  @doc false
+  def replica_registry_key_state(name, cluster, key) do
+    num_shards = Group.get_config(name).num_shards
+    shard = Group.Replica.shard_index_for(cluster, key, num_shards)
+
+    %{
+      shard: shard,
+      projection: Group.Replica.Data.registry_lookup(name, shard, cluster, key),
+      claims: Group.Replica.Data.registry_claims(name, shard, cluster, key)
+    }
+  end
+
+  @doc false
+  def replica_registry_replication_state(name, cluster, key, origin) do
+    num_shards = Group.get_config(name).num_shards
+    shard = Group.Replica.shard_index_for(cluster, key, num_shards)
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+    replica_state = :sys.get_state(replica)
+    local_stream_id = Group.Replica.Data.local_stream_id(name, shard, cluster)
+
+    streams =
+      Group.Replica.Data.replica_cursor_streams_for_origin_cluster(
+        name,
+        shard,
+        origin,
+        cluster
+      )
+
+    peer_authority =
+      Node.list()
+      |> Map.new(fn peer ->
+        {peer,
+         %{
+           generation: Group.Replica.Data.remote_generation(name, peer),
+           epoch: Group.Replica.Data.remote_cluster_epoch(name, peer, cluster),
+           revision: Group.Replica.Data.remote_cluster_epoch_revision(name, peer),
+           exact: Group.Replica.Data.remote_cluster_epoch_exact_revision(name, peer),
+           observed: Group.Replica.Data.remote_cluster_epoch_observed_revision(name, peer),
+           hint: Group.Replica.Data.remote_replica_authority_hint(name, peer),
+           lane_view: {
+             Group.Replica.Data.remote_view_generation(name, shard, peer),
+             Group.Replica.Data.remote_view_cluster_epoch_revision(name, shard, peer),
+             Group.Replica.Data.remote_view_observed_revision(name, shard, peer)
+           }
+         }}
+      end)
+
+    %{
+      key: replica_registry_key_state(name, cluster, key),
+      origin: origin,
+      cluster_nodes: Group.nodes(name, cluster),
+      local_generation: Group.Replica.Data.generation(name),
+      local_epoch: Group.Replica.Data.local_cluster_epoch(name, cluster),
+      local_revision: Group.Replica.Data.local_cluster_epoch_revision(name),
+      local_stream:
+        if(local_stream_id,
+          do:
+            {local_stream_id,
+             Group.Replica.Data.replica_stream_head(name, shard, local_stream_id)},
+          else: nil
+        ),
+      peer_authority: peer_authority,
+      remote_generation: Group.Replica.Data.remote_generation(name, origin),
+      remote_epoch: Group.Replica.Data.remote_cluster_epoch(name, origin, cluster),
+      remote_revision: Group.Replica.Data.remote_cluster_epoch_revision(name, origin),
+      remote_exact_revision: Group.Replica.Data.remote_cluster_epoch_exact_revision(name, origin),
+      remote_observed_revision:
+        Group.Replica.Data.remote_cluster_epoch_observed_revision(name, origin),
+      remote_authority_hint: Group.Replica.Data.remote_replica_authority_hint(name, origin),
+      lane_view: {
+        Group.Replica.Data.remote_view_generation(name, shard, origin),
+        Group.Replica.Data.remote_view_cluster_epoch_revision(name, shard, origin),
+        Group.Replica.Data.remote_view_observed_revision(name, shard, origin)
+      },
+      cursors:
+        Enum.map(streams, fn stream_id ->
+          {stream_id, Group.Replica.Data.replica_cursor(name, shard, stream_id)}
+        end),
+      remote_shards: Map.keys(replica_state.remote_shards),
+      peer_last_seen_nodes: Map.keys(replica_state.peer_last_seen),
+      peer_last_seen: Map.get(replica_state.peer_last_seen, origin),
+      pending_reprojection?:
+        replica_state.pending_registry_reprojections
+        |> Map.get(origin, MapSet.new())
+        |> MapSet.member?({cluster, key})
+    }
+  end
+
   defp assert_registry_claim_indexes(name, shard) do
     by_key = Group.Replica.Data.reg_claim_by_key_table(name, shard)
     by_pid = Group.Replica.Data.reg_claim_by_pid_table(name, shard)
@@ -869,12 +1038,32 @@ defmodule Group.TestCluster do
   end
 
   defp assert_registry_projection_has_authority(name, shard) do
-    claims =
+    claim_rows =
       Group.Replica.Data.reg_claim_by_key_table(name, shard)
       |> :ets.tab2list()
-      |> MapSet.new(fn
-        {{cluster, key, origin, _generation, _epoch}, pid, meta, time, _seq} ->
-          {cluster, key, pid, meta, time, origin}
+
+    resolver = Map.get(Group.get_config(name), :resolve_registry_conflict)
+
+    expected =
+      claim_rows
+      |> Enum.group_by(fn
+        {{cluster, key, _origin, _generation, _epoch}, _pid, _meta, _time, _seq} ->
+          {cluster, key}
+      end)
+      |> MapSet.new(fn {{cluster, key}, claims} ->
+        {{^cluster, ^key, origin, _generation, _epoch}, pid, meta, time, _seq} =
+          Enum.max_by(claims, fn
+            {{^cluster, ^key, _origin, _generation, _epoch}, claim_pid, claim_meta, claim_time,
+             _seq} ->
+              registry_claim_order_key(
+                name,
+                key,
+                {claim_pid, claim_meta, claim_time},
+                resolver
+              )
+          end)
+
+        {cluster, key, pid, meta, time, origin}
       end)
 
     visible =
@@ -884,25 +1073,66 @@ defmodule Group.TestCluster do
         {cluster, key, pid, meta, time, origin}
       end)
 
-    missing_authority = MapSet.difference(visible, claims)
-
-    claimed_keys =
-      MapSet.new(claims, fn {cluster, key, _pid, _meta, _time, _origin} -> {cluster, key} end)
-
-    visible_keys =
-      MapSet.new(visible, fn {cluster, key, _pid, _meta, _time, _origin} -> {cluster, key} end)
-
-    missing_projection = MapSet.difference(claimed_keys, visible_keys)
-
-    if MapSet.size(missing_authority) > 0 do
-      raise "visible registry rows without an authoritative claim in #{name} shard #{shard}: " <>
-              inspect(MapSet.to_list(missing_authority))
+    if visible != expected do
+      raise "registry projection does not match the deterministic claim winner in #{name} " <>
+              "shard #{shard}: expected=#{inspect(MapSet.to_list(expected))} " <>
+              "visible=#{inspect(MapSet.to_list(visible))}"
     end
+  end
 
-    if MapSet.size(missing_projection) > 0 do
-      raise "authoritative registry claims without a visible projection in #{name} shard #{shard}: " <>
-              inspect(MapSet.to_list(missing_projection))
-    end
+  defp registry_claim_order_key(_name, _key, {pid, _meta, time}, nil), do: {time, pid}
+
+  defp registry_claim_order_key(name, key, {pid, _meta, _time} = claim, {
+         mod,
+         func,
+         extra_args
+       }) do
+    {apply(mod, func, [name, key, claim | extra_args]), pid}
+  end
+
+  defp assert_registry_claim_authority(name, shard) do
+    Group.Replica.Data.reg_claim_by_key_table(name, shard)
+    |> :ets.tab2list()
+    |> Enum.each(fn
+      {{cluster, key, origin, generation, epoch}, pid, _meta, _time, seq} = claim ->
+        valid? =
+          if origin == node() do
+            generation == Group.Replica.Data.generation(name) and
+              epoch == Group.Replica.Data.local_cluster_epoch(name, cluster)
+          else
+            generation == Group.Replica.Data.remote_generation(name, origin) and
+              remote_lane_current?(name, shard, origin) and
+              epoch == Group.Replica.Data.remote_cluster_epoch(name, origin, cluster)
+          end
+
+        unless valid? and node(pid) == origin and seq > 0 do
+          raise "registry claim is not fenced by current authority in #{name} shard #{shard}: " <>
+                  inspect({claim, key})
+        end
+    end)
+  end
+
+  defp assert_pg_row_authority(name, shard) do
+    Group.Replica.Data.pg_by_key_table(name, shard)
+    |> :ets.tab2list()
+    |> Enum.each(fn {{cluster, key, pid}, _meta, _time, origin} = row ->
+      valid? =
+        node(pid) == origin and
+          if origin == node() do
+            not is_nil(Group.Replica.Data.local_cluster_epoch(name, cluster))
+          else
+            generation = Group.Replica.Data.remote_generation(name, origin)
+
+            not is_nil(generation) and
+              remote_lane_current?(name, shard, origin) and
+              not is_nil(Group.Replica.Data.remote_cluster_epoch(name, origin, cluster))
+          end
+
+      unless valid? do
+        raise "PG row is not fenced by current authority in #{name} shard #{shard}: " <>
+                inspect({row, key})
+      end
+    end)
   end
 
   defp assert_oplog_indexes(name, shard) do
@@ -969,6 +1199,7 @@ defmodule Group.TestCluster do
           Group.Replica.WireProtocol.stream_shard(stream_id) == shard and
           origin != node() and
           generation == Group.Replica.Data.remote_generation(name, origin) and
+          remote_lane_current?(name, shard, origin) and
           epoch == Group.Replica.Data.remote_cluster_epoch(name, origin, cluster) and
           seq >= 0
 
@@ -979,27 +1210,49 @@ defmodule Group.TestCluster do
     end)
   end
 
+  defp remote_lane_current?(name, shard, origin) do
+    generation = Group.Replica.Data.remote_generation(name, origin)
+    observed = Group.Replica.Data.remote_cluster_epoch_observed_revision(name, origin)
+
+    Group.Replica.Data.remote_replica_authority_hint(name, origin) ==
+      {generation, observed} and
+      Group.Replica.Data.remote_cluster_epoch_revision(name, origin) == observed and
+      Group.Replica.Data.remote_view_generation(name, shard, origin) == generation and
+      Group.Replica.Data.remote_view_cluster_epoch_revision(name, shard, origin) ==
+        Group.Replica.Data.remote_cluster_epoch_exact_revision(name, origin) and
+      Group.Replica.Data.remote_view_observed_revision(name, shard, origin) ==
+        observed
+  end
+
   @doc "Wait for a condition to become true, with retries"
   def assert_eventually(fun, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 2000)
     interval = Keyword.get(opts, :interval, 50)
+    diagnostic = Keyword.get(opts, :diagnostic)
     deadline = System.monotonic_time(:millisecond) + timeout
 
-    do_assert_eventually(fun, interval, deadline)
+    do_assert_eventually(fun, interval, deadline, diagnostic)
   end
 
-  defp do_assert_eventually(fun, interval, deadline) do
+  defp do_assert_eventually(fun, interval, deadline, diagnostic) do
     case fun.() do
       true ->
         true
 
       false ->
         if System.monotonic_time(:millisecond) >= deadline do
-          raise "assert_eventually timed out"
+          details =
+            if is_function(diagnostic, 0) do
+              "\ndiagnostic: " <> inspect(diagnostic.(), pretty: true, limit: :infinity)
+            else
+              ""
+            end
+
+          raise "assert_eventually timed out#{details}"
         end
 
         Process.sleep(interval)
-        do_assert_eventually(fun, interval, deadline)
+        do_assert_eventually(fun, interval, deadline, diagnostic)
     end
   end
 end

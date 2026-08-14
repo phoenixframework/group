@@ -11,6 +11,8 @@ defmodule Group.Replica do
   @local_request_tag :group_local_request
   @local_reply_tag :group_local_reply
   @protocol_version Group.Replica.WireProtocol.version()
+  @priority_control_quota 64
+  @incoming_batch_quota 64
 
   _archdoc = ~S"""
   Sharded control process for local writes, replica transport, anti-entropy,
@@ -32,14 +34,20 @@ defmodule Group.Replica do
   rebuilding local process monitors.
 
   A registry's authoritative claims are stored per origin separately from its
-  single visible winner. Conflict selection folds claims in a stable order.
+  single visible winner. Conflict selection computes one deterministic rank per
+  claim and chooses the maximum `{rank, pid}`, so selection is associative,
+  commutative, and independent of delivery order.
   When a local claim loses, only its owner node appends the authoritative
-  unregister and terminates the local process. Retaining hidden remote claims
-  until their origin deletes them prevents a later winner change from orphaning
-  or permanently forgetting a live claim. Local unregister and process-DOWN
-  paths always re-project every affected key after deleting their claims. On a
-  shard restart, the complete claim/key union is projected again, closing the
-  crash window between journal application and the materialized winner write.
+  unregister and terminates the local process. Immediately before that
+  irreversible step, Data serially revalidates the remote winner against the
+  node-wide authority and this lane's installed view; an authority change
+  restarts selection without killing either owner. Retaining hidden remote
+  claims until their origin deletes them prevents a later winner change from
+  orphaning or permanently forgetting a live claim. Local unregister and
+  process-DOWN paths always re-project every affected key after deleting their
+  claims. On a shard restart, the complete claim/key union is projected again,
+  closing the crash window between journal application and the materialized
+  winner write.
 
   PG memberships need no winner projection: the origin stream owns exactly the
   rows whose member processes live on that origin node.
@@ -57,6 +65,28 @@ defmodule Group.Replica do
   - constant-size periodic heartbeats provide a bounded peer lease without
     creating remote process monitors. A generation/epoch-revision mismatch
     requests a fresh authoritative hello.
+
+  Data installs an exact remote authority and its shared-cluster dual-index
+  projection in one serialized operation. A concurrent local cluster connect
+  therefore observes either the old authority and is covered by the install,
+  or the new authority and projects the peer itself; neither ordering can leave
+  exact authority permanently disconnected from replica routing.
+  Local activation uses the same Data serialization point to install its epoch,
+  self route, and every already-exact remote route. Local deactivation removes
+  admission and enqueues idempotent cleanup to every shard before Data replies.
+  The public API still waits for the shard barrier, but caller survival is not a
+  correctness dependency; shard restart repair consumes the same close marker.
+
+  One persisted `{generation, revision}` authority hint is the cross-lane
+  fence. A heartbeat or lane hello may advance it only for a peer that already
+  has exact authority; Data invalidates every installed lane view in the same
+  turn. A delayed hint after complete retirement is discovery only: it cannot
+  recreate authority, a transport route, or an unbounded lease. Only the
+  dist-Erlang exact hello reintroduces that peer. Contiguous incremental cluster
+  controls compare their expected generation/revision against the applied
+  authority, observed revision, and hint inside one Data callback. A raced
+  heartbeat therefore rejects the complete incremental write instead of
+  installing a partial epoch set.
 
   Replica state uses the configured Group.Transport:
 
@@ -77,6 +107,8 @@ defmodule Group.Replica do
   Rejected first chunks destroy their staging table immediately. Node loss,
   generation replacement, and retired cluster streams discard matching partial
   assemblies immediately rather than waiting for their inactivity deadline.
+  Unsequenced legacy state messages and malformed replica frames are rejected
+  before they can mutate a cursor or materialized row.
 
   ## Bounded recovery
 
@@ -99,7 +131,12 @@ defmodule Group.Replica do
 
   Optional peer lifecycle callbacks are per shard lane. A sideband adapter that
   shares one node connection across shards keeps that route until its final
-  live lane goes down; one flapping shard cannot disconnect healthy lanes.
+  live lane goes down; one flapping shard cannot disconnect healthy lanes. A
+  lane hello calls `peer_up` and enters `remote_shards` only after exact/current
+  authority admits that lane, so delayed post-retirement hellos cannot strand
+  an unleased transport route. If a lane hello arrives before exact authority,
+  authority fanout immediately repeats shard-local discovery instead of waiting
+  for the periodic anti-entropy probe.
 
   The transport need not order messages for correctness. The local shard
   serializes writes, sequence numbers establish per-stream order, and receivers
@@ -114,12 +151,30 @@ defmodule Group.Replica do
   control/routing barriers, and idle timers bound the delay.
 
   Incremental cluster controls are generation fenced, receiver batched, and
-  installed by shard 0 into the node-wide authority table. Their observed
-  revision suppresses full-hello storms during bursts; a quiet authoritative
-  hello repairs any missing or reordered controls. Snapshot capture is
-  serialized with epoch activation, and the last exact revision is distinct
-  from the highest incrementally observed revision. Shard-local lane readiness
-  is separate from shared authority, so no epoch map is copied per shard.
+  installed only by shard 0 into the node-wide authority table; controls that
+  arrive on another lane are forwarded locally to that single owner. Revisions
+  must be contiguous. A gap records the highest observation, fences every lane,
+  and requests an exact hello instead of applying a partial authority set. The
+  last exact revision, complete applied revision, and highest observed revision
+  are distinct. The Data owner compare-and-installs an incremental batch only
+  when its expected revision still matches the applied revision and persisted
+  hint. Shard-local lane readiness is separate from shared authority, so no
+  epoch map is copied per shard. On shard restart, constant-size retained
+  authority/view metadata seeds leases for origins whose rows survived in Data;
+  a disappeared Group is still retired after the normal bounded timeout. Each
+  lane deletes its own view only after purging its rows/cursors, so shard 0
+  cannot erase a sibling's restart breadcrumb. Shard 0 also reconstructs an
+  exact-hello obligation whenever the persisted observed authority revision is
+  newer than the last exact revision. If a registry conflict is reconciled
+  while one retained claim is temporarily fenced by such an authority gap, the
+  lane remembers only that key and reprojects it when the exact view is
+  installed. This avoids a shard-wide claim scan while ensuring a current
+  cursor can never strand an old visible winner.
+
+  Exact-snapshot row capture runs in at most one off-shard worker per shard. It
+  sends only if the local stream identity and fully-applied head are unchanged
+  after both row scans; overlapping writes discard the capture and periodic
+  anti-entropy retries. This keeps million-row scans off the control process.
 
   Incoming PG mutations retain the bulk receiver lane. Contiguous registry
   records in one stream run are projected together and emit one monitor event
@@ -127,11 +182,16 @@ defmodule Group.Replica do
   wire order and emits one combined batch.
 
   After replicated work, the shard takes a bounded local-request turn before
-  yielding. FIFO is preserved within the local request lane, while protocol and
-  cluster barriers flush earlier buffered state first.
+  yielding. Priority-control recursion is also quota-bounded. FIFO is preserved
+  within the local request lane, while protocol and cluster barriers flush
+  earlier buffered state first.
 
   Snapshot staging is owned by the receiving shard, expires after a peer lease
-  without progress, and disappears automatically if the shard crashes.
+  without progress, and disappears automatically if the shard crashes. Commit
+  first replaces the numeric receive cursor with a durable
+  `{:snapshot_installing, sequence}` marker. Startup repair sees that marker,
+  removes any partially replaced registry/PG slice, and clears the cursor so
+  anti-entropy requests the exact state again.
   """
 
   require Logger
@@ -172,9 +232,11 @@ defmodule Group.Replica do
     peer_last_seen: %{},
     cluster_control_dirty: %{},
     authority_dirty_notified: MapSet.new(),
+    pending_registry_reprojections: %{},
     monitors: %{},
-    peer_transports: %{},
-    snapshot_transfers: %{}
+    snapshot_transfers: %{},
+    snapshot_send: nil,
+    snapshot_send_offsets: %{}
   ]
 
   def start_link(opts) do
@@ -219,6 +281,16 @@ defmodule Group.Replica do
       end)
     after
       Enum.each(requests, &cancel_local_request/1)
+    end
+
+    :ok
+  end
+
+  @doc false
+  def local_cast(shard_name, request) when is_atom(shard_name) or is_pid(shard_name) do
+    case GenServer.whereis(shard_name) do
+      nil -> :ok
+      pid -> send(pid, {@local_request_tag, :noreply, request})
     end
 
     :ok
@@ -270,14 +342,50 @@ defmodule Group.Replica do
     :ok = Data.repair_local_replica_journal(name, shard_index)
     state = replay_local_journal(state)
     :ok = Data.repair_shard_indexes(name, shard_index)
+    {state, _events} = rebuild_registry_projections(state)
 
-    completed_clusters =
-      Data.mark_closed_cluster_shard(name, Data.closed_local_clusters(name), shard_index)
-
-    if completed_clusters != [], do: Data.remove_clusters(name, completed_clusters)
+    _completed_clusters =
+      Data.mark_closed_cluster_shard(
+        name,
+        Data.closed_local_cluster_epochs(name),
+        shard_index
+      )
 
     # Rebuild monitors from any surviving ETS data (after shard crash/restart)
     state = rebuild_monitors(state)
+
+    # A shard can die after replica rows are materialized but before it handles
+    # the peer's retirement. The ETS owner survives a shard restart, while the
+    # in-memory lease map does not. Reconstruct every retained origin as a lease
+    # candidate: live Groups answer the normal discovery probe below and refresh
+    # the lease; permanently disappeared Groups are purged when it expires.
+    restarted_at = monotonic_millis()
+    retained_origins = Data.retained_replica_origins(name, shard_index)
+
+    cluster_control_dirty =
+      if shard_index == 0 do
+        Enum.reduce(retained_origins, %{}, fn origin, dirty ->
+          exact = Data.remote_cluster_epoch_exact_revision(name, origin)
+          observed = Data.remote_cluster_epoch_observed_revision(name, origin)
+          known_generation = Data.remote_generation(name, origin)
+          hint = Data.remote_replica_authority_hint(name, origin)
+
+          if (not is_nil(observed) and observed != exact) or
+               (not is_nil(hint) and elem(hint, 0) != known_generation) do
+            Map.put(dirty, origin, restarted_at)
+          else
+            dirty
+          end
+        end)
+      else
+        %{}
+      end
+
+    state = %{
+      state
+      | peer_last_seen: Map.new(retained_origins, &{&1, restarted_at}),
+        cluster_control_dirty: cluster_control_dirty
+    }
 
     log_once(state, fn -> "#{log_prefix(state)} started (shards=#{num_shards})" end)
 
@@ -304,12 +412,12 @@ defmodule Group.Replica do
   # =====================================================================
 
   @impl true
-  def handle_call({:register, _, _, _, _} = request, _from, state) do
+  def handle_call({:register, _, _, _, _, _} = request, _from, state) do
     {reply, state} = process_local_request(state, request)
     {:reply, reply, state}
   end
 
-  def handle_call({:unregister, _, _} = request, _from, state) do
+  def handle_call({:unregister, _, _, _} = request, _from, state) do
     {reply, state} = process_local_request(state, request)
     {:reply, reply, state}
   end
@@ -318,12 +426,12 @@ defmodule Group.Replica do
   # Process group calls
   # =====================================================================
 
-  def handle_call({:join, _, _, _, _} = request, _from, state) do
+  def handle_call({:join, _, _, _, _, _} = request, _from, state) do
     {reply, state} = process_local_request(state, request)
     {:reply, reply, state}
   end
 
-  def handle_call({:leave, _, _, _} = request, _from, state) do
+  def handle_call({:leave, _, _, _, _} = request, _from, state) do
     {reply, state} = process_local_request(state, request)
     {:reply, reply, state}
   end
@@ -357,24 +465,6 @@ defmodule Group.Replica do
   # =====================================================================
 
   @impl true
-  def handle_info({:replicate_registry_batch, ops}, state) do
-    state = flush_pending_replicated_sender_barrier(state)
-
-    {state, flushed?} = enqueue_replicated_registry_ops(state, ops)
-
-    state = if flushed?, do: take_priority_turn(state), else: state
-    {:noreply, state}
-  end
-
-  def handle_info({:replicate_pg_batch, ops}, state) do
-    state = flush_pending_replicated_sender_barrier(state)
-
-    {state, flushed?} = enqueue_replicated_pg_ops(state, ops)
-
-    state = if flushed?, do: take_priority_turn(state), else: state
-    {:noreply, state}
-  end
-
   def handle_info(
         {:replica_hello, remote_pid, version, generation, epoch_revision, cluster_epochs,
          transport_id, transport_descriptor},
@@ -384,10 +474,21 @@ defmodule Group.Replica do
     remote_node = node(remote_pid)
 
     known_generation = Data.remote_generation(state.name, remote_node)
+
+    hinted_generation =
+      case Data.remote_replica_authority_hint(state.name, remote_node) do
+        {hinted_generation, _revision} -> hinted_generation
+        nil -> known_generation
+      end
+
     observed_revision = Data.remote_cluster_epoch_observed_revision(state.name, remote_node)
     authoritative_revision = Data.remote_cluster_epoch_revision(state.name, remote_node)
 
     exact_revision = Data.remote_cluster_epoch_exact_revision(state.name, remote_node)
+
+    stale_generation? =
+      not is_nil(hinted_generation) and hinted_generation != generation and
+        not WireProtocol.generation_newer?(generation, hinted_generation)
 
     stale_revision? =
       known_generation == generation and
@@ -397,14 +498,15 @@ defmodule Group.Replica do
         end)
 
     cond do
-      version != WireProtocol.version() or transport_id != state.replica_transport.id() ->
+      version != WireProtocol.version() or transport_id != state.replica_transport.id() or
+          not WireProtocol.valid_generation?(generation) ->
         Logger.error(
           "#{log_prefix_shard(state)} incompatible replica protocol/transport from #{inspect(remote_node)}"
         )
 
         {:noreply, state}
 
-      stale_revision? ->
+      stale_generation? or stale_revision? ->
         {:noreply, state}
 
       known_generation == generation and exact_revision == epoch_revision ->
@@ -412,17 +514,6 @@ defmodule Group.Replica do
         # is being installed. Once this exact revision is present, another
         # identical hello is only a lease/descriptor refresh; reinstalling its
         # full epoch set would serialize every shard behind redundant ETS work.
-        state = notify_replica_transport_peer_up(state, remote_node, transport_descriptor)
-
-        state = %{
-          state
-          | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid),
-            peer_last_seen: Map.put(state.peer_last_seen, remote_node, monotonic_millis()),
-            cluster_control_dirty: Map.delete(state.cluster_control_dirty, remote_node),
-            peer_transports:
-              Map.put(state.peer_transports, remote_node, {transport_id, transport_descriptor})
-        }
-
         state =
           if replica_view_current?(state, remote_node) do
             state
@@ -430,7 +521,23 @@ defmodule Group.Replica do
             install_current_replica_lane(state, remote_node, generation)
           end
 
-        {:noreply, state}
+        if replica_authority_current?(state, remote_node, generation, epoch_revision) and
+             replica_view_current?(state, remote_node) do
+          state = notify_replica_transport_peer_up(state, remote_node, transport_descriptor)
+
+          {:noreply,
+           %{
+             state
+             | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid),
+               peer_last_seen: Map.put(state.peer_last_seen, remote_node, monotonic_millis()),
+               cluster_control_dirty: Map.delete(state.cluster_control_dirty, remote_node)
+           }}
+        else
+          {:noreply,
+           state
+           |> mark_cluster_control_dirty(remote_node)
+           |> request_replica_authority(remote_node)}
+        end
 
       true ->
         {:noreply,
@@ -466,29 +573,15 @@ defmodule Group.Replica do
     remote_node = node(remote_pid)
 
     if version == WireProtocol.version() and transport_id == state.replica_transport.id() do
-      if function_exported?(state.replica_transport, :peer_up, 5) do
-        :ok =
-          state.replica_transport.peer_up(
-            state.name,
-            remote_node,
-            state.shard_index,
-            transport_descriptor,
-            state.replica_transport_opts
-          )
-      end
-
-      state = %{
-        state
-        | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid),
-          peer_transports:
-            Map.put(state.peer_transports, remote_node, {transport_id, transport_descriptor})
-      }
+      state = observe_replica_authority_hint(state, remote_node, generation, epoch_revision)
 
       cond do
         replica_authority_current?(state, remote_node, generation, epoch_revision) and
             replica_view_current?(state, remote_node) ->
           state =
             state
+            |> notify_replica_transport_peer_up(remote_node, transport_descriptor)
+            |> put_remote_shard(remote_node, remote_pid)
             |> purge_remote_streams_outside_authority(remote_node)
             |> touch_replica_peer(remote_node)
             |> Map.update!(:cluster_control_dirty, &Map.delete(&1, remote_node))
@@ -496,13 +589,20 @@ defmodule Group.Replica do
 
           {:noreply, state}
 
-        replica_authority_current?(state, remote_node, generation, epoch_revision) ->
+        replica_exact_authority_current?(state, remote_node, generation, epoch_revision) ->
           # The shared authority can arrive before this sibling is registered,
           # so shard-zero fanout is intentionally lossy at startup. Rebuild
           # this lane directly from the exact shared authority.
-          {:noreply, install_current_replica_lane(state, remote_node, generation)}
+          {:noreply,
+           state
+           |> notify_replica_transport_peer_up(remote_node, transport_descriptor)
+           |> put_remote_shard(remote_node, remote_pid)
+           |> install_current_replica_lane(remote_node, generation)}
 
         true ->
+          # A lane hello is only a hint until node-wide exact authority exists.
+          # In particular, a delayed hello after retirement must not recreate
+          # an unleased route that can live forever and suppress rediscovery.
           {:noreply, request_replica_authority(state, remote_node)}
       end
     else
@@ -533,7 +633,7 @@ defmodule Group.Replica do
           state
         end
 
-      :ok = install_replica_view(state, remote_node, generation)
+      state = install_replica_view(state, remote_node, generation)
 
       state = %{
         state
@@ -547,6 +647,18 @@ defmodule Group.Replica do
           |> touch_replica_peer(remote_node)
           |> send_replica_heads(remote_node)
         else
+          # A lane hello can legitimately outrun shard zero's exact authority.
+          # The hello is not retained as a route, because a delayed hello after
+          # retirement must not recreate an unleased peer. Once exact authority
+          # reaches this lane, repeat shard-local discovery immediately instead
+          # of waiting for the next anti-entropy probe.
+          send_remote_shard_message(
+            state,
+            remote_node,
+            {:peer_connect, self(), state.shard_index, state.num_shards,
+             Data.my_clusters(state.name)}
+          )
+
           state
         end
 
@@ -556,69 +668,97 @@ defmodule Group.Replica do
     end
   end
 
-  def handle_info({:replica_authority_removed_local, remote_node}, state) do
-    state = flush_pending_replicated_message_barrier(state)
-    {:noreply, expire_replica_peer(state, remote_node)}
-  end
-
   def handle_info(
-        {:replica_cluster_open, remote_pid, generation, revision, epochs},
+        {:replica_cluster_open, remote_pid, generation, revision, epochs} = control,
         state
       ) do
     state = flush_pending_replicated_message_barrier(state)
-    remote_node = node(remote_pid)
 
-    controls =
-      collect_replica_cluster_controls(
-        :replica_cluster_open,
-        remote_pid,
-        generation,
-        [{revision, epochs}],
-        state.replicated_sender_buffer_size - 1
-      )
+    if state.shard_index == 0 do
+      remote_node = node(remote_pid)
 
-    case accepted_replica_cluster_epochs(state, remote_node, generation, controls) do
-      {:accept, observed_revision, epochs} ->
-        stale =
-          Data.put_remote_cluster_epochs(
-            state.name,
-            state.shard_index,
-            remote_node,
-            observed_revision,
-            epochs
-          )
-
-        shared =
-          Enum.filter(epochs, fn {cluster, _epoch} ->
-            node() in Data.cluster_nodes(state.name, cluster)
-          end)
-
-        Data.add_cluster_node(state.name, Enum.map(shared, &elem(&1, 0)), remote_node)
-
-        fan_out_to_siblings(
-          state,
-          {:replica_cluster_open_control_local, remote_node, generation, observed_revision,
-           epochs, stale, Enum.map(shared, &elem(&1, 0))}
+      controls =
+        collect_replica_cluster_controls(
+          :replica_cluster_open,
+          remote_pid,
+          generation,
+          [{revision, epochs}],
+          state.replicated_sender_buffer_size - 1
         )
 
-        state =
-          state
-          |> mark_authority_dirty(remote_node)
-          |> purge_closed_remote_epochs(remote_node, stale)
-          |> purge_superseded_remote_streams(remote_node, epochs)
+      case accepted_replica_cluster_epochs(state, remote_node, generation, controls) do
+        {:accept, expected_revision, observed_revision, epochs} ->
+          case Data.put_remote_cluster_epochs(
+                 state.name,
+                 state.shard_index,
+                 remote_node,
+                 generation,
+                 expected_revision,
+                 observed_revision,
+                 epochs
+               ) do
+            {:ok, stale} ->
+              shared =
+                Enum.filter(epochs, fn {cluster, _epoch} ->
+                  node() in Data.cluster_nodes(state.name, cluster)
+                end)
 
-        :ok = install_replica_view(state, remote_node, generation)
-        state = send_replica_heads(state, remote_node, Enum.map(shared, &elem(&1, 0)))
-        {:noreply, take_one_local_request_turn(state)}
+              Data.add_cluster_node(state.name, Enum.map(shared, &elem(&1, 0)), remote_node)
 
-      :stale ->
-        {:noreply, take_one_local_request_turn(state)}
+              fan_out_to_siblings(
+                state,
+                {:replica_cluster_open_control_local, remote_node, generation, observed_revision,
+                 epochs, stale, Enum.map(shared, &elem(&1, 0))}
+              )
 
-      :refresh ->
-        {:noreply,
-         state
-         |> request_replica_authority(remote_node)
-         |> take_one_local_request_turn()}
+              state =
+                state
+                |> mark_authority_dirty(remote_node)
+                |> purge_closed_remote_epochs(remote_node, stale)
+                |> purge_superseded_remote_streams(remote_node, epochs)
+                |> purge_remote_streams_outside_authority(remote_node)
+
+              state = install_replica_view(state, remote_node, generation)
+              state = send_replica_heads(state, remote_node, Enum.map(shared, &elem(&1, 0)))
+              {:noreply, take_one_local_request_turn(state)}
+
+            :stale ->
+              {:noreply,
+               state
+               |> mark_authority_dirty(remote_node)
+               |> request_replica_authority(remote_node)
+               |> take_one_local_request_turn()}
+          end
+
+        :stale ->
+          {:noreply, take_one_local_request_turn(state)}
+
+        :refresh ->
+          {:noreply,
+           state
+           |> request_replica_authority(remote_node)
+           |> take_one_local_request_turn()}
+
+        {:gap, observed_revision} ->
+          :ok =
+            Data.observe_remote_cluster_epoch_revision(
+              state.name,
+              remote_node,
+              observed_revision
+            )
+
+          {:noreply,
+           state
+           |> mark_authority_dirty(remote_node)
+           |> request_replica_authority(remote_node)
+           |> take_one_local_request_turn()}
+      end
+    else
+      # Incremental authority is node-wide and therefore has one local owner.
+      # Forward a control that arrived on another lane instead of racing its
+      # check/update against shard 0.
+      _ = send_local_control_message(state, control)
+      {:noreply, take_one_local_request_turn(state)}
     end
   end
 
@@ -627,7 +767,9 @@ defmodule Group.Replica do
   end
 
   def handle_info({:replica_authority_dirty_local, remote_node}, state) do
-    send(shard_name(state.name, 0), {:replica_authority_dirty_local, remote_node})
+    _ =
+      send_local_control_message(state, {:replica_authority_dirty_local, remote_node})
+
     {:noreply, state}
   end
 
@@ -644,20 +786,16 @@ defmodule Group.Replica do
           state
           |> purge_closed_remote_epochs(remote_node, stale)
           |> purge_superseded_remote_streams(remote_node, epochs)
+          |> purge_remote_streams_outside_authority(remote_node)
 
-        :ok = install_replica_view(state, remote_node, generation)
-        send_replica_heads(state, remote_node, shared)
+        state
+        |> install_replica_view(remote_node, generation)
+        |> send_replica_heads(remote_node, shared)
       else
         state
       end
 
     {:noreply, take_one_local_request_turn(state)}
-  end
-
-  def handle_info({:replica_cluster_stale_epochs_local, remote_node, stale}, state) do
-    state = flush_pending_replicated_message_barrier(state)
-    state = purge_closed_remote_epochs(state, remote_node, stale)
-    {:noreply, send_replica_heads(state, remote_node)}
   end
 
   def handle_info(
@@ -677,33 +815,43 @@ defmodule Group.Replica do
       )
 
     case accepted_replica_cluster_epochs(state, remote_node, generation, controls) do
-      {:accept, observed_revision, epochs} ->
-        closed =
-          Data.close_remote_cluster_epochs(
-            state.name,
-            0,
-            remote_node,
-            observed_revision,
-            epochs
-          )
+      {:accept, expected_revision, observed_revision, epochs} ->
+        case Data.close_remote_cluster_epochs(
+               state.name,
+               0,
+               remote_node,
+               generation,
+               expected_revision,
+               observed_revision,
+               epochs
+             ) do
+          {:ok, closed} ->
+            if state.shard_index == 0 do
+              Data.remove_cluster_node(state.name, Enum.map(closed, &elem(&1, 0)), remote_node)
+            end
 
-        if state.shard_index == 0 do
-          Data.remove_cluster_node(state.name, Enum.map(closed, &elem(&1, 0)), remote_node)
+            fan_out_to_siblings(
+              state,
+              {:replica_cluster_close_control_local, remote_node, generation, observed_revision,
+               closed}
+            )
+
+            state =
+              state
+              |> mark_cluster_control_dirty(remote_node)
+              |> purge_closed_remote_epochs(remote_node, closed)
+              |> purge_remote_streams_outside_authority(remote_node)
+
+            state = install_replica_view(state, remote_node, generation)
+            {:noreply, take_one_local_request_turn(state)}
+
+          :stale ->
+            {:noreply,
+             state
+             |> mark_authority_dirty(remote_node)
+             |> request_replica_authority(remote_node)
+             |> take_one_local_request_turn()}
         end
-
-        fan_out_to_siblings(
-          state,
-          {:replica_cluster_close_control_local, remote_node, generation, observed_revision,
-           closed}
-        )
-
-        state =
-          state
-          |> mark_cluster_control_dirty(remote_node)
-          |> purge_closed_remote_epochs(remote_node, closed)
-
-        :ok = install_replica_view(state, remote_node, generation)
-        {:noreply, take_one_local_request_turn(state)}
 
       :stale ->
         {:noreply, take_one_local_request_turn(state)}
@@ -711,6 +859,20 @@ defmodule Group.Replica do
       :refresh ->
         {:noreply,
          state
+         |> request_replica_authority(remote_node)
+         |> take_one_local_request_turn()}
+
+      {:gap, observed_revision} ->
+        :ok =
+          Data.observe_remote_cluster_epoch_revision(
+            state.name,
+            remote_node,
+            observed_revision
+          )
+
+        {:noreply,
+         state
+         |> mark_cluster_control_dirty(remote_node)
          |> request_replica_authority(remote_node)
          |> take_one_local_request_turn()}
     end
@@ -728,9 +890,12 @@ defmodule Group.Replica do
 
     state =
       if replica_authority_current?(state, remote_node, generation, revision) do
-        state = purge_closed_remote_epochs(state, remote_node, closed)
-        :ok = install_replica_view(state, remote_node, generation)
-        state
+        state =
+          state
+          |> purge_closed_remote_epochs(remote_node, closed)
+          |> purge_remote_streams_outside_authority(remote_node)
+
+        install_replica_view(state, remote_node, generation)
       else
         state
       end
@@ -738,31 +903,34 @@ defmodule Group.Replica do
     {:noreply, take_one_local_request_turn(state)}
   end
 
-  def handle_info({:replica_cluster_close_local, remote_node, closed}, state) do
-    state = flush_pending_replicated_message_barrier(state)
-
-    :ok =
-      Data.forget_remote_cluster_epochs(state.name, state.shard_index, remote_node, closed)
-
-    {:noreply, purge_closed_remote_epochs(state, remote_node, closed)}
-  end
-
   def handle_info(
-        {:replica_heartbeat, remote_pid, version, generation, epoch_revision},
+        {:replica_heartbeat, remote_pid, version, generation, epoch_revision, transport_id,
+         transport_descriptor},
         state
       ) do
     remote_node = node(remote_pid)
 
+    compatible? =
+      version == WireProtocol.version() and transport_id == state.replica_transport.id()
+
+    state =
+      if compatible? do
+        observe_replica_authority_hint(state, remote_node, generation, epoch_revision)
+      else
+        state
+      end
+
     state =
       cond do
-        version == WireProtocol.version() and
+        compatible? and
           replica_authority_current?(state, remote_node, generation, epoch_revision) and
             replica_view_current?(state, remote_node) ->
           state
+          |> notify_replica_transport_peer_up(remote_node, transport_descriptor)
           |> put_remote_shard(remote_node, remote_pid)
           |> touch_replica_peer(remote_node)
 
-        version == WireProtocol.version() and
+        compatible? and
             replica_authority_current?(state, remote_node, generation, epoch_revision) ->
           state
 
@@ -777,7 +945,7 @@ defmodule Group.Replica do
     if state.shard_index == 0 do
       {:noreply, send_replica_hello(state, node(remote_pid))}
     else
-      send(shard_name(state.name, 0), {:replica_hello_request, remote_pid})
+      _ = send_local_control_message(state, {:replica_hello_request, remote_pid})
       {:noreply, state}
     end
   end
@@ -796,8 +964,48 @@ defmodule Group.Replica do
 
   def handle_info({:group_replica_batch, remote_node, messages}, state)
       when is_atom(remote_node) and is_list(messages) do
-    state = Enum.reduce(messages, state, &handle_replica_message(&2, remote_node, &1))
+    {turn, remaining} = Enum.split(messages, @incoming_batch_quota)
+    state = Enum.reduce(turn, state, &handle_replica_message(&2, remote_node, &1))
+
+    if remaining != [] do
+      send(self(), {:group_replica_batch, remote_node, remaining})
+    end
+
     {:noreply, take_priority_turn(state)}
+  end
+
+  def handle_info(
+        {:replica_snapshot_send_complete, token, worker, snapshot_key, result},
+        %{snapshot_send: {worker, token, snapshot_key}} = state
+      ) do
+    offsets =
+      case result do
+        :complete ->
+          Map.delete(state.snapshot_send_offsets, snapshot_key)
+
+        {:resume, chunk_index} ->
+          if current_snapshot_send?(state, snapshot_key) do
+            Map.put(state.snapshot_send_offsets, snapshot_key, chunk_index)
+          else
+            Map.delete(state.snapshot_send_offsets, snapshot_key)
+          end
+
+        :retry ->
+          if current_snapshot_send?(state, snapshot_key) do
+            state.snapshot_send_offsets
+          else
+            Map.delete(state.snapshot_send_offsets, snapshot_key)
+          end
+      end
+
+    {:noreply, %{state | snapshot_send: nil, snapshot_send_offsets: offsets}}
+  end
+
+  def handle_info(
+        {:replica_snapshot_send_complete, _token, _worker, _snapshot_key, _result},
+        state
+      ) do
+    {:noreply, state}
   end
 
   def handle_info({@anti_entropy_timer, ref}, state) do
@@ -825,6 +1033,10 @@ defmodule Group.Replica do
 
   def handle_info({@local_request_tag, alias_ref, request}, state) when is_reference(alias_ref) do
     {:noreply, process_local_request_turn(state, [{{:alias, alias_ref}, request}])}
+  end
+
+  def handle_info({@local_request_tag, :noreply, request}, state) do
+    {:noreply, process_local_request_turn(state, [{:noreply, request}])}
   end
 
   # =====================================================================
@@ -913,138 +1125,6 @@ defmodule Group.Replica do
   end
 
   # =====================================================================
-  # Cluster state (unified handler for peer discovery + cluster join)
-  # =====================================================================
-
-  def handle_info({:cluster_state, cluster, reg_data, pg_data}, state) do
-    state = flush_pending_replicated_message_barrier(state)
-    %{name: name} = state
-
-    # Guard: skip merge for named clusters we're not a member of
-    if cluster_member?(name, cluster) do
-      log_once(state, fn ->
-        "#{log_prefix(state)} cluster_state cluster=#{inspect(cluster)} (#{length(reg_data)} reg, #{length(pg_data)} pg entries)"
-      end)
-
-      log_verbose(state, fn ->
-        "#{log_prefix_shard(state)} merging cluster=#{inspect(cluster)} (#{length(reg_data)} reg, #{length(pg_data)} pg entries)"
-      end)
-
-      {state, events} = merge_remote_cluster_data(state, cluster, reg_data, pg_data)
-      notify_monitors(name, events)
-      {:noreply, state}
-    else
-      {:noreply, state}
-    end
-  end
-
-  # =====================================================================
-  # Cluster connect/disconnect from remote
-  # =====================================================================
-
-  def handle_info({:cluster_connect, clusters, remote_pid}, state) do
-    state = flush_pending_replicated_message_barrier(state)
-    %{name: name} = state
-    remote_node = node(remote_pid)
-
-    shared =
-      Enum.filter(clusters, fn c ->
-        node() in Data.cluster_nodes(name, c)
-      end)
-
-    log_once(state, fn ->
-      "#{log_prefix(state)} #{remote_node} cluster_connect #{inspect(shared)} (#{length(shared)}/#{length(clusters)} shared)"
-    end)
-
-    if shared != [] do
-      Data.add_cluster_node(name, shared, remote_node)
-
-      # Membership is a control-plane handshake. Replica state follows on the
-      # data transport via heads/deltas (or an exact snapshot fallback).
-      send_to_peer(state, remote_node, {:cluster_connect_ack, shared, self(), []})
-    end
-
-    {:noreply, state}
-  end
-
-  def handle_info({:cluster_connect_ack, clusters, remote_pid, cluster_data}, state) do
-    state = flush_pending_replicated_message_barrier(state)
-    %{name: name} = state
-    remote_node = node(remote_pid)
-
-    # Guard: skip if remote node went down (nodedown race) or if we left the
-    # cluster (connect+disconnect race). Without these, a delayed ack would
-    # re-add a dead/irrelevant node to cluster_nodes permanently.
-    {state, events} =
-      if Map.has_key?(state.remote_shards, remote_node) do
-        active = Enum.filter(clusters, fn c -> node() in Data.cluster_nodes(name, c) end)
-
-        if active != [] do
-          Data.add_cluster_node(name, active, remote_node)
-
-          # The empty data list is the v1 contract. Retain merge support for a
-          # rolling peer that still bundles legacy cluster data.
-          {new_state, events} =
-            Enum.reduce(cluster_data, {state, []}, fn {cluster, reg_data, pg_data},
-                                                      {acc_state, acc_events} ->
-              if cluster in active and (reg_data != [] or pg_data != []) do
-                merge_remote_cluster_data(acc_state, cluster, reg_data, pg_data, acc_events)
-              else
-                {acc_state, acc_events}
-              end
-            end)
-
-          {send_replica_heads(new_state, remote_node), events}
-        else
-          {state, []}
-        end
-      else
-        {state, []}
-      end
-
-    notify_monitors(name, events)
-    {:noreply, state}
-  end
-
-  def handle_info({:cluster_disconnect, clusters, remote_pid}, state) do
-    state = flush_pending_replicated_message_barrier(state)
-    %{name: name, shard_index: shard} = state
-    remote_node = node(remote_pid)
-
-    log_once(state, fn ->
-      "#{log_prefix(state)} #{remote_node} cluster_disconnect #{inspect(clusters)}"
-    end)
-
-    if shard == 0 do
-      Data.remove_cluster_node(name, clusters, remote_node)
-      fan_out_to_siblings(state, {:cluster_disconnect, clusters, remote_pid})
-    end
-
-    {state, events} =
-      Enum.reduce(clusters, {state, []}, fn cluster, {outer_state, acc} ->
-        affected_keys =
-          Data.purge_registry_claims_for_cluster(name, shard, cluster, remote_node)
-
-        {purged_reg, purged_pg} = purge_cluster_entries(name, shard, cluster, remote_node)
-
-        acc = build_purged_events(name, purged_reg, purged_pg, :cluster_disconnect, acc)
-
-        Enum.reduce(affected_keys, {outer_state, acc}, fn key, {inner_state, inner_events} ->
-          reconcile_registry_projection(
-            inner_state,
-            cluster,
-            key,
-            :cluster_disconnect,
-            inner_events
-          )
-        end)
-      end)
-
-    notify_monitors(name, events)
-    {:noreply, state}
-  end
-
-  # =====================================================================
   # Node up/down
   # =====================================================================
 
@@ -1064,7 +1144,14 @@ defmodule Group.Replica do
   def handle_info({:nodedown, dead_node}, state) do
     state = flush_pending_replicated_message_barrier(state)
     state = discard_snapshot_transfers_for_source(state, dead_node)
+    state = discard_snapshot_send_offsets_for_target(state, dead_node)
+    state = discard_pending_registry_reprojections(state, dead_node)
     %{name: name, shard_index: shard} = state
+
+    # Cursor absence is the durable restart marker for an incomplete or
+    # retiring remote stream. Clear it before touching materialized rows so a
+    # shard crash at any later purge step finishes that retirement on restart.
+    Data.delete_replica_cursors_for_origin(name, shard, dead_node)
 
     # Remove cluster memberships from shared tables. Every shard calls this
     # unconditionally (not just shard 0) to handle the race where a non-zero
@@ -1094,10 +1181,10 @@ defmodule Group.Replica do
       state
       | remote_shards: Map.delete(state.remote_shards, dead_node),
         peer_last_seen: Map.delete(state.peer_last_seen, dead_node),
+        cluster_control_dirty: Map.delete(state.cluster_control_dirty, dead_node),
         authority_dirty_notified: MapSet.delete(state.authority_dirty_notified, dead_node)
     }
 
-    Data.delete_replica_cursors_for_origin(name, shard, dead_node)
     Data.delete_remote_replica_info(name, shard, dead_node)
 
     if function_exported?(state.replica_transport, :peer_down, 4) do
@@ -1110,7 +1197,6 @@ defmodule Group.Replica do
         )
     end
 
-    state = %{state | peer_transports: Map.delete(state.peer_transports, dead_node)}
     {:noreply, state}
   end
 
@@ -1122,128 +1208,59 @@ defmodule Group.Replica do
     state = flush_pending_replicated_message_barrier(state)
     %{name: name, shard_index: shard} = state
 
-    remote_node = node(pid)
+    # Replica shards intentionally never create remote process monitors: their
+    # liveness is generation/lease fenced and remote monitoring can itself
+    # suspend on a busy distribution connection. Consequently every genuine
+    # DOWN handled here belongs to a locally owned registry/PG process.
+    if Map.has_key?(state.monitors, pid) do
+      {downs, monitors} =
+        collect_local_process_downs(
+          [{pid, reason}],
+          state.monitors,
+          @process_down_batch_size - 1
+        )
 
-    if remote_node != node() and Map.get(state.remote_shards, remote_node) == pid do
-      state = discard_snapshot_transfers_for_source(state, remote_node)
+      pids = Enum.map(downs, &elem(&1, 0))
+      reason_by_pid = Map.new(downs)
+      {visible_reg, pending_pg} = Data.entries_for_pids(name, shard, pids)
 
-      # Remote shard process died — purge its cluster memberships and node data.
-      # Unconditional (not gated on shard 0) — same reasoning as nodedown handler.
-      Data.purge_cluster_node(name, remote_node)
-      {purged_reg, purged_pg} = Data.purge_node(name, shard, remote_node)
-      affected_claims = Data.purge_registry_claims_for_origin(name, shard, remote_node)
+      claimed_reg =
+        Data.local_registry_claims_by_pids(name, shard, pids)
+        |> Enum.map(fn {pid, cluster, key, meta, _generation, _epoch} ->
+          {pid, cluster, key, meta}
+        end)
+
+      pending_reg = Enum.uniq(visible_reg ++ claimed_reg)
+
+      sequenced_downs =
+        append_process_down_records(state, reason_by_pid, pending_reg, pending_pg)
+
+      {purged_reg, purged_pg} = Data.delete_all_for_pids(name, shard, pids)
 
       log_verbose(state, fn ->
-        "#{log_prefix_shard(state)} remote_shard_down #{remote_node} (purged #{length(purged_reg)} reg, #{length(purged_pg)} pg)"
+        "#{log_prefix_shard(state)} process_down_batch pids=#{length(downs)} (#{length(purged_reg) + length(purged_pg)} entries cleaned)"
       end)
 
-      events = build_purged_events(name, purged_reg, purged_pg, {:nodedown, remote_node})
+      state = finish_process_down_records(state, sequenced_downs)
 
-      {state, events} =
-        Enum.reduce(affected_claims, {state, events}, fn {cluster, key}, {acc, inner_events} ->
-          reconcile_registry_projection(
-            acc,
-            cluster,
-            key,
-            {:nodedown, remote_node},
-            inner_events
-          )
-        end)
+      affected_registry_keys =
+        pending_reg
+        |> Enum.map(fn {_pid, cluster, key, _meta} -> {cluster, key} end)
+        |> Enum.uniq()
+
+      {state, projection_events} =
+        reconcile_registry_keys(state, affected_registry_keys, reason, [])
+
+      events =
+        projection_events ++
+          build_process_down_events(name, purged_reg, purged_pg, reason_by_pid)
 
       notify_monitors(name, events)
-      state = %{state | remote_shards: Map.delete(state.remote_shards, remote_node)}
-      state = %{state | monitors: Map.delete(state.monitors, pid)}
-
-      if function_exported?(state.replica_transport, :peer_down, 4) do
-        :ok =
-          state.replica_transport.peer_down(
-            name,
-            remote_node,
-            shard,
-            state.replica_transport_opts
-          )
-      end
-
+      state = %{state | monitors: Map.drop(monitors, pids)}
       {:noreply, state}
     else
-      if Map.has_key?(state.monitors, pid) do
-        {downs, monitors} =
-          collect_local_process_downs(
-            [{pid, reason}],
-            state.monitors,
-            @process_down_batch_size - 1
-          )
-
-        pids = Enum.map(downs, &elem(&1, 0))
-        reason_by_pid = Map.new(downs)
-        {visible_reg, pending_pg} = Data.entries_for_pids(name, shard, pids)
-
-        claimed_reg =
-          Data.local_registry_claims_by_pids(name, shard, pids)
-          |> Enum.map(fn {pid, cluster, key, meta, _generation, _epoch} ->
-            {pid, cluster, key, meta}
-          end)
-
-        pending_reg = Enum.uniq(visible_reg ++ claimed_reg)
-
-        sequenced_downs =
-          append_process_down_records(state, reason_by_pid, pending_reg, pending_pg)
-
-        {purged_reg, purged_pg} = Data.delete_all_for_pids(name, shard, pids)
-
-        log_verbose(state, fn ->
-          "#{log_prefix_shard(state)} process_down_batch pids=#{length(downs)} (#{length(purged_reg) + length(purged_pg)} entries cleaned)"
-        end)
-
-        state = finish_process_down_records(state, sequenced_downs)
-
-        affected_registry_keys =
-          pending_reg
-          |> Enum.map(fn {_pid, cluster, key, _meta} -> {cluster, key} end)
-          |> Enum.uniq()
-
-        {state, projection_events} =
-          reconcile_registry_keys(state, affected_registry_keys, reason, [])
-
-        events =
-          projection_events ++
-            build_process_down_events(name, purged_reg, purged_pg, reason_by_pid)
-
-        notify_monitors(name, events)
-        state = %{state | monitors: Map.drop(monitors, pids)}
-        {:noreply, state}
-      else
-        {:noreply, state}
-      end
+      {:noreply, state}
     end
-  end
-
-  def handle_info({:replicate_process_down_batch, reg_entries, pg_entries}, state) do
-    state = flush_pending_replicated_message_barrier(state)
-    %{name: name, shard_index: shard} = state
-
-    log_verbose(state, fn ->
-      "#{log_prefix_shard(state)} replicate_process_down_batch (#{length(reg_entries)} reg, #{length(pg_entries)} pg)"
-    end)
-
-    deleted_reg = Data.registry_delete_matching_many(name, shard, reg_entries)
-    deleted_pg = Data.pg_delete_matching_many(name, shard, pg_entries)
-    events = build_process_down_batch_events(name, deleted_reg, deleted_pg)
-    notify_monitors(name, events)
-    {:noreply, state}
-  end
-
-  def handle_info({:send_cluster_data, clusters, target_node}, state) do
-    state = flush_pending_replicated_message_barrier(state)
-    %{name: name} = state
-
-    active = Enum.filter(clusters, fn c -> node() in Data.cluster_nodes(name, c) end)
-
-    if active != [] do
-      send_cluster_states(state, active, target_node)
-    end
-
-    {:noreply, state}
   end
 
   def handle_info({:group_dispatch, pids, message}, state) do
@@ -1421,6 +1438,8 @@ defmodule Group.Replica do
     :ok
   end
 
+  defp reply_local_request(:noreply, _reply), do: :ok
+
   defp process_local_request_turn(
          state,
          initial_messages
@@ -1442,6 +1461,9 @@ defmodule Group.Replica do
 
       {@local_request_tag, alias_ref, request} when is_reference(alias_ref) ->
         collect_local_request_messages([{{:alias, alias_ref}, request} | acc], remaining - 1)
+
+      {@local_request_tag, :noreply, request} ->
+        collect_local_request_messages([{:noreply, request} | acc], remaining - 1)
     after
       0 ->
         Enum.reverse(acc)
@@ -1506,30 +1528,70 @@ defmodule Group.Replica do
   end
 
   defp process_local_request_without_barrier(state, request) do
+    with :ok <- validate_local_mutation_epoch(state, request) do
+      case request do
+        {:register, cluster, _epoch, key, pid, meta} ->
+          do_register(state, cluster, key, pid, meta)
+
+        {:unregister, cluster, _epoch, key} ->
+          do_unregister(state, cluster, key)
+
+        {:join, cluster, _epoch, key, pid, meta} ->
+          do_join(state, cluster, key, pid, meta)
+
+        {:leave, cluster, _epoch, key, pid} ->
+          do_leave(state, cluster, key, pid)
+
+        {:cluster_connect, clusters} ->
+          do_cluster_connect(state, clusters)
+
+        {:cluster_connect, clusters, epochs} ->
+          do_cluster_connect(state, clusters, epochs)
+
+        {:cluster_disconnect, clusters} ->
+          do_cluster_disconnect(state, clusters)
+
+        {:cluster_disconnect, clusters, epochs} ->
+          do_cluster_disconnect(state, clusters, epochs)
+
+        _ ->
+          {{:error, :invalid_local_request}, state}
+      end
+    else
+      {:error, reason} -> {{:error, reason}, state}
+    end
+  end
+
+  defp validate_local_mutation_epoch(state, request) do
     case request do
-      {:register, cluster, key, pid, meta} ->
-        do_register(state, cluster, key, pid, meta)
+      {op, cluster, epoch, _key, _pid, _meta} when op in [:register, :join] ->
+        validate_local_mutation_epoch(state, cluster, epoch)
 
-      {:unregister, cluster, key} ->
-        do_unregister(state, cluster, key)
+      {op, cluster, epoch, _key} when op == :unregister ->
+        validate_local_mutation_epoch(state, cluster, epoch)
 
-      {:join, cluster, key, pid, meta} ->
-        do_join(state, cluster, key, pid, meta)
+      {op, cluster, epoch, _key, _pid} when op == :leave ->
+        validate_local_mutation_epoch(state, cluster, epoch)
 
-      {:leave, cluster, key, pid} ->
-        do_leave(state, cluster, key, pid)
+      {op, _cluster, _key, _pid, _meta} when op in [:register, :join] ->
+        {:error, :stale_cluster_epoch}
 
-      {:cluster_connect, clusters} ->
-        do_cluster_connect(state, clusters)
+      {op, _cluster, _key} when op == :unregister ->
+        {:error, :stale_cluster_epoch}
 
-      {:cluster_connect, clusters, epochs} ->
-        do_cluster_connect(state, clusters, epochs)
+      {op, _cluster, _key, _pid} when op == :leave ->
+        {:error, :stale_cluster_epoch}
 
-      {:cluster_disconnect, clusters} ->
-        do_cluster_disconnect(state, clusters)
+      _ ->
+        :ok
+    end
+  end
 
-      {:cluster_disconnect, clusters, epochs} ->
-        do_cluster_disconnect(state, clusters, epochs)
+  defp validate_local_mutation_epoch(state, cluster, epoch) do
+    if Data.local_cluster_epoch(state.name, cluster) == epoch do
+      :ok
+    else
+      {:error, :stale_cluster_epoch}
     end
   end
 
@@ -1592,82 +1654,90 @@ defmodule Group.Replica do
         {%{}, [], [], [], %{}, MapSet.new()},
         fn {reply_to, request},
            {entries, replies, events, broadcasts, new_monitors, maybe_demonitor_pids} ->
-          case request do
-            {:join, cluster, key, pid, meta} ->
-              member = {cluster, key, pid}
-              {initial, current} = local_pg_batch_entry(entries, name, shard, member)
+          if validate_local_mutation_epoch(state, request) != :ok do
+            {entries, [{reply_to, {:error, :stale_cluster_epoch}} | replies], events, broadcasts,
+             new_monitors, maybe_demonitor_pids}
+          else
+            case request do
+              {:join, cluster, _epoch, key, pid, meta} ->
+                member = {cluster, key, pid}
+                {initial, current} = local_pg_batch_entry(entries, name, shard, member)
 
-              case current do
-                nil ->
-                  time = System.system_time()
-                  new_monitors = ensure_local_batch_monitor(state, new_monitors, pid)
+                case current do
+                  nil ->
+                    time = System.system_time()
+                    new_monitors = ensure_local_batch_monitor(state, new_monitors, pid)
 
-                  {
-                    Map.put(entries, member, {initial, {meta, time, local_node}}),
-                    [{reply_to, :ok} | replies],
-                    [
-                      build_event(name, :joined, key, pid, meta, %{
-                        previous_meta: nil,
-                        cluster: cluster
-                      })
-                      | events
-                    ],
-                    [
-                      {:join, cluster, key, pid, meta, time, :join, node(pid)} | broadcasts
-                    ],
-                    new_monitors,
-                    maybe_demonitor_pids
-                  }
+                    {
+                      Map.put(entries, member, {initial, {meta, time, local_node}}),
+                      [{reply_to, :ok} | replies],
+                      [
+                        build_event(name, :joined, key, pid, meta, %{
+                          previous_meta: nil,
+                          cluster: cluster
+                        })
+                        | events
+                      ],
+                      [
+                        {:join, cluster, key, pid, meta, time, :join, node(pid)} | broadcasts
+                      ],
+                      new_monitors,
+                      maybe_demonitor_pids
+                    }
 
-                {old_meta, _time, _node} when old_meta == meta ->
-                  {entries, [{reply_to, :ok} | replies], events, broadcasts, new_monitors,
-                   maybe_demonitor_pids}
+                  {old_meta, _time, _node} when old_meta == meta ->
+                    {entries, [{reply_to, :ok} | replies], events, broadcasts, new_monitors,
+                     maybe_demonitor_pids}
 
-                {old_meta, _time, _node} ->
-                  time = System.system_time()
+                  {old_meta, _time, _node} ->
+                    time = System.system_time()
 
-                  {
-                    Map.put(entries, member, {initial, {meta, time, local_node}}),
-                    [{reply_to, :ok} | replies],
-                    [
-                      build_event(name, :joined, key, pid, meta, %{
-                        previous_meta: old_meta,
-                        cluster: cluster
-                      })
-                      | events
-                    ],
-                    [
-                      {:join, cluster, key, pid, meta, time, :update, node(pid)} | broadcasts
-                    ],
-                    new_monitors,
-                    maybe_demonitor_pids
-                  }
-              end
+                    {
+                      Map.put(entries, member, {initial, {meta, time, local_node}}),
+                      [{reply_to, :ok} | replies],
+                      [
+                        build_event(name, :joined, key, pid, meta, %{
+                          previous_meta: old_meta,
+                          cluster: cluster
+                        })
+                        | events
+                      ],
+                      [
+                        {:join, cluster, key, pid, meta, time, :update, node(pid)} | broadcasts
+                      ],
+                      new_monitors,
+                      maybe_demonitor_pids
+                    }
+                end
 
-            {:leave, cluster, key, pid} ->
-              member = {cluster, key, pid}
-              {initial, current} = local_pg_batch_entry(entries, name, shard, member)
+              {:leave, cluster, _epoch, key, pid} ->
+                member = {cluster, key, pid}
+                {initial, current} = local_pg_batch_entry(entries, name, shard, member)
 
-              case current do
-                nil ->
-                  {entries, [{reply_to, {:error, :not_in_group}} | replies], events, broadcasts,
-                   new_monitors, maybe_demonitor_pids}
+                case current do
+                  nil ->
+                    {entries, [{reply_to, {:error, :not_in_group}} | replies], events, broadcasts,
+                     new_monitors, maybe_demonitor_pids}
 
-                {meta, _time, _node} ->
-                  {
-                    Map.put(entries, member, {initial, nil}),
-                    [{reply_to, :ok} | replies],
-                    [
-                      build_event(name, :left, key, pid, meta, %{reason: :leave, cluster: cluster})
-                      | events
-                    ],
-                    [
-                      {:leave, cluster, key, pid, meta, :leave} | broadcasts
-                    ],
-                    new_monitors,
-                    MapSet.put(maybe_demonitor_pids, pid)
-                  }
-              end
+                  {meta, _time, _node} ->
+                    {
+                      Map.put(entries, member, {initial, nil}),
+                      [{reply_to, :ok} | replies],
+                      [
+                        build_event(name, :left, key, pid, meta, %{
+                          reason: :leave,
+                          cluster: cluster
+                        })
+                        | events
+                      ],
+                      [
+                        {:leave, cluster, key, pid, meta, :leave} | broadcasts
+                      ],
+                      new_monitors,
+                      MapSet.put(maybe_demonitor_pids, pid)
+                    }
+                end
+            end
           end
         end
       )
@@ -1875,8 +1945,8 @@ defmodule Group.Replica do
     end)
   end
 
-  defp local_request_domain({:join, _cluster, _key, _pid, _meta}), do: :pg
-  defp local_request_domain({:leave, _cluster, _key, _pid}), do: :pg
+  defp local_request_domain({:join, _cluster, _epoch, _key, _pid, _meta}), do: :pg
+  defp local_request_domain({:leave, _cluster, _epoch, _key, _pid}), do: :pg
   defp local_request_domain(_request), do: :other
 
   defp do_register(state, cluster, key, pid, meta) do
@@ -2061,13 +2131,6 @@ defmodule Group.Replica do
     peers = Data.cluster_nodes(name, nil) -- [node()]
 
     for target_node <- peers do
-      shared =
-        Enum.filter(clusters, fn cluster ->
-          not is_nil(Data.remote_cluster_epoch(name, target_node, cluster))
-        end)
-
-      Data.add_cluster_node(name, shared, target_node)
-
       send_remote_shard_message(
         state,
         target_node,
@@ -2087,9 +2150,55 @@ defmodule Group.Replica do
         Enum.map(clusters, &{&1, Data.closed_local_cluster_epoch(state.name, &1)})
       )
 
-  defp do_cluster_disconnect(state, clusters, epochs) do
+  defp do_cluster_disconnect(state, _clusters, epochs) do
+    epochs =
+      Enum.filter(epochs, fn
+        {cluster, epoch} when not is_nil(epoch) ->
+          Data.closed_local_cluster_pending?(
+            state.name,
+            cluster,
+            epoch,
+            state.shard_index
+          )
+
+        _ ->
+          false
+      end)
+
+    case epochs do
+      [] -> {:ok, state}
+      epochs -> do_cluster_disconnect_epochs(state, epochs)
+    end
+  end
+
+  defp do_cluster_disconnect_epochs(state, epochs) do
     state = flush_pending_replicated_sender_barrier(state)
     %{name: name, shard_index: shard} = state
+    clusters = Enum.map(epochs, &elem(&1, 0))
+
+    closed_streams =
+      Enum.flat_map(epochs, fn
+        {cluster, epoch} when not is_nil(epoch) ->
+          [
+            WireProtocol.stream_id(
+              name,
+              node(),
+              Data.generation(name),
+              shard,
+              cluster,
+              epoch
+            )
+          ]
+
+        _ ->
+          []
+      end)
+
+    state = discard_snapshot_send_offsets_for_streams(state, closed_streams)
+
+    # See the nodedown ordering note: restart repair rejects remote rows whose
+    # receive cursor was cleared before this cluster-wide purge.
+    :ok = Data.delete_replica_cursors_for_clusters(name, shard, clusters)
 
     log_once(state, fn ->
       "#{log_prefix(state)} cluster_disconnect #{inspect(clusters)}"
@@ -2122,8 +2231,6 @@ defmodule Group.Replica do
     # Forget their receive cursors as well: if this node later reconnects while
     # a remote origin kept the same epoch, its advertised head must rebuild the
     # rows instead of being mistaken for data we still retain.
-    :ok = Data.delete_replica_cursors_for_clusters(name, shard, clusters)
-
     if shard == 0 do
       broadcast_to_peers(
         state,
@@ -2140,8 +2247,7 @@ defmodule Group.Replica do
         :ok
     end)
 
-    completed_clusters = Data.mark_closed_cluster_shard(name, clusters, shard)
-    if completed_clusters != [], do: Data.remove_clusters(name, completed_clusters)
+    _completed_clusters = Data.mark_closed_cluster_shard(name, epochs, shard)
     notify_monitors(name, events)
     {:ok, state}
   end
@@ -2257,102 +2363,80 @@ defmodule Group.Replica do
     |> take_one_local_request_turn()
   end
 
-  defp take_priority_control_turn(state) do
+  defp take_priority_control_turn(state),
+    do: take_priority_control_turn(state, @priority_control_quota)
+
+  defp take_priority_control_turn(state, 0), do: state
+
+  defp take_priority_control_turn(state, remaining) do
     receive do
       {:peer_connect, _remote_pid, _remote_shard_index, _remote_num_shards, _remote_clusters} =
           msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:peer_connect_ack, _remote_pid, _remote_shard_index, _remote_num_shards, _remote_clusters} =
           msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
-
-      {:cluster_connect, _clusters, _remote_pid} = msg ->
-        state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
-
-      {:cluster_connect_ack, _clusters, _remote_pid, _cluster_data} = msg ->
-        state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
-
-      {:cluster_disconnect, _clusters, _remote_pid} = msg ->
-        state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
-
-      {:cluster_state, _cluster, _reg_data, _pg_data} = msg ->
-        state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:replica_hello, _remote_pid, _version, _generation, _epoch_revision, _cluster_epochs,
        _transport_id, _descriptor} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:replica_lane_hello, _remote_pid, _version, _generation, _epoch_revision, _transport_id,
        _descriptor} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:replica_authority_installed_local, _remote_node, _generation, _epoch_revision,
        _old_generation, _stale_epochs} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
-
-      {:replica_authority_removed_local, _remote_node} = msg ->
-        state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:replica_authority_dirty_local, _remote_node} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:replica_cluster_open_control_local, _remote_node, _generation, _revision, _epochs, _stale,
        _shared} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:replica_cluster_close_control_local, _remote_node, _generation, _revision, _closed} =
           msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
-      {:replica_heartbeat, _remote_pid, _version, _generation, _epoch_revision} = msg ->
+      {:replica_heartbeat, _remote_pid, _version, _generation, _epoch_revision, _transport_id,
+       _transport_descriptor} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:replica_hello_request, _remote_pid} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:replica_cluster_open, _remote_pid, _generation, _revision, _epochs} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:replica_cluster_close, _remote_pid, _generation, _revision, _epochs} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
-
-      {:send_cluster_data, _clusters, _target_node} = msg ->
-        state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
-
-      {:replicate_process_down_batch, _reg_entries, _pg_entries} = msg ->
-        state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:DOWN, _mref, :process, _pid, _reason} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:nodeup, _remote_node} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
 
       {:nodedown, _remote_node} = msg ->
         state = process_inline_priority_message(state, msg)
-        take_priority_control_turn(state)
+        take_priority_control_turn(state, remaining - 1)
     after
       0 ->
         state
@@ -2367,6 +2451,9 @@ defmodule Group.Replica do
 
       {@local_request_tag, alias_ref, request} when is_reference(alias_ref) ->
         process_local_request_turn(state, [{{:alias, alias_ref}, request}])
+
+      {@local_request_tag, :noreply, request} ->
+        process_local_request_turn(state, [{:noreply, request}])
     after
       0 ->
         state
@@ -2887,37 +2974,48 @@ defmodule Group.Replica do
          generation,
          epoch_revision,
          cluster_epochs,
-         transport_id,
+         _transport_id,
          transport_descriptor
        ) do
     remote_node = node(remote_pid)
 
-    shared =
-      cluster_epochs
-      |> Enum.map(&elem(&1, 0))
-      |> compute_shared_clusters(Data.my_clusters(state.name))
+    case Data.put_remote_replica_info(
+           state.name,
+           0,
+           remote_node,
+           generation,
+           epoch_revision,
+           cluster_epochs
+         ) do
+      :stale ->
+        state
+        |> mark_cluster_control_dirty(remote_node)
+        |> request_replica_authority(remote_node)
 
-    previous_shared = Data.clusters_for_node(state.name, remote_node) -- [nil]
-    shared_set = MapSet.new(shared)
-    departed = Enum.reject(previous_shared, &MapSet.member?(shared_set, &1))
-    Data.remove_cluster_node(state.name, departed, remote_node)
+      {old_generation, stale_epochs} ->
+        finish_replica_authority_install(
+          state,
+          remote_pid,
+          remote_node,
+          generation,
+          epoch_revision,
+          transport_descriptor,
+          old_generation,
+          stale_epochs
+        )
+    end
+  end
 
-    Data.add_cluster_node(
-      state.name,
-      [nil | Enum.reject(shared, &is_nil/1)],
-      remote_node
-    )
-
-    {old_generation, stale_epochs} =
-      Data.put_remote_replica_info(
-        state.name,
-        0,
-        remote_node,
-        generation,
-        epoch_revision,
-        cluster_epochs
-      )
-
+  defp finish_replica_authority_install(
+         state,
+         remote_pid,
+         remote_node,
+         generation,
+         epoch_revision,
+         transport_descriptor,
+         old_generation,
+         stale_epochs
+       ) do
     state = maybe_purge_remote_generation(state, remote_node, old_generation, generation)
     state = notify_replica_transport_peer_up(state, remote_node, transport_descriptor)
 
@@ -2930,24 +3028,29 @@ defmodule Group.Replica do
         state
       end
 
-    :ok = install_replica_view(state, remote_node, generation)
+    state = install_replica_view(state, remote_node, generation)
 
-    state = %{
+    if replica_authority_current?(state, remote_node, generation, epoch_revision) and
+         replica_view_current?(state, remote_node) do
+      state = %{
+        state
+        | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid),
+          peer_last_seen: Map.put(state.peer_last_seen, remote_node, monotonic_millis()),
+          cluster_control_dirty: Map.delete(state.cluster_control_dirty, remote_node)
+      }
+
+      fan_out_to_siblings(
+        state,
+        {:replica_authority_installed_local, remote_node, generation, epoch_revision,
+         old_generation, stale_epochs}
+      )
+
+      send_replica_heads(state, remote_node)
+    else
       state
-      | remote_shards: Map.put(state.remote_shards, remote_node, remote_pid),
-        peer_last_seen: Map.put(state.peer_last_seen, remote_node, monotonic_millis()),
-        cluster_control_dirty: Map.delete(state.cluster_control_dirty, remote_node),
-        peer_transports:
-          Map.put(state.peer_transports, remote_node, {transport_id, transport_descriptor})
-    }
-
-    fan_out_to_siblings(
-      state,
-      {:replica_authority_installed_local, remote_node, generation, epoch_revision,
-       old_generation, stale_epochs}
-    )
-
-    send_replica_heads(state, remote_node)
+      |> mark_cluster_control_dirty(remote_node)
+      |> request_replica_authority(remote_node)
+    end
   end
 
   defp notify_replica_transport_peer_up(state, remote_node, transport_descriptor) do
@@ -2997,27 +3100,69 @@ defmodule Group.Replica do
 
   defp replica_authority_current?(state, remote_node, generation, epoch_revision) do
     Data.remote_generation(state.name, remote_node) == generation and
-      Data.remote_cluster_epoch_observed_revision(state.name, remote_node) == epoch_revision
+      Data.remote_cluster_epoch_observed_revision(state.name, remote_node) == epoch_revision and
+      Data.remote_replica_authority_hint(state.name, remote_node) ==
+        {generation, epoch_revision}
+  end
+
+  defp replica_exact_authority_current?(state, remote_node, generation, epoch_revision) do
+    replica_authority_current?(state, remote_node, generation, epoch_revision) and
+      Data.remote_cluster_epoch_exact_revision(state.name, remote_node) == epoch_revision
   end
 
   defp replica_view_current?(state, remote_node) do
-    Data.remote_view_generation(state.name, state.shard_index, remote_node) ==
-      Data.remote_generation(state.name, remote_node) and
+    known_generation = Data.remote_generation(state.name, remote_node)
+    observed_revision = Data.remote_cluster_epoch_observed_revision(state.name, remote_node)
+
+    Data.remote_replica_authority_hint(state.name, remote_node) ==
+      {known_generation, observed_revision} and
+      Data.remote_cluster_epoch_revision(state.name, remote_node) == observed_revision and
+      Data.remote_view_generation(state.name, state.shard_index, remote_node) ==
+        known_generation and
       Data.remote_view_cluster_epoch_revision(state.name, state.shard_index, remote_node) ==
         Data.remote_cluster_epoch_exact_revision(state.name, remote_node) and
       Data.remote_view_observed_revision(state.name, state.shard_index, remote_node) ==
-        Data.remote_cluster_epoch_observed_revision(state.name, remote_node)
+        observed_revision
+  end
+
+  defp observe_replica_authority_hint(state, remote_node, generation, epoch_revision) do
+    if WireProtocol.valid_generation?(generation) and is_integer(epoch_revision) and
+         epoch_revision >= 0 and
+         Data.observe_remote_replica_hint(
+           state.name,
+           remote_node,
+           generation,
+           epoch_revision
+         ) do
+      # A heartbeat or lane hello can outrun a dropped authority control. Data
+      # has already fenced every affected lane; retain an exact-hello retry
+      # obligation independently of this one best-effort request.
+      state
+      |> ensure_replica_peer_retirement_deadline(remote_node)
+      |> mark_authority_dirty(remote_node)
+      |> request_replica_authority(remote_node)
+    else
+      state
+    end
   end
 
   defp install_replica_view(state, remote_node, generation) do
-    Data.put_remote_view_info(
-      state.name,
-      state.shard_index,
-      remote_node,
-      generation,
-      Data.remote_cluster_epoch_exact_revision(state.name, remote_node),
-      Data.remote_cluster_epoch_observed_revision(state.name, remote_node)
-    )
+    case Data.put_remote_view_info(
+           state.name,
+           state.shard_index,
+           remote_node,
+           generation,
+           Data.remote_cluster_epoch_exact_revision(state.name, remote_node),
+           Data.remote_cluster_epoch_observed_revision(state.name, remote_node)
+         ) do
+      :ok ->
+        reproject_pending_registry_keys(state, remote_node)
+
+      :stale ->
+        state
+        |> mark_authority_dirty(remote_node)
+        |> request_replica_authority(remote_node)
+    end
   end
 
   defp install_current_replica_lane(state, remote_node, generation) do
@@ -3026,12 +3171,16 @@ defmodule Group.Replica do
 
     state = maybe_purge_remote_generation(state, remote_node, old_generation, generation)
     state = purge_remote_streams_outside_authority(state, remote_node)
-    :ok = install_replica_view(state, remote_node, generation)
+    state = install_replica_view(state, remote_node, generation)
 
-    state
-    |> touch_replica_peer(remote_node)
-    |> Map.update!(:cluster_control_dirty, &Map.delete(&1, remote_node))
-    |> send_replica_heads(remote_node)
+    if replica_view_current?(state, remote_node) do
+      state
+      |> touch_replica_peer(remote_node)
+      |> Map.update!(:cluster_control_dirty, &Map.delete(&1, remote_node))
+      |> send_replica_heads(remote_node)
+    else
+      state
+    end
   end
 
   defp schedule_anti_entropy(state) do
@@ -3056,6 +3205,13 @@ defmodule Group.Replica do
     %{state | peer_last_seen: Map.put(state.peer_last_seen, remote_node, monotonic_millis())}
   end
 
+  defp ensure_replica_peer_retirement_deadline(state, remote_node) do
+    %{
+      state
+      | peer_last_seen: Map.put_new(state.peer_last_seen, remote_node, monotonic_millis())
+    }
+  end
+
   defp collect_replica_cluster_controls(_tag, _remote_pid, _generation, acc, 0),
     do: Enum.reverse(acc)
 
@@ -3075,40 +3231,53 @@ defmodule Group.Replica do
   end
 
   defp accepted_replica_cluster_epochs(state, remote_node, generation, controls) do
-    case Data.remote_view_generation(state.name, state.shard_index, remote_node) do
-      ^generation ->
-        authoritative_revision =
-          Data.remote_view_cluster_epoch_revision(
-            state.name,
-            state.shard_index,
-            remote_node
-          )
+    case {
+      Data.remote_replica_authority_hint(state.name, remote_node),
+      Data.remote_view_generation(state.name, state.shard_index, remote_node)
+    } do
+      {{^generation, _hinted_revision}, ^generation} ->
+        expected_revision =
+          Data.remote_cluster_epoch_observed_revision(state.name, remote_node)
 
         accepted =
           Enum.filter(controls, fn {revision, _epochs} ->
-            is_nil(authoritative_revision) or revision > authoritative_revision
+            is_nil(expected_revision) or revision > expected_revision
           end)
+          |> Enum.sort_by(&elem(&1, 0))
+          |> Enum.uniq_by(&elem(&1, 0))
 
         case accepted do
           [] ->
             :stale
 
           accepted ->
-            accepted = Enum.sort_by(accepted, &elem(&1, 0))
-            observed_revision = accepted |> List.last() |> elem(0)
+            next_revision = (expected_revision || -1) + 1
 
-            epochs =
-              accepted
-              |> Enum.flat_map(&elem(&1, 1))
-              |> Map.new()
-              |> Map.to_list()
+            if contiguous_cluster_controls?(accepted, next_revision) do
+              observed_revision = accepted |> List.last() |> elem(0)
 
-            {:accept, observed_revision, epochs}
+              epochs =
+                accepted
+                |> Enum.flat_map(&elem(&1, 1))
+                |> Map.new()
+                |> Map.to_list()
+
+              {:accept, expected_revision, observed_revision, epochs}
+            else
+              {:gap, accepted |> List.last() |> elem(0)}
+            end
         end
 
-      _other_generation ->
+      _other_authority ->
         :refresh
     end
+  end
+
+  defp contiguous_cluster_controls?(controls, expected_revision) do
+    Enum.reduce_while(controls, expected_revision, fn
+      {^expected_revision, _epochs}, ^expected_revision -> {:cont, expected_revision + 1}
+      _control, _expected -> {:halt, false}
+    end) != false
   end
 
   defp mark_cluster_control_dirty(state, remote_node) do
@@ -3127,12 +3296,16 @@ defmodule Group.Replica do
     if MapSet.member?(state.authority_dirty_notified, remote_node) do
       state
     else
-      send(shard_name(state.name, 0), {:replica_authority_dirty_local, remote_node})
+      case send_local_control_message(state, {:replica_authority_dirty_local, remote_node}) do
+        :ok ->
+          %{
+            state
+            | authority_dirty_notified: MapSet.put(state.authority_dirty_notified, remote_node)
+          }
 
-      %{
-        state
-        | authority_dirty_notified: MapSet.put(state.authority_dirty_notified, remote_node)
-      }
+        :disconnected ->
+          state
+      end
     end
   end
 
@@ -3141,11 +3314,17 @@ defmodule Group.Replica do
 
     dirty =
       Enum.reduce(state.cluster_control_dirty, %{}, fn {remote_node, last_activity}, acc ->
-        if now - last_activity >= state.replicated_anti_entropy_interval do
-          request_replica_authority(state, remote_node)
-          Map.put(acc, remote_node, now)
-        else
-          Map.put(acc, remote_node, last_activity)
+        cond do
+          is_nil(Data.remote_generation(state.name, remote_node)) and
+              is_nil(Data.remote_replica_authority_hint(state.name, remote_node)) ->
+            acc
+
+          now - last_activity >= state.replicated_anti_entropy_interval ->
+            request_replica_authority(state, remote_node)
+            Map.put(acc, remote_node, now)
+
+          true ->
+            Map.put(acc, remote_node, last_activity)
         end
       end)
 
@@ -3153,12 +3332,15 @@ defmodule Group.Replica do
   end
 
   defp broadcast_replica_heartbeats(state) do
+    transport_id = state.replica_transport.id()
+    descriptor = state.replica_transport.descriptor(state.name, state.replica_transport_opts)
+
     Enum.reduce(state.remote_shards, state, fn {target_node, _pid}, acc ->
       send_remote_shard_message(
         acc,
         target_node,
         {:replica_heartbeat, self(), WireProtocol.version(), Data.generation(acc.name),
-         Data.local_cluster_epoch_revision(acc.name)}
+         Data.local_cluster_epoch_revision(acc.name), transport_id, descriptor}
       )
 
       acc
@@ -3248,13 +3430,35 @@ defmodule Group.Replica do
     end)
   end
 
+  defp discard_snapshot_send_offsets_for_target(state, target_node) do
+    offsets =
+      Map.reject(state.snapshot_send_offsets, fn
+        {{^target_node, _stream_id, _head}, _chunk_index} -> true
+        {_key, _chunk_index} -> false
+      end)
+
+    %{state | snapshot_send_offsets: offsets}
+  end
+
+  defp discard_snapshot_send_offsets_for_streams(state, stream_ids) do
+    stream_ids = MapSet.new(stream_ids)
+
+    offsets =
+      Map.reject(state.snapshot_send_offsets, fn
+        {{_target_node, stream_id, _head}, _chunk_index} ->
+          MapSet.member?(stream_ids, stream_id)
+      end)
+
+    %{state | snapshot_send_offsets: offsets}
+  end
+
   defp expire_replica_peer(state, remote_node) do
     state = discard_snapshot_transfers_for_source(state, remote_node)
+    state = discard_snapshot_send_offsets_for_target(state, remote_node)
+    state = discard_pending_registry_reprojections(state, remote_node)
     %{name: name, shard_index: shard} = state
 
-    if shard == 0 do
-      Data.purge_cluster_node(name, remote_node)
-    end
+    Data.delete_replica_cursors_for_origin(name, shard, remote_node)
 
     {purged_reg, purged_pg} = Data.purge_node(name, shard, remote_node)
     affected_claims = Data.purge_registry_claims_for_origin(name, shard, remote_node)
@@ -3266,12 +3470,9 @@ defmodule Group.Replica do
       end)
 
     notify_monitors(name, events)
-    Data.delete_replica_cursors_for_origin(name, shard, remote_node)
-    Data.delete_remote_replica_info(name, shard, remote_node)
 
-    if shard == 0 do
-      fan_out_to_siblings(state, {:replica_authority_removed_local, remote_node})
-    end
+    retirement = Data.expire_remote_replica_lane(name, shard, remote_node)
+    if retirement == :node_retired, do: Data.purge_cluster_node(name, remote_node)
 
     if function_exported?(state.replica_transport, :peer_down, 4) do
       :ok =
@@ -3288,8 +3489,7 @@ defmodule Group.Replica do
       | remote_shards: Map.delete(state.remote_shards, remote_node),
         peer_last_seen: Map.delete(state.peer_last_seen, remote_node),
         cluster_control_dirty: Map.delete(state.cluster_control_dirty, remote_node),
-        authority_dirty_notified: MapSet.delete(state.authority_dirty_notified, remote_node),
-        peer_transports: Map.delete(state.peer_transports, remote_node)
+        authority_dirty_notified: MapSet.delete(state.authority_dirty_notified, remote_node)
     }
   end
 
@@ -3335,7 +3535,8 @@ defmodule Group.Replica do
   end
 
   defp replica_stream_target?(state, stream_id, target_node) do
-    WireProtocol.stream_name(stream_id) == state.name and
+    WireProtocol.valid_stream_id?(stream_id) and
+      WireProtocol.stream_name(stream_id) == state.name and
       WireProtocol.stream_origin(stream_id) == node() and
       WireProtocol.stream_shard(stream_id) == state.shard_index and
       WireProtocol.stream_generation(stream_id) == Data.generation(state.name) and
@@ -3348,49 +3549,49 @@ defmodule Group.Replica do
   end
 
   defp valid_remote_stream?(state, source_node, stream_id) do
-    cluster = WireProtocol.stream_cluster(stream_id)
+    if WireProtocol.valid_stream_id?(stream_id) do
+      cluster = WireProtocol.stream_cluster(stream_id)
 
-    WireProtocol.stream_name(stream_id) == state.name and
-      WireProtocol.stream_origin(stream_id) == source_node and
-      WireProtocol.stream_shard(stream_id) == state.shard_index and
-      replica_view_current?(state, source_node) and
-      WireProtocol.stream_generation(stream_id) == Data.remote_generation(state.name, source_node) and
-      WireProtocol.stream_epoch(stream_id) ==
-        Data.remote_cluster_epoch(state.name, source_node, cluster) and
-      (is_nil(cluster) or cluster_member?(state.name, cluster))
+      WireProtocol.stream_name(stream_id) == state.name and
+        WireProtocol.stream_origin(stream_id) == source_node and
+        WireProtocol.stream_shard(stream_id) == state.shard_index and
+        replica_view_current?(state, source_node) and
+        WireProtocol.stream_generation(stream_id) ==
+          Data.remote_generation(state.name, source_node) and
+        WireProtocol.stream_epoch(stream_id) ==
+          Data.remote_cluster_epoch(state.name, source_node, cluster) and
+        (is_nil(cluster) or cluster_member?(state.name, cluster))
+    else
+      false
+    end
   end
 
   defp handle_replica_message(state, source_node, {:heads, version, heads})
-       when version == @protocol_version do
-    needs =
-      Enum.flat_map(heads, fn {stream_id, _floor, head} ->
-        if valid_remote_stream?(state, source_node, stream_id) do
-          cursor = Data.replica_cursor(state.name, state.shard_index, stream_id)
-          if head > cursor, do: [{stream_id, cursor + 1}], else: []
-        else
-          []
-        end
-      end)
-
-    needs
-    |> Enum.chunk_every(state.replicated_sender_buffer_size)
-    |> Enum.reduce(state, fn chunk, acc ->
-      outgoing_replica_message(acc, source_node, {:needs, WireProtocol.version(), chunk})
-    end)
+       when version == @protocol_version and is_list(heads) do
+    if Enum.all?(heads, &valid_replica_head?/1) do
+      handle_replica_heads(state, source_node, heads)
+    else
+      state
+    end
   end
 
   defp handle_replica_message(state, source_node, {:delta_batch, version, runs})
-       when version == @protocol_version do
-    state = flush_pending_replicated_sender_barrier(state)
+       when version == @protocol_version and is_list(runs) do
+    if Enum.all?(runs, &valid_replica_delta_run?/1) do
+      state = flush_pending_replicated_sender_barrier(state)
 
-    Enum.reduce(runs, state, fn {stream_id, _first_seq, records, advertised_head}, acc ->
-      apply_replica_delta_run(acc, source_node, stream_id, records, advertised_head)
-    end)
+      Enum.reduce(runs, state, fn {stream_id, _first_seq, records, advertised_head}, acc ->
+        apply_replica_delta_run(acc, source_node, stream_id, records, advertised_head)
+      end)
+    else
+      state
+    end
   end
 
   defp handle_replica_message(state, source_node, {:need, version, stream_id, next_seq})
-       when version == @protocol_version do
-    if WireProtocol.stream_origin(stream_id) == node() and
+       when version == @protocol_version and is_integer(next_seq) and next_seq > 0 do
+    if WireProtocol.valid_stream_id?(stream_id) and
+         WireProtocol.stream_origin(stream_id) == node() and
          WireProtocol.stream_shard(stream_id) == state.shard_index and
          replica_stream_target?(state, stream_id, source_node) do
       send_replica_repair(state, source_node, stream_id, next_seq)
@@ -3400,8 +3601,12 @@ defmodule Group.Replica do
   end
 
   defp handle_replica_message(state, source_node, {:needs, version, needs})
-       when version == @protocol_version do
-    send_replica_repairs(state, source_node, needs)
+       when version == @protocol_version and is_list(needs) do
+    if Enum.all?(needs, &valid_replica_need?/1) do
+      send_replica_repairs(state, source_node, needs)
+    else
+      state
+    end
   end
 
   defp handle_replica_message(
@@ -3455,6 +3660,24 @@ defmodule Group.Replica do
 
   defp handle_replica_message(state, _source_node, _message), do: state
 
+  defp handle_replica_heads(state, source_node, heads) do
+    needs =
+      Enum.flat_map(heads, fn {stream_id, _floor, head} ->
+        if valid_remote_stream?(state, source_node, stream_id) do
+          cursor = Data.replica_cursor(state.name, state.shard_index, stream_id)
+          if head > cursor, do: [{stream_id, cursor + 1}], else: []
+        else
+          []
+        end
+      end)
+
+    needs
+    |> Enum.chunk_every(state.replicated_sender_buffer_size)
+    |> Enum.reduce(state, fn chunk, acc ->
+      outgoing_replica_message(acc, source_node, {:needs, WireProtocol.version(), chunk})
+    end)
+  end
+
   defp valid_snapshot_stream?(state, source_node, stream_id, snapshot_seq) do
     valid_remote_stream?(state, source_node, stream_id) and
       snapshot_seq > Data.replica_cursor(state.name, state.shard_index, stream_id)
@@ -3482,7 +3705,8 @@ defmodule Group.Replica do
     cluster = WireProtocol.stream_cluster(stream_id)
 
     Enum.all?(reg_data, fn
-      {key, pid, _meta, _time} when is_pid(pid) ->
+      {key, pid, meta, time}
+      when is_binary(key) and is_pid(pid) and is_map(meta) and is_integer(time) ->
         node(pid) == source_node and
           shard_index_for(cluster, key, state.num_shards) == state.shard_index
 
@@ -3490,13 +3714,58 @@ defmodule Group.Replica do
         false
     end) and
       Enum.all?(pg_data, fn
-        {key, pid, _meta, _time} when is_pid(pid) ->
+        {key, pid, meta, time}
+        when is_binary(key) and is_pid(pid) and is_map(meta) and is_integer(time) ->
           node(pid) == source_node and
             shard_index_for(cluster, key, state.num_shards) == state.shard_index
 
         _other ->
           false
-      end)
+      end) and unique_snapshot_rows?(reg_data, pg_data)
+  end
+
+  defp unique_snapshot_rows?(reg_data, pg_data) do
+    reg_data
+    |> MapSet.new(fn {key, _pid, _meta, _time} -> key end)
+    |> MapSet.size() == length(reg_data) and
+      pg_data
+      |> MapSet.new(fn {key, pid, _meta, _time} -> {key, pid} end)
+      |> MapSet.size() == length(pg_data)
+  end
+
+  defp valid_replica_head?({stream_id, floor, head}) do
+    WireProtocol.valid_stream_id?(stream_id) and is_integer(floor) and floor >= 1 and
+      is_integer(head) and head >= 0 and floor <= head + 1
+  end
+
+  defp valid_replica_head?(_head), do: false
+
+  defp valid_replica_need?({stream_id, next_seq}) do
+    WireProtocol.valid_stream_id?(stream_id) and is_integer(next_seq) and next_seq > 0
+  end
+
+  defp valid_replica_need?(_need), do: false
+
+  defp valid_replica_delta_run?({stream_id, first_seq, records, advertised_head})
+       when is_integer(first_seq) and first_seq > 0 and is_list(records) and records != [] and
+              is_integer(advertised_head) and advertised_head >= first_seq do
+    WireProtocol.valid_stream_id?(stream_id) and
+      valid_replica_record_sequence?(records, first_seq, advertised_head)
+  end
+
+  defp valid_replica_delta_run?(_run), do: false
+
+  defp valid_replica_record_sequence?(records, first_seq, advertised_head) do
+    case Enum.reduce_while(records, first_seq, fn
+           {seq, mutations}, expected when seq == expected and is_list(mutations) ->
+             {:cont, expected + 1}
+
+           _record, _expected ->
+             {:halt, :invalid}
+         end) do
+      next_seq when is_integer(next_seq) -> next_seq - 1 <= advertised_head
+      :invalid -> false
+    end
   end
 
   defp stage_replica_snapshot_chunk(
@@ -3610,6 +3879,14 @@ defmodule Group.Replica do
         state = flush_pending_replicated_barrier(state)
         cluster = WireProtocol.stream_cluster(stream_id)
 
+        :ok =
+          Data.begin_replica_snapshot_install(
+            state.name,
+            state.shard_index,
+            stream_id,
+            transfer.snapshot_seq
+          )
+
         affected_registry_keys =
           Data.replace_registry_claims_for_stream_from_staging(
             state.name,
@@ -3663,6 +3940,14 @@ defmodule Group.Replica do
     state = flush_pending_replicated_barrier(state)
     cluster = WireProtocol.stream_cluster(stream_id)
 
+    :ok =
+      Data.begin_replica_snapshot_install(
+        state.name,
+        state.shard_index,
+        stream_id,
+        snapshot_seq
+      )
+
     affected_registry_keys =
       Data.replace_registry_claims_for_stream(
         state.name,
@@ -3700,7 +3985,7 @@ defmodule Group.Replica do
 
           {accepted, rejected} =
             Enum.split_while(contiguous, fn {_seq, mutations} ->
-              valid_replica_mutations?(stream_id, mutations)
+              valid_replica_mutations?(state, stream_id, mutations)
             end)
 
           if rejected != [] do
@@ -3710,7 +3995,12 @@ defmodule Group.Replica do
           end
 
           state =
-            apply_received_replica_records(state, stream_id, accepted)
+            if accepted == [] do
+              state
+            else
+              :ok = Data.ensure_replica_cursor(state.name, state.shard_index, stream_id)
+              apply_received_replica_records(state, stream_id, accepted)
+            end
             |> flush_pending_replicated_barrier()
 
           case List.last(accepted) do
@@ -3745,38 +4035,68 @@ defmodule Group.Replica do
   defp take_contiguous_replica_records(_records, next_seq, acc),
     do: {Enum.reverse(acc), next_seq}
 
-  defp valid_replica_mutations?(stream_id, mutations) do
+  defp valid_replica_mutations?(state, stream_id, mutations) do
     origin = WireProtocol.stream_origin(stream_id)
     cluster = WireProtocol.stream_cluster(stream_id)
 
-    mutations != [] and Enum.all?(mutations, &valid_replica_mutation?(&1, cluster, origin))
+    mutations != [] and
+      Enum.all?(
+        mutations,
+        &valid_replica_mutation?(
+          &1,
+          cluster,
+          origin,
+          state.shard_index,
+          state.num_shards
+        )
+      )
   end
 
   defp valid_replica_mutation?(
-         {:register, cluster, _key, pid, _meta, _time, entry_node},
+         {:register, cluster, key, pid, meta, time, entry_node},
          cluster,
-         origin
-       ),
-       do: node(pid) == origin and entry_node == origin
+         origin,
+         shard,
+         num_shards
+       )
+       when is_binary(key) and is_pid(pid) and is_map(meta) and is_integer(time),
+       do:
+         node(pid) == origin and entry_node == origin and
+           shard_index_for(cluster, key, num_shards) == shard
 
   defp valid_replica_mutation?(
-         {:unregister, cluster, _key, pid, _meta, _reason},
+         {:unregister, cluster, key, pid, meta, _reason},
          cluster,
-         origin
-       ),
-       do: node(pid) == origin
+         origin,
+         shard,
+         num_shards
+       )
+       when is_binary(key) and is_pid(pid) and is_map(meta),
+       do: node(pid) == origin and shard_index_for(cluster, key, num_shards) == shard
 
   defp valid_replica_mutation?(
-         {:join, cluster, _key, pid, _meta, _time, _reason, entry_node},
+         {:join, cluster, key, pid, meta, time, _reason, entry_node},
          cluster,
-         origin
-       ),
-       do: node(pid) == origin and entry_node == origin
+         origin,
+         shard,
+         num_shards
+       )
+       when is_binary(key) and is_pid(pid) and is_map(meta) and is_integer(time),
+       do:
+         node(pid) == origin and entry_node == origin and
+           shard_index_for(cluster, key, num_shards) == shard
 
-  defp valid_replica_mutation?({:leave, cluster, _key, pid, _meta, _reason}, cluster, origin),
-    do: node(pid) == origin
+  defp valid_replica_mutation?(
+         {:leave, cluster, key, pid, meta, _reason},
+         cluster,
+         origin,
+         shard,
+         num_shards
+       )
+       when is_binary(key) and is_pid(pid) and is_map(meta),
+       do: node(pid) == origin and shard_index_for(cluster, key, num_shards) == shard
 
-  defp valid_replica_mutation?(_mutation, _cluster, _origin), do: false
+  defp valid_replica_mutation?(_mutation, _cluster, _origin, _shard, _num_shards), do: false
 
   defp apply_received_replica_records(state, stream_id, records) do
     records
@@ -3999,33 +4319,131 @@ defmodule Group.Replica do
   end
 
   defp send_replica_snapshot(state, target_node, stream_id, head) do
+    case state.snapshot_send do
+      {worker, _token, _snapshot_key} when is_pid(worker) ->
+        if Process.alive?(worker),
+          do: state,
+          else: start_replica_snapshot_send(state, target_node, stream_id, head)
+
+      nil ->
+        start_replica_snapshot_send(state, target_node, stream_id, head)
+    end
+  end
+
+  defp start_replica_snapshot_send(state, target_node, stream_id, head) do
+    owner = self()
+    token = make_ref()
+    snapshot_key = {target_node, stream_id, head}
+
+    offsets =
+      state.snapshot_send_offsets
+      |> Enum.reject(fn
+        {{^target_node, ^stream_id, other_head}, _chunk_index} -> other_head != head
+        {_other_key, _chunk_index} -> false
+      end)
+      |> Map.new()
+
+    start_index = Map.get(offsets, snapshot_key, 1)
+
+    snapshot_context = %{
+      name: state.name,
+      shard_index: state.shard_index,
+      replicated_snapshot_chunk_target_bytes: state.replicated_snapshot_chunk_target_bytes,
+      replica_transport: state.replica_transport,
+      replica_transport_opts: state.replica_transport_opts
+    }
+
+    worker =
+      spawn(fn ->
+        result =
+          try do
+            capture_and_send_replica_snapshot(
+              snapshot_context,
+              target_node,
+              stream_id,
+              head,
+              start_index
+            )
+          catch
+            kind, reason ->
+              Logger.error(
+                "#{log_prefix_shard(snapshot_context)} snapshot capture failed: " <>
+                  Exception.format_banner(kind, reason)
+              )
+
+              :retry
+          end
+
+        send(
+          owner,
+          {:replica_snapshot_send_complete, token, self(), snapshot_key, result}
+        )
+      end)
+
+    %{state | snapshot_send: {worker, token, snapshot_key}, snapshot_send_offsets: offsets}
+  end
+
+  defp capture_and_send_replica_snapshot(state, target_node, stream_id, head, start_index) do
     cluster = WireProtocol.stream_cluster(stream_id)
     reg_data = Data.registry_claims_for_stream(state.name, state.shard_index, stream_id)
     pg_data = Data.pg_entries_for_origin(state.name, state.shard_index, cluster, node())
 
-    envelope_bytes =
-      Snapshot.frame_envelope_bytes(stream_id, head, length(reg_data), length(pg_data))
+    {_floor, current_head, applied} =
+      Data.replica_stream_head(state.name, state.shard_index, stream_id)
 
-    snapshot =
-      Snapshot.chunk_rows(
-        reg_data,
-        pg_data,
-        state.replicated_snapshot_chunk_target_bytes,
-        envelope_bytes
-      )
+    # Appending a mutation advances the head before materializing its table
+    # changes. Therefore an unchanged, fully-applied head after both scans
+    # proves these rows are one exact state at `head`; an overlapping write
+    # makes the capture disposable and the receiver will ask again.
+    if Data.local_stream_id(state.name, state.shard_index, cluster) == stream_id and
+         current_head == head and applied == head and
+         target_node in Data.cluster_nodes(state.name, cluster) do
+      envelope_bytes =
+        Snapshot.frame_envelope_bytes(stream_id, head, length(reg_data), length(pg_data))
 
-    chunk_count = length(snapshot.chunks)
+      snapshot =
+        Snapshot.chunk_rows(
+          reg_data,
+          pg_data,
+          state.replicated_snapshot_chunk_target_bytes,
+          envelope_bytes
+        )
 
-    snapshot.chunks
-    |> Enum.with_index(1)
-    |> Enum.reduce(state, fn {{reg_chunk, pg_chunk}, chunk_index}, acc ->
-      outgoing_replica_message(
-        acc,
-        target_node,
-        {:snapshot_chunk, WireProtocol.version(), stream_id, head, chunk_index, chunk_count,
-         snapshot.registry_count, snapshot.pg_count, reg_chunk, pg_chunk}
-      )
-    end)
+      chunk_count = length(snapshot.chunks)
+
+      snapshot.chunks
+      |> Enum.with_index(1)
+      |> Enum.drop(start_index - 1)
+      |> Enum.reduce_while(:complete, fn {{reg_chunk, pg_chunk}, chunk_index}, _acc ->
+        message =
+          {:snapshot_chunk, WireProtocol.version(), stream_id, head, chunk_index, chunk_count,
+           snapshot.registry_count, snapshot.pg_count, reg_chunk, pg_chunk}
+
+        case state.replica_transport.outgoing(
+               state.name,
+               target_node,
+               state.shard_index,
+               message,
+               state.replica_transport_opts
+             ) do
+          :ok -> {:cont, :complete}
+          result when result in [:busy, :disconnected] -> {:halt, {:resume, chunk_index}}
+        end
+      end)
+    else
+      :complete
+    end
+  end
+
+  defp current_snapshot_send?(state, {target_node, stream_id, head}) do
+    cluster = WireProtocol.stream_cluster(stream_id)
+
+    {_floor, current_head, applied} =
+      Data.replica_stream_head(state.name, state.shard_index, stream_id)
+
+    Data.local_stream_id(state.name, state.shard_index, cluster) == stream_id and
+      current_head == head and applied == head and
+      target_node in Data.cluster_nodes(state.name, cluster)
   end
 
   defp replace_remote_pg_snapshot_from_staging(
@@ -4163,6 +4581,8 @@ defmodule Group.Replica do
 
   defp maybe_purge_remote_generation(state, remote_node, _old_generation, _generation) do
     state = discard_snapshot_transfers_for_source(state, remote_node)
+    state = discard_pending_registry_reprojections(state, remote_node)
+    Data.delete_replica_cursors_for_origin(state.name, state.shard_index, remote_node)
     {_reg, _pg} = Data.purge_node(state.name, state.shard_index, remote_node)
 
     affected =
@@ -4178,7 +4598,6 @@ defmodule Group.Replica do
       end)
 
     notify_monitors(state.name, events)
-    Data.delete_replica_cursors_for_origin(state.name, state.shard_index, remote_node)
     state
   end
 
@@ -4201,16 +4620,16 @@ defmodule Group.Replica do
 
     state = discard_snapshot_transfers_for_streams(state, stream_ids)
 
+    Enum.each(stream_ids, fn stream_id ->
+      :ok = Data.delete_replica_cursor(state.name, state.shard_index, stream_id)
+    end)
+
     affected_keys =
       Data.purge_registry_claims_for_streams(
         state.name,
         state.shard_index,
         stream_ids
       )
-
-    Enum.each(stream_ids, fn stream_id ->
-      :ok = Data.delete_replica_cursor(state.name, state.shard_index, stream_id)
-    end)
 
     clusters = cluster_epochs |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
 
@@ -4237,6 +4656,7 @@ defmodule Group.Replica do
       end)
 
     notify_monitors(state.name, events)
+
     state
   end
 
@@ -4314,28 +4734,9 @@ defmodule Group.Replica do
     superseded
     |> Enum.group_by(&WireProtocol.stream_cluster/1)
     |> Enum.reduce(state, fn {cluster, cluster_streams}, acc ->
-      affected_keys =
-        Data.purge_registry_claims_for_streams(
-          state.name,
-          state.shard_index,
-          cluster_streams
-        )
-
       Enum.each(cluster_streams, fn stream_id ->
         :ok = Data.delete_replica_cursor(state.name, state.shard_index, stream_id)
       end)
-
-      # PG rows do not carry their stream epoch. Remove the origin/cluster
-      # slice and reset the current cursor so its exact state is rebuilt by
-      # the next head advertisement (delta when retained, snapshot after
-      # pruning). Registry claims do carry epochs and are removed narrowly.
-      purged_pg =
-        Data.delete_pg_for_origin_clusters(
-          state.name,
-          state.shard_index,
-          [cluster],
-          remote_node
-        )
 
       case Map.get(current_epochs, cluster) do
         nil ->
@@ -4355,6 +4756,25 @@ defmodule Group.Replica do
           :ok = Data.delete_replica_cursor(state.name, state.shard_index, current_stream)
       end
 
+      affected_keys =
+        Data.purge_registry_claims_for_streams(
+          state.name,
+          state.shard_index,
+          cluster_streams
+        )
+
+      # PG rows do not carry their stream epoch. Remove the origin/cluster
+      # slice and reset the current cursor so its exact state is rebuilt by
+      # the next head advertisement (delta when retained, snapshot after
+      # pruning). Registry claims do carry epochs and are removed narrowly.
+      purged_pg =
+        Data.delete_pg_for_origin_clusters(
+          state.name,
+          state.shard_index,
+          [cluster],
+          remote_node
+        )
+
       events = build_purged_events(state.name, [], purged_pg, :cluster_disconnect, [])
 
       {acc, events} =
@@ -4370,6 +4790,7 @@ defmodule Group.Replica do
         end)
 
       notify_monitors(state.name, events)
+
       acc
     end)
   end
@@ -4475,20 +4896,6 @@ defmodule Group.Replica do
     end)
   end
 
-  defp build_process_down_batch_events(name, reg_entries, pg_entries) do
-    events =
-      Enum.reduce(reg_entries, [], fn {pid, cluster, key, meta, reason}, acc ->
-        [
-          build_event(name, :unregistered, key, pid, meta, %{reason: reason, cluster: cluster})
-          | acc
-        ]
-      end)
-
-    Enum.reduce(pg_entries, events, fn {pid, cluster, key, meta, reason}, acc ->
-      [build_event(name, :left, key, pid, meta, %{reason: reason, cluster: cluster}) | acc]
-    end)
-  end
-
   defp fan_out_to_siblings(state, message) do
     %{name: name, shard_index: shard_index, num_shards: num_shards} = state
 
@@ -4497,6 +4904,17 @@ defmodule Group.Replica do
         pid when is_pid(pid) -> send(pid, message)
         nil -> :ok
       end
+    end
+  end
+
+  defp send_local_control_message(state, message) do
+    case Process.whereis(shard_name(state.name, 0)) do
+      pid when is_pid(pid) ->
+        send(pid, message)
+        :ok
+
+      nil ->
+        :disconnected
     end
   end
 
@@ -4594,7 +5012,6 @@ defmodule Group.Replica do
         state.replicated_oplog_max_entries
       )
 
-    {state, _events} = rebuild_registry_projections(state)
     state
   end
 
@@ -4708,91 +5125,6 @@ defmodule Group.Replica do
     node() in Data.cluster_nodes(name, cluster)
   end
 
-  # Additive merge: inserts new entries and resolves conflicts, but does not
-  # delete local entries missing from the incoming snapshot. This is safe because
-  # Erlang dist uses TCP — either all replicate_* messages arrive in order (no
-  # stale entries) or the connection dies and nodedown purges everything before
-  # cluster_state can arrive. There is no case where stale entries survive into
-  # the merge.
-  defp merge_remote_cluster_data(state, cluster, reg_data, pg_data, events \\ []) do
-    %{name: name, shard_index: shard, num_shards: num_shards} = state
-
-    # Registry merge uses Enum.reduce to thread state + events, because
-    # resolve_conflict modifies state.monitors (demonitor evicted local pids)
-    # and may produce an event.
-    {state, events} =
-      Enum.reduce(reg_data, {state, events}, fn {key, pid, meta, time}, {acc_state, acc_events} ->
-        if shard_index_for(cluster, key, num_shards) != shard do
-          {acc_state, acc_events}
-        else
-          case Data.registry_lookup(name, shard, cluster, key) do
-            nil ->
-              Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-              event = build_event(name, :registered, key, pid, meta, %{cluster: cluster})
-              {acc_state, [event | acc_events]}
-
-            {^pid, _meta, existing_time, _node} ->
-              # Same pid (bounceback or metadata update) — apply if newer
-              if time > existing_time do
-                Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-              end
-
-              {acc_state, acc_events}
-
-            {existing_pid, existing_meta, existing_time, existing_node}
-            when existing_node == node() ->
-              # Local entry vs incoming remote — use full conflict resolution
-              # (runs the configured resolver and re-broadcasts the winner)
-              {new_state, event} =
-                resolve_conflict(
-                  acc_state,
-                  cluster,
-                  key,
-                  {existing_pid, existing_meta, existing_time},
-                  {pid, meta, time}
-                )
-
-              acc_events = if event, do: [event | acc_events], else: acc_events
-              {new_state, acc_events}
-
-            {existing_pid, _meta, existing_time, _node} when time > existing_time ->
-              # Both remote — keep the more recent one
-              if existing_pid != pid do
-                Data.registry_delete(name, shard, cluster, key, existing_pid)
-              end
-
-              Data.registry_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-              {acc_state, acc_events}
-
-            _ ->
-              {acc_state, acc_events}
-          end
-        end
-      end)
-
-    events =
-      Enum.reduce(pg_data, events, fn {key, pid, meta, time}, acc_events ->
-        if shard_index_for(cluster, key, num_shards) != shard do
-          acc_events
-        else
-          case Data.pg_lookup(name, shard, cluster, key, pid) do
-            nil ->
-              Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-              [build_event(name, :joined, key, pid, meta, %{cluster: cluster}) | acc_events]
-
-            {_meta, existing_time, _node} when time > existing_time ->
-              Data.pg_insert(name, shard, cluster, key, pid, meta, time, node(pid))
-              acc_events
-
-            _ ->
-              acc_events
-          end
-        end
-      end)
-
-    {state, events}
-  end
-
   defp resolve_replicated_registry_conflict(
          state,
          cluster,
@@ -4867,32 +5199,38 @@ defmodule Group.Replica do
 
   defp reconcile_registry_projection(state, cluster, key, reason, events) do
     claims = Data.registry_claims(state.name, state.shard_index, cluster, key)
+    state = remember_pending_registry_reprojections(state, cluster, key, claims)
     winner = select_registry_claim_winner(state, cluster, key, claims)
 
-    {state, retired?} = retire_local_registry_losers(state, cluster, key, claims, winner)
+    {state, retirement} = retire_local_registry_losers(state, cluster, key, claims, winner)
 
-    winner =
-      if retired? do
-        state.name
-        |> Data.registry_claims(state.shard_index, cluster, key)
-        |> then(&select_registry_claim_winner(state, cluster, key, &1))
-      else
-        winner
-      end
+    case retirement do
+      :authority_changed ->
+        reconcile_registry_projection(state, cluster, key, reason, events)
 
-    current = Data.registry_lookup(state.name, state.shard_index, cluster, key)
+      retired? ->
+        winner =
+          if retired? do
+            state.name
+            |> Data.registry_claims(state.shard_index, cluster, key)
+            |> then(&select_registry_claim_winner(state, cluster, key, &1))
+          else
+            winner
+          end
 
-    projection_reason = if retired?, do: :resolve_conflict, else: reason
+        current = Data.registry_lookup(state.name, state.shard_index, cluster, key)
+        projection_reason = if retired?, do: :resolve_conflict, else: reason
 
-    project_registry_winner(
-      state,
-      cluster,
-      key,
-      current,
-      winner,
-      projection_reason,
-      events
-    )
+        project_registry_winner(
+          state,
+          cluster,
+          key,
+          current,
+          winner,
+          projection_reason,
+          events
+        )
+    end
   end
 
   defp reconcile_registry_keys(state, keys, reason, events) do
@@ -4901,34 +5239,74 @@ defmodule Group.Replica do
     end)
   end
 
+  defp remember_pending_registry_reprojections(state, _cluster, _key, []), do: state
+  defp remember_pending_registry_reprojections(state, _cluster, _key, [_claim]), do: state
+
+  defp remember_pending_registry_reprojections(state, cluster, key, claims) do
+    Enum.reduce(claims, state, fn
+      {_pid, _meta, _time, origin, generation, epoch, _seq}, acc when origin != node() ->
+        local_cluster_active? =
+          is_nil(cluster) or not is_nil(Data.local_cluster_epoch(acc.name, cluster))
+
+        waiting_for_lane_view? =
+          local_cluster_active? and generation == Data.remote_generation(acc.name, origin) and
+            epoch == Data.remote_cluster_epoch(acc.name, origin, cluster) and
+            not replica_view_current?(acc, origin)
+
+        if waiting_for_lane_view? do
+          pending =
+            Map.update(
+              acc.pending_registry_reprojections,
+              origin,
+              MapSet.new([{cluster, key}]),
+              &MapSet.put(&1, {cluster, key})
+            )
+
+          %{acc | pending_registry_reprojections: pending}
+        else
+          acc
+        end
+
+      _local_claim, acc ->
+        acc
+    end)
+  end
+
+  defp reproject_pending_registry_keys(state, remote_node) do
+    case Map.pop(state.pending_registry_reprojections, remote_node) do
+      {nil, _pending} ->
+        state
+
+      {keys, pending} ->
+        state = %{state | pending_registry_reprojections: pending}
+        {state, events} = reconcile_registry_keys(state, keys, :reconcile, [])
+        notify_monitors(state.name, events)
+        state
+    end
+  end
+
+  defp discard_pending_registry_reprojections(state, remote_node) do
+    %{
+      state
+      | pending_registry_reprojections:
+          Map.delete(state.pending_registry_reprojections, remote_node)
+    }
+  end
+
   defp select_registry_claim_winner(_state, _cluster, _key, []), do: nil
   defp select_registry_claim_winner(_state, _cluster, _key, [claim]), do: claim
 
-  defp select_registry_claim_winner(state, cluster, key, claims) do
-    claims =
-      Enum.sort_by(claims, fn {pid, _meta, time, origin_node, generation, epoch, _seq} ->
-        {time, pid, origin_node, generation, epoch}
-      end)
+  defp select_registry_claim_winner(%{name: name} = state, cluster, key, claims) do
+    resolver = Map.get(Group.get_config(name), :resolve_registry_conflict)
 
-    Enum.reduce_while(tl(claims), hd(claims), fn claim, winner ->
-      {winner_pid, winner_meta, winner_time, _origin, _generation, _epoch, _seq} = winner
-      {pid, meta, time, _origin, _generation, _epoch, _seq} = claim
-
-      selected =
-        resolve_conflict_winner(
-          state,
-          cluster,
-          key,
-          {winner_pid, winner_meta, winner_time},
-          {pid, meta, time}
-        )
-
-      cond do
-        selected == winner_pid -> {:cont, winner}
-        selected == pid -> {:cont, claim}
-        true -> {:halt, nil}
-      end
-    end)
+    claims
+    |> Enum.filter(&registry_claim_current?(state, cluster, &1))
+    |> Enum.max_by(
+      fn {pid, meta, time, _origin, _generation, _epoch, _seq} ->
+        registry_conflict_order_key(name, key, {pid, meta, time}, resolver)
+      end,
+      fn -> nil end
+    )
   end
 
   defp retire_local_registry_losers(state, cluster, key, claims, winner) do
@@ -4938,19 +5316,75 @@ defmodule Group.Replica do
       Enum.filter(claims, fn {pid, _meta, _time, origin_node, _generation, _epoch, _seq} ->
         origin_node == node() and pid != winner_pid
       end)
+      |> Enum.filter(&registry_claim_current?(state, cluster, &1))
 
-    state =
-      Enum.reduce(local_losers, state, fn
-        {pid, meta, _time, _origin_node, _generation, _epoch, _seq}, acc ->
-          op = {:unregister, cluster, key, pid, meta, :resolve_conflict}
-          record = append_local_replica_record(acc, op)
-          acc = finish_local_replica_record(acc, record, :registry)
-          winner_meta = if winner, do: elem(winner, 1), else: nil
-          exit_local_conflict_loser(pid, key, winner_meta)
-          acc
-      end)
+    cond do
+      local_losers == [] ->
+        {state, false}
 
-    {state, local_losers != []}
+      registry_winner_authoritative?(state, cluster, winner) ->
+        state =
+          Enum.reduce(local_losers, state, fn
+            {pid, meta, _time, _origin_node, _generation, _epoch, _seq}, acc ->
+              op = {:unregister, cluster, key, pid, meta, :resolve_conflict}
+              record = append_local_replica_record(acc, op)
+              acc = finish_local_replica_record(acc, record, :registry)
+              winner_meta = if winner, do: elem(winner, 1), else: nil
+              exit_local_conflict_loser(pid, key, winner_meta)
+              acc
+          end)
+
+        {state, true}
+
+      true ->
+        # Authority changed after winner selection. Nothing irreversible has
+        # happened yet; select again against the now-current authority.
+        {state, :authority_changed}
+    end
+  end
+
+  defp registry_claim_current?(
+         state,
+         cluster,
+         {_pid, _meta, _time, origin, generation, epoch, _seq}
+       ) do
+    local_cluster_active? =
+      is_nil(cluster) or not is_nil(Data.local_cluster_epoch(state.name, cluster))
+
+    local_cluster_active? and
+      if origin == node() do
+        generation == Data.generation(state.name) and
+          epoch == Data.local_cluster_epoch(state.name, cluster)
+      else
+        replica_view_current?(state, origin) and
+          generation == Data.remote_generation(state.name, origin) and
+          epoch == Data.remote_cluster_epoch(state.name, origin, cluster)
+      end
+  end
+
+  defp registry_winner_authoritative?(_state, _cluster, nil), do: true
+
+  defp registry_winner_authoritative?(
+         _state,
+         _cluster,
+         {_pid, _meta, _time, origin, _generation, _epoch, _seq}
+       )
+       when origin == node(),
+       do: true
+
+  defp registry_winner_authoritative?(
+         state,
+         cluster,
+         {_pid, _meta, _time, origin, generation, epoch, _seq}
+       ) do
+    Data.remote_registry_claim_authoritative?(
+      state.name,
+      state.shard_index,
+      origin,
+      generation,
+      cluster,
+      epoch
+    )
   end
 
   defp project_registry_winner(state, _cluster, _key, nil, nil, _reason, events),
@@ -5079,159 +5513,49 @@ defmodule Group.Replica do
     {state, [registered, unregistered | events]}
   end
 
-  defp resolve_conflict(
-         state,
-         cluster,
-         key,
-         {local_pid, local_meta, local_time},
-         {remote_pid, remote_meta, remote_time}
-       ) do
-    %{name: name, shard_index: shard} = state
-
-    winner_pid =
-      resolve_conflict_winner(
-        state,
-        cluster,
-        key,
-        {local_pid, local_meta, local_time},
-        {remote_pid, remote_meta, remote_time}
-      )
-
-    cond do
-      winner_pid == remote_pid ->
-        exit_local_conflict_loser(local_pid, key, remote_meta)
-        # Remote wins — replace local entry
-        Data.registry_delete(name, shard, cluster, key, local_pid)
-        state = maybe_demonitor_pid(state, name, shard, local_pid)
-        time = System.system_time()
-
-        Data.registry_insert(
-          name,
-          shard,
-          cluster,
-          key,
-          remote_pid,
-          remote_meta,
-          time,
-          node(remote_pid)
-        )
-
-        # Dispatch lifecycle events so monitors see the eviction.
-        # The :registered event for remote_pid will arrive via the winner's
-        # re-broadcast registry op, so we only dispatch :unregistered here.
-        event =
-          build_event(name, :unregistered, key, local_pid, local_meta, %{
-            reason: :resolve_conflict,
-            cluster: cluster
-          })
-
-        state =
-          enqueue_broadcast_op(
-            state,
-            {:unregister, cluster, key, local_pid, local_meta, :resolve_conflict}
-          )
-
-        {state, event}
-
-      winner_pid == local_pid ->
-        # Local wins — re-broadcast to override remote
-        time = System.system_time()
-
-        Data.registry_insert(
-          name,
-          shard,
-          cluster,
-          key,
-          local_pid,
-          local_meta,
-          time,
-          node(local_pid)
-        )
-
-        state =
-          enqueue_broadcast_op(
-            state,
-            {:register, cluster, key, local_pid, local_meta, time, node(local_pid)}
-          )
-
-        {state, nil}
-
-      true ->
-        exit_local_conflict_loser(local_pid, key, nil)
-        # Neither wins — remove both
-        Data.registry_delete(name, shard, cluster, key, local_pid)
-        state = maybe_demonitor_pid(state, name, shard, local_pid)
-
-        state =
-          enqueue_broadcast_op(
-            state,
-            {:unregister, cluster, key, local_pid, local_meta, :resolve_conflict}
-          )
-
-        event =
-          build_event(name, :unregistered, key, local_pid, local_meta, %{
-            reason: :resolve_conflict,
-            cluster: cluster
-          })
-
-        {state, event}
-    end
-  end
-
   defp resolve_conflict_winner(
          %{name: name},
-         cluster,
+         _cluster,
          key,
          {local_pid, local_meta, local_time},
          {remote_pid, remote_meta, remote_time}
        ) do
     config = Group.get_config(name)
+    resolver = Map.get(config, :resolve_registry_conflict)
 
-    case Map.get(config, :resolve_registry_conflict) do
-      nil ->
-        default_resolve_conflict(
-          name,
-          cluster,
-          key,
-          {local_pid, local_meta, local_time},
-          {remote_pid, remote_meta, remote_time}
-        )
+    local = {local_pid, local_meta, local_time}
+    remote = {remote_pid, remote_meta, remote_time}
 
-      {mod, func, extra_args} ->
-        apply(mod, func, [
-          name,
-          key,
-          {local_pid, local_meta, local_time},
-          {remote_pid, remote_meta, remote_time} | extra_args
-        ])
-    end
-  end
-
-  defp default_resolve_conflict(
-         _name,
-         _cluster,
-         key,
-         {pid1, meta1, time1},
-         {pid2, meta2, time2}
-       ) do
-    # Tiebreaker must be deterministic regardless of which node is resolving.
-    # Using `>=` would pick the remote on BOTH nodes when timestamps are equal,
-    # causing mutual kill (both processes die, key becomes unregistered).
-    # Erlang pids have a total order (by node name then id), so pid comparison
-    # gives a consistent tiebreaker across all nodes.
-    {winner_pid, _winner_meta, _loser_pid} =
-      if time2 > time1 or (time2 == time1 and pid2 > pid1) do
-        {pid2, meta2, pid1}
+    winner =
+      if registry_conflict_order_key(name, key, remote, resolver) >
+           registry_conflict_order_key(name, key, local, resolver) do
+        remote_pid
       else
-        {pid1, meta1, pid2}
+        local_pid
       end
 
+    if is_nil(resolver) do
+      log_default_registry_conflict(key, local_pid, remote_pid, winner)
+    end
+
+    winner
+  end
+
+  defp registry_conflict_order_key(_name, _key, {pid, _meta, time}, nil), do: {time, pid}
+
+  defp registry_conflict_order_key(name, key, {pid, _meta, _time} = claim, {
+         mod,
+         func,
+         extra_args
+       }) do
+    {apply(mod, func, [name, key, claim | extra_args]), pid}
+  end
+
+  defp log_default_registry_conflict(key, pid1, pid2, winner_pid) do
     Logger.error(fn ->
       "#{inspect(__MODULE__)}: registry conflict detected: key=#{inspect(key)}, " <>
         "pid1=#{inspect(pid1)}, pid2=#{inspect(pid2)}, picking #{inspect(winner_pid)} as winner"
     end)
-
-    winner_pid
   end
 
   defp exit_local_conflict_loser(pid, key, winner_meta) when node(pid) == node() do
@@ -5240,26 +5564,6 @@ defmodule Group.Replica do
   end
 
   defp exit_local_conflict_loser(_pid, _key, _winner_meta), do: :ok
-
-  # Legacy receive-only compatibility: gather local data for all requested
-  # clusters in one scan before emitting the old cluster_state messages.
-  defp send_cluster_states(state, clusters, target_node) do
-    %{name: name, shard_index: shard} = state
-    {reg_by_cluster, pg_by_cluster} = Data.local_data_by_cluster(name, shard, clusters)
-
-    log_verbose(state, fn ->
-      "#{log_prefix_shard(state)} sending cluster_states to #{target_node} (#{length(clusters)} clusters)"
-    end)
-
-    for cluster <- clusters do
-      reg_data = Map.get(reg_by_cluster, cluster, [])
-      pg_data = Map.get(pg_by_cluster, cluster, [])
-
-      if reg_data != [] or pg_data != [] do
-        send_to_peer(state, target_node, {:cluster_state, cluster, reg_data, pg_data})
-      end
-    end
-  end
 
   defp compute_shared_clusters(my_clusters, remote_clusters) do
     my_set = MapSet.new(my_clusters)

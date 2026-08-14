@@ -25,6 +25,20 @@ generation and an active bit, so an inactive hello fences even a same-epoch
 snapshot. After healing, fair repair must either install only the current
 generation or erase every row and authority reference for the absent peer.
 
+`AuthorityProjection.tla` models concurrent exact remote installs, local named
+cluster activation/deactivation, materialized rows, and a lifecycle caller that
+may disappear after the durable mutation. Its safety invariants require local
+activation and shared routing to project authority consistently; its liveness
+property requires queued close cleanup to finish without the original caller.
+
+`AuthorityHint.tla` models the cross-lane fence created when a heartbeat or lane
+hello observes a newer authority before the exact hello arrives. It checks that
+delayed old exact/view installs cannot re-enable a lane, unresolved hints retain
+a bounded lease/repair obligation, contiguous incremental authority is installed
+only from the currently hinted/applied revision, unknown post-retirement hints
+cannot establish authority, and delayed retirement cleanup cannot erase a
+rediscovered generation's route.
+
 The default TLC configuration uses three nodes: one origin and two independent
 receivers. The origin has one key, a two-record stream, a one-record oplog, and
 the system retains one arbitrary network frame. This forces delta repair,
@@ -64,8 +78,8 @@ TLC proves the listed invariants and liveness property for the configured
 finite instance, not for arbitrary unbounded node and key sets. Larger models
 should be run periodically by increasing `Nodes`, `Origins`, `Keys`, `MaxSeq`,
 `OplogBound`, and `MaxMessages`. `check_matrix.sh` runs the protocol, snapshot
-assembly, and peer-eviction models; set `TLA_EXTENDED=1` for the larger
-anti-entropy configuration.
+assembly, peer-eviction, authority-projection, and authority-hint models; set
+`TLA_EXTENDED=1` for the larger anti-entropy configuration.
 
 The checked three-node default explores 1,835,826 states, finds 490,236
 distinct states to a depth of 30, and completes in roughly 1 minute 40 seconds
@@ -77,6 +91,15 @@ to a depth of 13, and completes in under a second on the same class of machine.
 The peer-eviction model explores 1,527,116 states, finds 238,120 distinct
 states to a depth of 26, and completes in roughly 20 seconds on the development
 machine used for validation.
+
+The authority-projection model explores 71 states, finds 24 distinct states to
+a depth of 6, and completes in under a second. Its small state space is
+intentional: it exhaustively crosses the two authority directions, lifecycle
+caller loss/replacement, writes, and independently fair close cleanup.
+
+The authority-hint model explores 2,989 states, finds 428 distinct states to a
+depth of 9, and completes in roughly one second. It separates the last exact
+revision from the complete applied revision and highest persisted hint.
 
 The extended two-key, three-sequence model explores 127,557,634 states, finds
 32,238,304 distinct states to a depth of 34, and completes in roughly two hours

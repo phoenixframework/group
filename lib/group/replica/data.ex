@@ -72,7 +72,12 @@ defmodule Group.Replica.Data do
   position. `replica_oplog` stores `{stream, sequence}` mutation records while
   `replica_oplog_order` gives them one shard-wide append order for bounded pruning.
   `replica_cursor` records only the highest contiguous sequence applied from each remote
-  stream. A gap below the retained floor is repaired by exact per-origin snapshot replacement.
+  stream. During exact replacement it temporarily stores
+  `{:snapshot_installing, snapshot_sequence}`; startup repair treats that marker as an
+  interrupted transaction, purges the partial origin slice, and removes the cursor so the
+  sender retransmits. Cursor absence is also the durable retirement marker: every peer,
+  generation, epoch, and local-cluster purge clears cursors before deleting rows. A gap below
+  the retained floor is repaired by exact per-origin snapshot replacement.
 
   ### cluster_nodes — `:bag`, keyed by cluster name
 
@@ -93,8 +98,10 @@ defmodule Group.Replica.Data do
 
   Both tables are shared across all shards. Used for the default cluster (nil) and named
   clusters. Peer-connect messages are discovery hints; shard 0's generation-fenced exact
-  authority installs membership. `nodedown`, shard death, or peer-lease expiry removes it.
-  `Group.nodes/1` reads the nil cluster from cluster_nodes.
+  authority installs membership. Exact authority and both membership indexes are replaced
+  in one Data GenServer turn, closing the local-connect/remote-install race without a scan
+  outside the remote authority's cluster set. `nodedown`, shard death, or peer-lease expiry
+  removes it. `Group.nodes/1` reads the nil cluster from cluster_nodes.
 
   ### cluster_leases — `:set`, keyed by cluster name
 
@@ -114,12 +121,25 @@ defmodule Group.Replica.Data do
 
   ### replication_meta and epoch tables
 
-  `replication_meta` holds the local origin generation, exact and observed authority
-  revisions, per-shard installed remote views, journal metadata, and one append counter per
-  shard. `local_cluster_epochs` and `closed_local_cluster_epochs` fence local named-cluster
-  lifetimes; `remote_cluster_epochs` is the exact node-wide authority installed by shard 0.
-  Exact and merely observed revisions are separate so a partial control burst cannot be
-  promoted to authoritative membership.
+  `replication_meta` holds the local origin generation, last exact, complete applied, and
+  highest observed authority revisions, a persisted `{generation, revision}` authority hint,
+  per-shard installed remote views, journal metadata, and one append counter per shard.
+  `local_cluster_epochs` and `closed_local_cluster_epochs` fence local named-cluster
+  lifetimes; `remote_cluster_epochs` is the node-wide authority installed by shard 0.
+  The three revision roles are separate so a partial control burst cannot be promoted to
+  authoritative membership. Contiguous incremental controls compare-and-install against the
+  current generation, applied revision, observed revision, and hint in this GenServer turn;
+  a concurrent heartbeat makes the whole update stale. A newer hint atomically fences every
+  lane view, but cannot be created after exact authority has been retired; only a later exact
+  hello can reintroduce the peer. Irreversible registry conflict retirement is
+  revalidated through this GenServer, serializing the decision with node-wide generation,
+  epoch, observed-revision, installed-lane, and local-cluster changes.
+  Local cluster activation also projects self and already-authoritative remote routes in
+  this serialized turn. Deactivation removes local admission and queues explicit old-epoch
+  cleanup on every shard before replying, so a caller exit cannot strand rows or a close
+  barrier; a shard that restarts before handling the message repairs from the marker.
+  Final peer-route cleanup rechecks that both exact authority and its hint are absent, so a
+  delayed retirement caller cannot erase a rediscovered generation's routes.
 
   ## Match Spec Patterns
 
@@ -133,10 +153,6 @@ defmodule Group.Replica.Data do
   - `purge_node/3`: Full table scan via `ets.select` filtering by node, then individual
     deletes. O(table size) for the scan, but this only runs on nodedown, remote shard death,
     or peer-lease expiry — rare paths.
-
-  - `local_data_by_cluster/3`: Full table scan filtering by `node() == local_node`,
-    grouped by cluster. Retained only for the legacy receive-only cluster-state
-    compatibility path; current recovery uses anti-entropy streams.
 
   - `registry_count`, `pg_count`, `pg_count_by_prefix`, `local_registry_count`,
     `local_pg_count`, `local_registry_present?`, `local_pg_present?`: Uses
@@ -228,6 +244,19 @@ defmodule Group.Replica.Data do
     |> Enum.map(&elem(&1, 0))
   end
 
+  def closed_local_cluster_epochs(name) do
+    closed_local_cluster_epochs_table(name)
+    |> :ets.tab2list()
+    |> Enum.map(fn {cluster, epoch, _pending_shards} -> {cluster, epoch} end)
+  end
+
+  def closed_local_cluster_pending?(name, cluster, epoch, shard) do
+    case :ets.lookup(closed_local_cluster_epochs_table(name), cluster) do
+      [{^cluster, ^epoch, pending_shards}] -> MapSet.member?(pending_shards, shard)
+      _ -> false
+    end
+  end
+
   def await_closed_local_clusters(name, clusters, timeout)
       when is_list(clusters) and is_integer(timeout) and timeout >= 0 do
     started_at = System.monotonic_time(:millisecond)
@@ -268,6 +297,16 @@ defmodule Group.Replica.Data do
     case :ets.lookup(replication_meta_table(name), {:remote_epoch_observed, remote_node}) do
       [{{:remote_epoch_observed, ^remote_node}, revision}] -> revision
       [] -> nil
+    end
+  end
+
+  def remote_replica_authority_hint(name, remote_node) do
+    case :ets.lookup(replication_meta_table(name), {:remote_authority_hint, remote_node}) do
+      [{{:remote_authority_hint, ^remote_node}, generation, revision}] ->
+        {generation, revision}
+
+      [] ->
+        nil
     end
   end
 
@@ -325,26 +364,67 @@ defmodule Group.Replica.Data do
     )
   end
 
-  def put_remote_cluster_epochs(name, shard, remote_node, revision, epochs) do
+  def put_remote_cluster_epochs(
+        name,
+        shard,
+        remote_node,
+        generation,
+        expected_revision,
+        revision,
+        epochs
+      ) do
     GenServer.call(
       data_name(name),
-      {:put_remote_cluster_epochs, shard, remote_node, revision, epochs},
+      {:put_remote_cluster_epochs, shard, remote_node, generation, expected_revision, revision,
+       epochs},
       :infinity
     )
   end
 
-  def close_remote_cluster_epochs(name, shard, remote_node, revision, epochs) do
+  def observe_remote_cluster_epoch_revision(name, remote_node, revision) do
     GenServer.call(
       data_name(name),
-      {:close_remote_cluster_epochs, shard, remote_node, revision, epochs},
+      {:observe_remote_cluster_epoch_revision, remote_node, revision},
       :infinity
     )
   end
 
-  def forget_remote_cluster_epochs(name, shard, remote_node, epochs) do
+  def observe_remote_replica_hint(name, remote_node, generation, revision) do
     GenServer.call(
       data_name(name),
-      {:forget_remote_cluster_epochs, shard, remote_node, epochs},
+      {:observe_remote_replica_hint, remote_node, generation, revision},
+      :infinity
+    )
+  end
+
+  def remote_registry_claim_authoritative?(
+        name,
+        shard,
+        remote_node,
+        generation,
+        cluster,
+        epoch
+      ) do
+    GenServer.call(
+      data_name(name),
+      {:remote_registry_claim_authoritative, shard, remote_node, generation, cluster, epoch},
+      :infinity
+    )
+  end
+
+  def close_remote_cluster_epochs(
+        name,
+        shard,
+        remote_node,
+        generation,
+        expected_revision,
+        revision,
+        epochs
+      ) do
+    GenServer.call(
+      data_name(name),
+      {:close_remote_cluster_epochs, shard, remote_node, generation, expected_revision, revision,
+       epochs},
       :infinity
     )
   end
@@ -357,16 +437,36 @@ defmodule Group.Replica.Data do
     )
   end
 
+  def expire_remote_replica_lane(name, shard, remote_node) do
+    GenServer.call(
+      data_name(name),
+      {:expire_remote_replica_lane, shard, remote_node},
+      :infinity
+    )
+  end
+
   def activate_local_clusters(name, clusters) do
     GenServer.call(data_name(name), {:activate_local_clusters, clusters}, :infinity)
+  end
+
+  def activate_local_clusters_durable(name, clusters) do
+    GenServer.call(data_name(name), {:activate_local_clusters_durable, clusters}, :infinity)
   end
 
   def deactivate_local_clusters(name, clusters) do
     GenServer.call(data_name(name), {:deactivate_local_clusters, clusters}, :infinity)
   end
 
-  def mark_closed_cluster_shard(name, clusters, shard) do
-    GenServer.call(data_name(name), {:mark_closed_cluster_shard, clusters, shard}, :infinity)
+  def deactivate_local_clusters_durable(name, clusters) do
+    GenServer.call(data_name(name), {:deactivate_local_clusters_durable, clusters}, :infinity)
+  end
+
+  def mark_closed_cluster_shard(name, cluster_epochs, shard) do
+    GenServer.call(
+      data_name(name),
+      {:mark_closed_cluster_shard, cluster_epochs, shard},
+      :infinity
+    )
   end
 
   def local_stream_id(name, shard, cluster) do
@@ -491,7 +591,8 @@ defmodule Group.Replica.Data do
 
   @doc false
   def repair_shard_indexes(name, shard) do
-    purge_inactive_cluster_rows(name, shard)
+    repair_interrupted_snapshot_installs(name, shard)
+    repair_primary_replica_rows(name, shard)
     rebuild_registry_reverse_index(name, shard)
     rebuild_registry_claim_reverse_index(name, shard)
     rebuild_pg_reverse_index(name, shard)
@@ -525,6 +626,37 @@ defmodule Group.Replica.Data do
       WireProtocol.stream_generation(stream_id) == generation(name) and
       WireProtocol.stream_shard(stream_id) == shard and
       WireProtocol.stream_epoch(stream_id) == local_cluster_epoch(name, cluster)
+  end
+
+  defp repair_interrupted_snapshot_installs(name, shard) do
+    streams =
+      :ets.select(replica_cursor_table(name, shard), [
+        {{:"$1", {:snapshot_installing, :_}}, [], [:"$1"]}
+      ])
+
+    {streams, malformed} =
+      Enum.split_with(streams, fn stream_id ->
+        WireProtocol.valid_stream_id?(stream_id) and
+          WireProtocol.stream_name(stream_id) == name and
+          WireProtocol.stream_shard(stream_id) == shard and
+          WireProtocol.stream_origin(stream_id) != node()
+      end)
+
+    Enum.each(malformed, &:ets.delete(replica_cursor_table(name, shard), &1))
+
+    if streams != [] do
+      _affected_keys = purge_registry_claims_for_streams(name, shard, streams)
+
+      streams
+      |> Enum.group_by(&WireProtocol.stream_origin/1, &WireProtocol.stream_cluster/1)
+      |> Enum.each(fn {origin, clusters} ->
+        delete_pg_for_origin_clusters(name, shard, Enum.uniq(clusters), origin)
+      end)
+
+      Enum.each(streams, &:ets.delete(replica_cursor_table(name, shard), &1))
+    end
+
+    :ok
   end
 
   defp await_closed_local_clusters(name, clusters, timeout, started_at) do
@@ -591,44 +723,177 @@ defmodule Group.Replica.Data do
     end)
   end
 
-  defp purge_inactive_cluster_rows(name, shard) do
-    clusters =
-      Enum.concat([
-        Enum.map(:ets.tab2list(reg_by_key_table(name, shard)), fn
-          {{cluster, _key}, _pid, _meta, _time, _entry_node} -> cluster
-        end),
-        Enum.map(:ets.tab2list(reg_claim_by_key_table(name, shard)), fn
-          {{cluster, _key, _origin, _generation, _epoch}, _pid, _meta, _time, _seq} ->
-            cluster
-        end),
-        Enum.map(:ets.tab2list(pg_by_key_table(name, shard)), fn
-          {{cluster, _key, _pid}, _meta, _time, _entry_node} -> cluster
-        end),
-        Enum.map(:ets.tab2list(replica_cursor_table(name, shard)), fn {stream_id, _seq} ->
-          WireProtocol.stream_cluster(stream_id)
-        end)
-      ])
-      |> Enum.reject(&is_nil/1)
-      |> Enum.uniq()
-      |> Enum.filter(&is_nil(local_cluster_epoch(name, &1)))
+  # A shard can crash between writes to its materialized rows and receive
+  # cursor, or while retiring an epoch across multiple ETS tables. Recover from
+  # the primary tables themselves: stale claims carry their complete stream
+  # authority, while a remote PG row is retained only when the current stream
+  # has a cursor (including the sequence-zero admission marker). This pass also
+  # replaces the old multi-million-element cluster list with one fixed-table
+  # traversal and O(number of inactive clusters) accumulator memory.
+  defp repair_primary_replica_rows(name, shard) do
+    inactive_clusters = MapSet.new()
 
-    Enum.each(clusters, fn cluster ->
-      :ets.select_delete(reg_by_key_table(name, shard), [
-        {{{cluster, :_}, :_, :_, :_, :_}, [], [true]}
-      ])
+    inactive_clusters =
+      repair_ets_table(
+        reg_by_key_table(name, shard),
+        inactive_clusters,
+        fn {{cluster, key}, _pid, _meta, _time, _entry_node}, inactive ->
+          if active_local_cluster?(name, cluster) do
+            inactive
+          else
+            :ets.delete(reg_by_key_table(name, shard), {cluster, key})
+            remember_inactive_cluster(name, inactive, cluster)
+          end
+        end
+      )
 
-      :ets.select_delete(reg_claim_by_key_table(name, shard), [
-        {{{cluster, :_, :_, :_, :_}, :_, :_, :_, :_}, [], [true]}
-      ])
+    inactive_clusters =
+      repair_ets_table(
+        reg_claim_by_key_table(name, shard),
+        inactive_clusters,
+        fn {{cluster, key, origin, claim_generation, epoch}, _pid, _meta, _time, _seq},
+           inactive ->
+          if active_local_cluster?(name, cluster) and
+               valid_claim_authority?(
+                 name,
+                 shard,
+                 cluster,
+                 origin,
+                 claim_generation,
+                 epoch
+               ) do
+            inactive
+          else
+            :ets.delete(
+              reg_claim_by_key_table(name, shard),
+              {cluster, key, origin, claim_generation, epoch}
+            )
 
-      :ets.select_delete(pg_by_key_table(name, shard), [
-        {{{cluster, :_, :_}, :_, :_, :_}, [], [true]}
-      ])
-    end)
+            remember_inactive_cluster(name, inactive, cluster)
+          end
+        end
+      )
 
-    :ok = delete_replica_cursors_for_clusters(name, shard, clusters)
-    if clusters != [], do: remove_clusters(name, clusters)
+    inactive_clusters =
+      repair_ets_table(
+        pg_by_key_table(name, shard),
+        inactive_clusters,
+        fn {{cluster, key, pid}, _meta, _time, entry_node}, inactive ->
+          valid? =
+            active_local_cluster?(name, cluster) and node(pid) == entry_node and
+              (entry_node == node() or
+                 valid_remote_pg_authority?(name, shard, cluster, entry_node))
+
+          if valid? do
+            inactive
+          else
+            :ets.delete(pg_by_key_table(name, shard), {cluster, key, pid})
+            remember_inactive_cluster(name, inactive, cluster)
+          end
+        end
+      )
+
+    inactive_clusters =
+      repair_ets_table(
+        replica_cursor_table(name, shard),
+        inactive_clusters,
+        fn {stream_id, _cursor}, inactive ->
+          cluster =
+            if WireProtocol.valid_stream_id?(stream_id),
+              do: WireProtocol.stream_cluster(stream_id)
+
+          if valid_remote_cursor_authority?(name, shard, stream_id) do
+            inactive
+          else
+            :ets.delete(replica_cursor_table(name, shard), stream_id)
+            remember_inactive_cluster(name, inactive, cluster)
+          end
+        end
+      )
+
+    inactive_clusters = MapSet.to_list(inactive_clusters)
+    if inactive_clusters != [], do: remove_clusters(name, inactive_clusters)
     :ok
+  end
+
+  defp repair_ets_table(table, acc, fun) do
+    :ets.safe_fixtable(table, true)
+
+    try do
+      repair_ets_table(table, :ets.first(table), acc, fun)
+    after
+      :ets.safe_fixtable(table, false)
+    end
+  end
+
+  defp repair_ets_table(_table, :"$end_of_table", acc, _fun), do: acc
+
+  defp repair_ets_table(table, key, acc, fun) do
+    next_key = :ets.next(table, key)
+
+    acc =
+      case :ets.lookup(table, key) do
+        [object] -> fun.(object, acc)
+        [] -> acc
+      end
+
+    repair_ets_table(table, next_key, acc, fun)
+  end
+
+  defp active_local_cluster?(_name, nil), do: true
+  defp active_local_cluster?(name, cluster), do: not is_nil(local_cluster_epoch(name, cluster))
+
+  defp remember_inactive_cluster(_name, inactive, nil), do: inactive
+
+  defp remember_inactive_cluster(name, inactive, cluster) do
+    if active_local_cluster?(name, cluster), do: inactive, else: MapSet.put(inactive, cluster)
+  end
+
+  defp valid_claim_authority?(name, _shard, cluster, origin, claim_generation, epoch)
+       when origin == node() do
+    claim_generation == generation(name) and epoch == local_cluster_epoch(name, cluster)
+  end
+
+  defp valid_claim_authority?(name, shard, cluster, origin, claim_generation, epoch) do
+    if claim_generation == remote_generation(name, origin) and
+         epoch == remote_cluster_epoch(name, origin, cluster) do
+      stream_id =
+        WireProtocol.stream_id(name, origin, claim_generation, shard, cluster, epoch)
+
+      :ets.member(replica_cursor_table(name, shard), stream_id)
+    else
+      false
+    end
+  end
+
+  defp valid_remote_pg_authority?(name, shard, cluster, origin) do
+    remote_generation = remote_generation(name, origin)
+    remote_epoch = remote_cluster_epoch(name, origin, cluster)
+
+    if WireProtocol.valid_generation?(remote_generation) and not is_nil(remote_epoch) do
+      stream_id =
+        WireProtocol.stream_id(name, origin, remote_generation, shard, cluster, remote_epoch)
+
+      :ets.member(replica_cursor_table(name, shard), stream_id)
+    else
+      false
+    end
+  end
+
+  defp valid_remote_cursor_authority?(name, shard, stream_id) do
+    WireProtocol.valid_stream_id?(stream_id) and
+      WireProtocol.stream_name(stream_id) == name and
+      WireProtocol.stream_shard(stream_id) == shard and
+      WireProtocol.stream_origin(stream_id) != node() and
+      active_local_cluster?(name, WireProtocol.stream_cluster(stream_id)) and
+      WireProtocol.stream_generation(stream_id) ==
+        remote_generation(name, WireProtocol.stream_origin(stream_id)) and
+      WireProtocol.stream_epoch(stream_id) ==
+        remote_cluster_epoch(
+          name,
+          WireProtocol.stream_origin(stream_id),
+          WireProtocol.stream_cluster(stream_id)
+        )
   end
 
   def replica_stream_head(name, shard, stream_id) do
@@ -697,7 +962,8 @@ defmodule Group.Replica.Data do
 
   def replica_cursor(name, shard, stream_id) do
     case :ets.lookup(replica_cursor_table(name, shard), stream_id) do
-      [{^stream_id, seq}] -> seq
+      [{^stream_id, seq}] when is_integer(seq) -> seq
+      [{^stream_id, {:snapshot_installing, _snapshot_seq}}] -> 0
       [] -> 0
     end
   end
@@ -718,6 +984,20 @@ defmodule Group.Replica.Data do
 
   def put_replica_cursor(name, shard, stream_id, seq) do
     :ets.insert(replica_cursor_table(name, shard), {stream_id, seq})
+    :ok
+  end
+
+  def ensure_replica_cursor(name, shard, stream_id) do
+    :ets.insert_new(replica_cursor_table(name, shard), {stream_id, 0})
+    :ok
+  end
+
+  def begin_replica_snapshot_install(name, shard, stream_id, snapshot_seq) do
+    :ets.insert(
+      replica_cursor_table(name, shard),
+      {stream_id, {:snapshot_installing, snapshot_seq}}
+    )
+
     :ok
   end
 
@@ -744,6 +1024,33 @@ defmodule Group.Replica.Data do
   def delete_replica_cursor(name, shard, stream_id) do
     :ets.delete(replica_cursor_table(name, shard), stream_id)
     :ok
+  end
+
+  @doc false
+  def retained_replica_origins(name, shard) do
+    # Accepted replica data is always fenced by this persisted lane view. Every
+    # retirement path destroys data and cursors before deleting the view, so a
+    # shard crash cannot leave valid data without this restart index. Scanning
+    # it is O(known peers * shards), never O(registry + PG cardinality).
+    match_specs = [
+      {{{:remote_view_info, shard, :"$1"}, :_, :_, :_}, [], [:"$1"]},
+      # A hint is the durable fence left before the observing lane records its
+      # in-memory lease deadline. Every restarting lane must recognize it so a
+      # crash in that window cannot strand the peer forever.
+      {{{:remote_authority_hint, :"$1"}, :_, :_}, [], [:"$1"]}
+    ]
+
+    match_specs =
+      if shard == 0 do
+        [{{{:remote_generation, :"$1"}, :_}, [], [:"$1"]} | match_specs]
+      else
+        match_specs
+      end
+
+    replication_meta_table(name)
+    |> :ets.select(match_specs)
+    |> Enum.reject(&(&1 == node()))
+    |> Enum.uniq()
   end
 
   def drop_local_stream(name, shard, cluster, epoch) do
@@ -1039,21 +1346,19 @@ defmodule Group.Replica.Data do
   def purge_registry_claims_for_streams(_name, _shard, []), do: []
 
   def purge_registry_claims_for_streams(name, shard, stream_ids) do
-    streams =
-      MapSet.new(stream_ids, fn stream_id ->
-        {
-          Group.Replica.WireProtocol.stream_cluster(stream_id),
-          Group.Replica.WireProtocol.stream_origin(stream_id),
-          Group.Replica.WireProtocol.stream_generation(stream_id),
-          Group.Replica.WireProtocol.stream_epoch(stream_id)
-        }
+    # Select only matching claims into memory. Epoch churn is rare, but the
+    # complete claim table may contain millions of unrelated rows.
+    match_specs =
+      Enum.map(stream_ids, fn stream_id ->
+        cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
+        origin = Group.Replica.WireProtocol.stream_origin(stream_id)
+        generation = Group.Replica.WireProtocol.stream_generation(stream_id)
+        epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
+
+        {{{cluster, :"$1", origin, generation, epoch}, :"$2", :"$3", :"$4", :"$5"}, [], [:"$_"]}
       end)
 
-    claims =
-      :ets.tab2list(reg_claim_by_key_table(name, shard))
-      |> Enum.filter(fn {{cluster, _key, origin, generation, epoch}, _pid, _meta, _time, _seq} ->
-        MapSet.member?(streams, {cluster, origin, generation, epoch})
-      end)
+    claims = :ets.select(reg_claim_by_key_table(name, shard), match_specs)
 
     Enum.each(claims, fn {{cluster, key, origin, generation, epoch}, pid, _meta, _time, _seq} ->
       :ets.delete(
@@ -1480,33 +1785,6 @@ defmodule Group.Replica.Data do
     )
   end
 
-  def local_data_by_cluster(name, shard, clusters) do
-    cluster_set = MapSet.new(clusters)
-    local_node = node()
-
-    reg_table = reg_by_key_table(name, shard)
-
-    reg_by_cluster =
-      :ets.select(reg_table, [
-        {{{:"$1", :"$2"}, :"$3", :"$4", :"$5", :"$6"}, [{:==, :"$6", local_node}],
-         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
-      ])
-      |> Enum.filter(fn {cluster, _, _, _, _} -> MapSet.member?(cluster_set, cluster) end)
-      |> Enum.group_by(&elem(&1, 0), fn {_, key, pid, meta, time} -> {key, pid, meta, time} end)
-
-    pg_table = pg_by_key_table(name, shard)
-
-    pg_by_cluster =
-      :ets.select(pg_table, [
-        {{{:"$1", :"$2", :"$3"}, :"$4", :"$5", :"$6"}, [{:==, :"$6", local_node}],
-         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
-      ])
-      |> Enum.filter(fn {cluster, _, _, _, _} -> MapSet.member?(cluster_set, cluster) end)
-      |> Enum.group_by(&elem(&1, 0), fn {_, key, pid, meta, time} -> {key, pid, meta, time} end)
-
-    {reg_by_cluster, pg_by_cluster}
-  end
-
   def pg_entries_for_origin(name, shard, cluster, origin_node) do
     :ets.select(pg_by_key_table(name, shard), [
       {{{cluster, :"$1", :"$2"}, :"$3", :"$4", origin_node}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
@@ -1821,50 +2099,98 @@ defmodule Group.Replica.Data do
   # GenServer callbacks
   # =====================================================================
 
-  @impl true
-  def handle_call({:add_cluster_node, clusters, node}, _from, state) do
-    :ets.insert(cluster_nodes_table(state.name), Enum.map(clusters, &{&1, node}))
-    :ets.insert(node_clusters_table(state.name), Enum.map(clusters, &{node, &1}))
-    {:reply, :ok, state}
-  end
+  defp replace_remote_cluster_projection(name, remote_node, remote_epochs) do
+    local_clusters =
+      local_cluster_epochs_table(name)
+      |> :ets.select([{{:"$1", :_}, [], [:"$1"]}])
+      |> MapSet.new()
+      |> MapSet.put(nil)
 
-  def handle_call({:remove_cluster_node, clusters, node}, _from, state) do
-    Enum.each(clusters, fn cluster ->
-      :ets.delete_object(cluster_nodes_table(state.name), {cluster, node})
-      :ets.delete_object(node_clusters_table(state.name), {node, cluster})
+    shared_clusters =
+      remote_epochs
+      |> Map.keys()
+      |> Enum.filter(&MapSet.member?(local_clusters, &1))
+      |> MapSet.new()
+
+    previous_clusters = MapSet.new(clusters_for_node(name, remote_node))
+
+    previous_clusters
+    |> MapSet.difference(shared_clusters)
+    |> Enum.each(fn cluster ->
+      :ets.delete_object(cluster_nodes_table(name), {cluster, remote_node})
+      :ets.delete_object(node_clusters_table(name), {remote_node, cluster})
     end)
 
-    {:reply, :ok, state}
+    rows = MapSet.to_list(shared_clusters)
+    :ets.insert(cluster_nodes_table(name), Enum.map(rows, &{&1, remote_node}))
+    :ets.insert(node_clusters_table(name), Enum.map(rows, &{remote_node, &1}))
+    :ok
   end
 
-  def handle_call({:remove_clusters, clusters}, _from, state) do
+  defp insert_cluster_nodes(name, clusters, target_node) do
+    :ets.insert(cluster_nodes_table(name), Enum.map(clusters, &{&1, target_node}))
+    :ets.insert(node_clusters_table(name), Enum.map(clusters, &{target_node, &1}))
+    :ok
+  end
+
+  defp delete_cluster_nodes(name, clusters, target_node) do
     Enum.each(clusters, fn cluster ->
-      nodes = cluster_nodes(state.name, cluster)
-      :ets.delete(cluster_nodes_table(state.name), cluster)
+      :ets.delete_object(cluster_nodes_table(name), {cluster, target_node})
+      :ets.delete_object(node_clusters_table(name), {target_node, cluster})
+    end)
+
+    :ok
+  end
+
+  defp delete_cluster_routes(name, clusters) do
+    Enum.each(clusters, fn cluster ->
+      nodes = cluster_nodes(name, cluster)
+      :ets.delete(cluster_nodes_table(name), cluster)
 
       Enum.each(nodes, fn cluster_node ->
-        :ets.delete_object(
-          node_clusters_table(state.name),
-          {cluster_node, cluster}
-        )
+        :ets.delete_object(node_clusters_table(name), {cluster_node, cluster})
       end)
     end)
 
-    {:reply, :ok, state}
+    :ok
   end
 
-  def handle_call({:purge_cluster_node, dead_node}, _from, state) do
+  defp delete_peer_routes(name, remote_node) do
     # Scan the forward index directly so this also repairs a one-sided row left
     # by an interrupted or older dual-index mutation.
-    :ets.select_delete(cluster_nodes_table(state.name), [
-      {{:_, dead_node}, [], [true]}
+    :ets.select_delete(cluster_nodes_table(name), [
+      {{:_, remote_node}, [], [true]}
     ])
 
-    :ets.delete(node_clusters_table(state.name), dead_node)
-    {:reply, :ok, state}
+    :ets.delete(node_clusters_table(name), remote_node)
+    :ok
   end
 
-  def handle_call({:activate_local_clusters, clusters}, _from, state) do
+  defp project_activated_local_clusters(name, clusters) do
+    :ok = insert_cluster_nodes(name, clusters, node())
+
+    name
+    |> cluster_nodes(nil)
+    |> Enum.reject(&(&1 == node()))
+    |> Enum.each(fn remote_node ->
+      shared =
+        Enum.filter(clusters, fn cluster ->
+          not is_nil(remote_cluster_epoch(name, remote_node, cluster))
+        end)
+
+      :ok = insert_cluster_nodes(name, shared, remote_node)
+    end)
+
+    :ok
+  end
+
+  defp cast_cluster_lifecycle(name, shards, request) do
+    Enum.each(shards, fn shard ->
+      :ok = Group.Replica.local_cast(Group.Replica.shard_name(name, shard), request)
+    end)
+  end
+
+  defp activate_local_clusters(state, clusters, durable?) do
     if clusters != [] do
       :ets.update_counter(
         replication_meta_table(state.name),
@@ -1887,17 +2213,12 @@ defmodule Group.Replica.Data do
         {cluster, epoch}
       end)
 
-    {:reply, epochs, state}
+    if durable?, do: project_activated_local_clusters(state.name, clusters)
+
+    {epochs, state}
   end
 
-  def handle_call(:local_replica_authority, _from, state) do
-    generation = generation(state.name)
-    revision = local_cluster_epoch_revision(state.name)
-    epochs = [{nil, generation} | :ets.tab2list(local_cluster_epochs_table(state.name))]
-    {:reply, {generation, revision, epochs}, state}
-  end
-
-  def handle_call({:deactivate_local_clusters, clusters}, _from, state) do
+  defp deactivate_local_clusters(state, clusters, durable?) do
     if clusters != [] do
       :ets.update_counter(
         replication_meta_table(state.name),
@@ -1924,29 +2245,106 @@ defmodule Group.Replica.Data do
         {cluster, epoch}
       end)
 
+    if durable? do
+      :ok = delete_cluster_nodes(state.name, clusters, node())
+
+      cast_cluster_lifecycle(
+        state.name,
+        0..(state.num_shards - 1),
+        {:cluster_disconnect, clusters, epochs}
+      )
+    end
+
+    {epochs, state}
+  end
+
+  @impl true
+  def handle_call({:add_cluster_node, clusters, node}, _from, state) do
+    :ok = insert_cluster_nodes(state.name, clusters, node)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:remove_cluster_node, clusters, node}, _from, state) do
+    :ok = delete_cluster_nodes(state.name, clusters, node)
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:remove_clusters, clusters}, _from, state) do
+    # Startup repair discovers inactive clusters outside the Data process. A
+    # reconnect may install a new epoch before this serialized cleanup runs;
+    # recheck authority here so stale repair work cannot erase the new routes.
+    inactive_clusters =
+      Enum.filter(clusters, &is_nil(local_cluster_epoch(state.name, &1)))
+
+    :ok = delete_cluster_routes(state.name, inactive_clusters)
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:purge_cluster_node, dead_node}, _from, state) do
+    # Nodedown/lease callers may resume after a newer exact authority has
+    # already reinstalled this peer. Recheck the serialized authority fence so
+    # stale cleanup cannot erase routes belonging to the new incarnation.
+    if is_nil(remote_generation(state.name, dead_node)) and
+         is_nil(remote_replica_authority_hint(state.name, dead_node)) do
+      :ok = delete_peer_routes(state.name, dead_node)
+    end
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:activate_local_clusters, clusters}, _from, state) do
+    {epochs, state} = activate_local_clusters(state, clusters, false)
     {:reply, epochs, state}
   end
 
-  def handle_call({:mark_closed_cluster_shard, clusters, shard}, _from, state) do
+  def handle_call({:activate_local_clusters_durable, clusters}, _from, state) do
+    {epochs, state} = activate_local_clusters(state, clusters, true)
+    {:reply, epochs, state}
+  end
+
+  def handle_call(:local_replica_authority, _from, state) do
+    generation = generation(state.name)
+    revision = local_cluster_epoch_revision(state.name)
+    epochs = [{nil, generation} | :ets.tab2list(local_cluster_epochs_table(state.name))]
+    {:reply, {generation, revision, epochs}, state}
+  end
+
+  def handle_call({:deactivate_local_clusters, clusters}, _from, state) do
+    {epochs, state} = deactivate_local_clusters(state, clusters, false)
+    {:reply, epochs, state}
+  end
+
+  def handle_call({:deactivate_local_clusters_durable, clusters}, _from, state) do
+    {epochs, state} = deactivate_local_clusters(state, clusters, true)
+    {:reply, epochs, state}
+  end
+
+  def handle_call({:mark_closed_cluster_shard, cluster_epochs, shard}, _from, state) do
     completed =
-      Enum.reduce(clusters, [], fn cluster, acc ->
+      Enum.reduce(cluster_epochs, [], fn {cluster, request_epoch}, acc ->
         case :ets.lookup(closed_local_cluster_epochs_table(state.name), cluster) do
-          [{^cluster, epoch, pending_shards}] ->
+          [{^cluster, ^request_epoch, pending_shards}] ->
             pending_shards = MapSet.delete(pending_shards, shard)
 
             if MapSet.size(pending_shards) == 0 do
+              # The close marker is the durable recovery obligation. Remove
+              # every route before deleting it so a caller and the final shard
+              # can both disappear immediately after this acknowledgement
+              # without leaving an unowned cluster membership behind.
+              :ok = delete_cluster_routes(state.name, [cluster])
               :ets.delete(closed_local_cluster_epochs_table(state.name), cluster)
               [cluster | acc]
             else
               :ets.insert(
                 closed_local_cluster_epochs_table(state.name),
-                {cluster, epoch, pending_shards}
+                {cluster, request_epoch, pending_shards}
               )
 
               acc
             end
 
-          [] ->
+          _stale_or_completed ->
             acc
         end
       end)
@@ -1966,63 +2364,82 @@ defmodule Group.Replica.Data do
     # one full copy per shard.
     0 = shard
     seen_generation = remote_generation(state.name, remote_node)
-    current_epochs = Map.new(epochs)
 
-    stale_epochs =
-      if seen_generation == generation do
-        for {{^remote_node, cluster}, epoch} <-
-              :ets.match_object(
-                remote_cluster_epochs_table(state.name),
-                {{remote_node, :_}, :_}
-              ),
+    stale? =
+      stale_remote_authority_install?(
+        state.name,
+        remote_node,
+        generation,
+        epoch_revision
+      )
+
+    if stale? do
+      {:reply, :stale, state}
+    else
+      current_epochs = Map.new(epochs)
+
+      stale_epochs =
+        if seen_generation == generation do
+          for {{^remote_node, cluster}, epoch} <-
+                :ets.match_object(
+                  remote_cluster_epochs_table(state.name),
+                  {{remote_node, :_}, :_}
+                ),
+              not is_nil(cluster),
+              Map.get(current_epochs, cluster) != epoch,
+              do: {cluster, epoch}
+        else
+          []
+        end
+
+      # A hello is a complete epoch snapshot. The replica handler fences older
+      # revisions before this call, so replace the shared view rather than merely
+      # adding rows; otherwise a dropped close control could leave a cluster epoch
+      # permanently valid after the heartbeat-driven repair.
+      :ets.select_delete(remote_cluster_epochs_table(state.name), [
+        {{{remote_node, :_}, :_}, [], [true]}
+      ])
+
+      :ets.insert(
+        replication_meta_table(state.name),
+        {{:remote_generation, remote_node}, generation}
+      )
+
+      :ets.insert(
+        replication_meta_table(state.name),
+        {{:remote_epoch_revision, remote_node}, epoch_revision}
+      )
+
+      :ets.insert(
+        replication_meta_table(state.name),
+        {{:remote_epoch_exact, remote_node}, epoch_revision}
+      )
+
+      :ets.insert(
+        replication_meta_table(state.name),
+        {{:remote_epoch_observed, remote_node}, epoch_revision}
+      )
+
+      put_remote_authority_hint(state.name, remote_node, generation, epoch_revision)
+
+      replace_remote_cluster_projection(state.name, remote_node, current_epochs)
+
+      :ets.update_counter(
+        replication_meta_table(state.name),
+        {:remote_authority_installs, remote_node},
+        {2, 1},
+        {{:remote_authority_installs, remote_node}, 0}
+      )
+
+      rows =
+        for {cluster, epoch} <- epochs,
             not is_nil(cluster),
-            Map.get(current_epochs, cluster) != epoch,
-            do: {cluster, epoch}
-      else
-        []
-      end
+            do: {{remote_node, cluster}, epoch}
 
-    # A hello is a complete epoch snapshot. The replica handler fences older
-    # revisions before this call, so replace the shared view rather than merely
-    # adding rows; otherwise a dropped close control could leave a cluster epoch
-    # permanently valid after the heartbeat-driven repair.
-    :ets.select_delete(remote_cluster_epochs_table(state.name), [
-      {{{remote_node, :_}, :_}, [], [true]}
-    ])
+      :ets.insert(remote_cluster_epochs_table(state.name), rows)
 
-    :ets.insert(
-      replication_meta_table(state.name),
-      {{:remote_generation, remote_node}, generation}
-    )
-
-    :ets.insert(
-      replication_meta_table(state.name),
-      {{:remote_epoch_revision, remote_node}, epoch_revision}
-    )
-
-    :ets.insert(
-      replication_meta_table(state.name),
-      {{:remote_epoch_exact, remote_node}, epoch_revision}
-    )
-
-    :ets.insert(
-      replication_meta_table(state.name),
-      {{:remote_epoch_observed, remote_node}, epoch_revision}
-    )
-
-    :ets.update_counter(
-      replication_meta_table(state.name),
-      {:remote_authority_installs, remote_node},
-      {2, 1},
-      {{:remote_authority_installs, remote_node}, 0}
-    )
-
-    rows =
-      for {cluster, epoch} <- epochs, not is_nil(cluster), do: {{remote_node, cluster}, epoch}
-
-    :ets.insert(remote_cluster_epochs_table(state.name), rows)
-
-    {:reply, {seen_generation, stale_epochs}, state}
+      {:reply, {seen_generation, stale_epochs}, state}
+    end
   end
 
   def handle_call(
@@ -2030,89 +2447,202 @@ defmodule Group.Replica.Data do
         _from,
         state
       ) do
-    :ets.insert(
-      replication_meta_table(state.name),
-      {{:remote_view_info, shard, remote_node}, generation, authoritative, observed}
-    )
+    if remote_generation(state.name, remote_node) == generation and
+         remote_cluster_epoch_exact_revision(state.name, remote_node) == authoritative and
+         remote_cluster_epoch_revision(state.name, remote_node) == observed and
+         remote_cluster_epoch_observed_revision(state.name, remote_node) == observed and
+         remote_replica_authority_hint(state.name, remote_node) == {generation, observed} do
+      :ets.insert(
+        replication_meta_table(state.name),
+        {{:remote_view_info, shard, remote_node}, generation, authoritative, observed}
+      )
 
-    {:reply, :ok, state}
+      {:reply, :ok, state}
+    else
+      {:reply, :stale, state}
+    end
   end
 
   def handle_call(
-        {:put_remote_cluster_epochs, shard, remote_node, revision, epochs},
-        _from,
-        state
-      ) do
-    _ = shard
-    observe_remote_cluster_revision(state.name, remote_node, revision, state.num_shards)
-
-    stale_epochs =
-      Enum.flat_map(epochs, fn {cluster, epoch} ->
-        case remote_cluster_epoch(state.name, remote_node, cluster) do
-          old_epoch when not is_nil(old_epoch) and old_epoch != epoch -> [{cluster, old_epoch}]
-          _ -> []
-        end
-      end)
-
-    rows =
-      for {cluster, epoch} <- epochs,
-          not is_nil(cluster),
-          do: {{remote_node, cluster}, epoch}
-
-    :ets.insert(remote_cluster_epochs_table(state.name), rows)
-
-    current_revision = remote_cluster_epoch_revision(state.name, remote_node)
-
-    :ets.insert(
-      replication_meta_table(state.name),
-      {{:remote_epoch_revision, remote_node}, max(current_revision || revision, revision)}
-    )
-
-    {:reply, stale_epochs, state}
-  end
-
-  def handle_call(
-        {:close_remote_cluster_epochs, shard, remote_node, revision, epochs},
+        {:put_remote_cluster_epochs, shard, remote_node, generation, expected_revision, revision,
+         epochs},
         _from,
         state
       ) do
     0 = shard
-    observe_remote_cluster_revision(state.name, remote_node, revision, state.num_shards)
 
-    closed =
-      Enum.filter(epochs, fn {cluster, epoch} ->
-        remote_cluster_epoch(state.name, remote_node, cluster) == epoch
-      end)
+    if incremental_authority_installable?(
+         state.name,
+         remote_node,
+         generation,
+         expected_revision,
+         revision
+       ) do
+      observe_remote_cluster_revision(state.name, remote_node, revision, state.num_shards)
 
-    Enum.each(epochs, fn {cluster, epoch} ->
-      case :ets.lookup(remote_cluster_epochs_table(state.name), {remote_node, cluster}) do
-        [{{^remote_node, ^cluster}, ^epoch}] ->
-          :ets.delete(remote_cluster_epochs_table(state.name), {remote_node, cluster})
+      stale_epochs =
+        Enum.flat_map(epochs, fn {cluster, epoch} ->
+          case remote_cluster_epoch(state.name, remote_node, cluster) do
+            old_epoch when not is_nil(old_epoch) and old_epoch != epoch -> [{cluster, old_epoch}]
+            _ -> []
+          end
+        end)
 
-        _ ->
-          :ok
-      end
-    end)
+      rows =
+        for {cluster, epoch} <- epochs,
+            not is_nil(cluster),
+            do: {{remote_node, cluster}, epoch}
 
-    current_revision = remote_cluster_epoch_revision(state.name, remote_node)
+      :ets.insert(remote_cluster_epochs_table(state.name), rows)
 
-    :ets.insert(
-      replication_meta_table(state.name),
-      {{:remote_epoch_revision, remote_node}, max(current_revision || revision, revision)}
-    )
+      :ets.insert(
+        replication_meta_table(state.name),
+        {{:remote_epoch_revision, remote_node}, revision}
+      )
 
-    {:reply, closed, state}
+      {:reply, {:ok, stale_epochs}, state}
+    else
+      {:reply, :stale, state}
+    end
   end
 
   def handle_call(
-        {:forget_remote_cluster_epochs, shard, remote_node, epochs},
+        {:remote_registry_claim_authoritative, shard, remote_node, generation, cluster, epoch},
         _from,
         state
       ) do
-    # Kept for the rolling-compatibility receive path. The node-wide authority
-    # table is intentionally not mutated by a shard-local purge.
-    _ = {shard, remote_node, epochs}
+    exact = remote_cluster_epoch_exact_revision(state.name, remote_node)
+    observed = remote_cluster_epoch_observed_revision(state.name, remote_node)
+
+    current_view? =
+      case :ets.lookup(
+             replication_meta_table(state.name),
+             {:remote_view_info, shard, remote_node}
+           ) do
+        [{{:remote_view_info, ^shard, ^remote_node}, ^generation, ^exact, ^observed}] -> true
+        _ -> false
+      end
+
+    authoritative? =
+      current_view? and remote_generation(state.name, remote_node) == generation and
+        remote_cluster_epoch_revision(state.name, remote_node) == observed and
+        remote_replica_authority_hint(state.name, remote_node) == {generation, observed} and
+        remote_cluster_epoch(state.name, remote_node, cluster) == epoch and
+        (is_nil(cluster) or active_local_cluster?(state.name, cluster))
+
+    {:reply, authoritative?, state}
+  end
+
+  def handle_call(
+        {:observe_remote_cluster_epoch_revision, remote_node, revision},
+        _from,
+        state
+      ) do
+    :ok = observe_remote_cluster_revision(state.name, remote_node, revision, state.num_shards)
     {:reply, :ok, state}
+  end
+
+  def handle_call(
+        {:observe_remote_replica_hint, remote_node, generation, revision},
+        _from,
+        state
+      ) do
+    known_generation = remote_generation(state.name, remote_node)
+
+    {hint_generation, hint_revision} =
+      remote_replica_authority_hint(state.name, remote_node) ||
+        {known_generation, remote_cluster_epoch_observed_revision(state.name, remote_node)}
+
+    fenced? =
+      cond do
+        hint_generation == generation and
+            (is_nil(hint_revision) or revision > hint_revision) ->
+          put_remote_authority_hint(state.name, remote_node, generation, revision)
+
+          if known_generation == generation do
+            :ok =
+              observe_remote_cluster_revision(
+                state.name,
+                remote_node,
+                revision,
+                state.num_shards
+              )
+          end
+
+          true
+
+        not is_nil(hint_generation) and
+            WireProtocol.generation_newer?(generation, hint_generation) ->
+          # This one shared row is the cross-lane fence. Public readers include
+          # it in replica_view_current?/2, so no lane can admit the prior
+          # generation after this insert even while the per-lane breadcrumbs
+          # below are being updated.
+          put_remote_authority_hint(state.name, remote_node, generation, revision)
+
+          # Preserve each lane's old generation as the later exact install's
+          # purge key, but make its authority revisions impossible to match.
+          # This fences every shard in the same Data turn even when only one
+          # sideband lane observes the restarted origin first.
+          state.name
+          |> replication_meta_table()
+          |> :ets.match_object({{:remote_view_info, :_, remote_node}, :_, :_, :_})
+          |> Enum.each(fn {key, lane_generation, _exact, _observed} ->
+            :ets.insert(
+              replication_meta_table(state.name),
+              {key, lane_generation, nil, nil}
+            )
+          end)
+
+          true
+
+        true ->
+          false
+      end
+
+    {:reply, fenced?, state}
+  end
+
+  def handle_call(
+        {:close_remote_cluster_epochs, shard, remote_node, generation, expected_revision,
+         revision, epochs},
+        _from,
+        state
+      ) do
+    0 = shard
+
+    if incremental_authority_installable?(
+         state.name,
+         remote_node,
+         generation,
+         expected_revision,
+         revision
+       ) do
+      observe_remote_cluster_revision(state.name, remote_node, revision, state.num_shards)
+
+      closed =
+        Enum.filter(epochs, fn {cluster, epoch} ->
+          remote_cluster_epoch(state.name, remote_node, cluster) == epoch
+        end)
+
+      Enum.each(epochs, fn {cluster, epoch} ->
+        case :ets.lookup(remote_cluster_epochs_table(state.name), {remote_node, cluster}) do
+          [{{^remote_node, ^cluster}, ^epoch}] ->
+            :ets.delete(remote_cluster_epochs_table(state.name), {remote_node, cluster})
+
+          _ ->
+            :ok
+        end
+      end)
+
+      :ets.insert(
+        replication_meta_table(state.name),
+        {{:remote_epoch_revision, remote_node}, revision}
+      )
+
+      {:reply, {:ok, closed}, state}
+    else
+      {:reply, :stale, state}
+    end
   end
 
   def handle_call({:delete_remote_replica_info, shard, remote_node}, _from, state) do
@@ -2122,27 +2652,32 @@ defmodule Group.Replica.Data do
     )
 
     if shard == 0 do
-      :ets.delete(replication_meta_table(state.name), {:remote_generation, remote_node})
-      :ets.delete(replication_meta_table(state.name), {:remote_epoch_revision, remote_node})
-      :ets.delete(replication_meta_table(state.name), {:remote_epoch_exact, remote_node})
-      :ets.delete(replication_meta_table(state.name), {:remote_epoch_observed, remote_node})
-      :ets.delete(replication_meta_table(state.name), {:remote_authority_installs, remote_node})
-
-      if state.num_shards > 1 do
-        for view_shard <- 1..(state.num_shards - 1) do
-          :ets.delete(
-            replication_meta_table(state.name),
-            {:remote_view_info, view_shard, remote_node}
-          )
-        end
-      end
-
-      :ets.select_delete(remote_cluster_epochs_table(state.name), [
-        {{{remote_node, :_}, :_}, [], [true]}
-      ])
+      delete_remote_authority(state.name, remote_node)
     end
 
     {:reply, :ok, state}
+  end
+
+  def handle_call({:expire_remote_replica_lane, shard, remote_node}, _from, state) do
+    :ets.delete(
+      replication_meta_table(state.name),
+      {:remote_view_info, shard, remote_node}
+    )
+
+    remaining_lanes =
+      :ets.select_count(replication_meta_table(state.name), [
+        {{{:remote_view_info, :_, remote_node}, :_, :_, :_}, [], [true]}
+      ])
+
+    result =
+      if remaining_lanes == 0 do
+        delete_remote_authority(state.name, remote_node)
+        :node_retired
+      else
+        :lane_retired
+      end
+
+    {:reply, result, state}
   end
 
   @impl true
@@ -2200,7 +2735,7 @@ defmodule Group.Replica.Data do
     :ets.new(local_cluster_epochs_table(name), set_opts)
     :ets.new(closed_local_cluster_epochs_table(name), set_opts)
     :ets.new(remote_cluster_epochs_table(name), set_opts)
-    :ets.insert(replication_meta_table(name), {:generation, make_ref()})
+    :ets.insert(replication_meta_table(name), {:generation, WireProtocol.new_generation()})
     :ets.insert(replication_meta_table(name), {:cluster_epoch_revision, 0})
 
     {:ok, %{name: name, num_shards: num_shards}}
@@ -2213,6 +2748,102 @@ defmodule Group.Replica.Data do
       [{^key, current}] when current >= revision -> :ok
       _ -> :ets.insert(replication_meta_table(name), {key, revision})
     end
+
+    case remote_generation(name, remote_node) do
+      generation when not is_nil(generation) ->
+        put_remote_authority_hint(name, remote_node, generation, revision)
+
+      nil ->
+        :ok
+    end
+
+    :ok
+  end
+
+  defp put_remote_authority_hint(name, remote_node, generation, revision) do
+    key = {:remote_authority_hint, remote_node}
+
+    install? =
+      case remote_replica_authority_hint(name, remote_node) do
+        nil ->
+          true
+
+        {^generation, current_revision} ->
+          revision > current_revision
+
+        {current_generation, _current_revision} ->
+          WireProtocol.generation_newer?(generation, current_generation)
+      end
+
+    if install? do
+      :ets.insert(replication_meta_table(name), {key, generation, revision})
+    end
+
+    :ok
+  end
+
+  defp stale_remote_authority_install?(name, remote_node, generation, revision) do
+    known_generation = remote_generation(name, remote_node)
+    authoritative_revision = remote_cluster_epoch_revision(name, remote_node)
+    observed_revision = remote_cluster_epoch_observed_revision(name, remote_node)
+
+    hinted_stale? =
+      case remote_replica_authority_hint(name, remote_node) do
+        nil ->
+          false
+
+        {^generation, hinted_revision} ->
+          revision < hinted_revision
+
+        {hinted_generation, _hinted_revision} ->
+          not WireProtocol.generation_newer?(generation, hinted_generation)
+      end
+
+    known_stale? =
+      not is_nil(known_generation) and known_generation != generation and
+        not WireProtocol.generation_newer?(generation, known_generation)
+
+    revision_stale? =
+      known_generation == generation and
+        Enum.any?([authoritative_revision, observed_revision], fn
+          current when is_integer(current) -> revision < current
+          _ -> false
+        end)
+
+    hinted_stale? or known_stale? or revision_stale?
+  end
+
+  defp incremental_authority_installable?(
+         name,
+         remote_node,
+         generation,
+         expected_revision,
+         revision
+       ) do
+    is_integer(expected_revision) and is_integer(revision) and revision > expected_revision and
+      remote_generation(name, remote_node) == generation and
+      remote_cluster_epoch_revision(name, remote_node) == expected_revision and
+      remote_cluster_epoch_observed_revision(name, remote_node) == expected_revision and
+      remote_replica_authority_hint(name, remote_node) == {generation, expected_revision}
+  end
+
+  defp delete_remote_authority(name, remote_node) do
+    # Fence every public-ETS reader first. The remaining mutations execute in
+    # this same Data callback, so a caller cannot observe completion between
+    # them; if Data itself dies, it takes every owned table with it. Removing
+    # the generation before routing therefore closes the read interleaving
+    # where a sibling lane could still accept data during retirement.
+    :ets.delete(replication_meta_table(name), {:remote_generation, remote_node})
+    :ok = delete_peer_routes(name, remote_node)
+    :ets.delete(replication_meta_table(name), {:remote_epoch_revision, remote_node})
+    :ets.delete(replication_meta_table(name), {:remote_epoch_exact, remote_node})
+    :ets.delete(replication_meta_table(name), {:remote_epoch_observed, remote_node})
+    :ets.delete(replication_meta_table(name), {:remote_authority_hint, remote_node})
+    :ets.delete(replication_meta_table(name), {:remote_authority_installs, remote_node})
+
+    :ets.select_delete(remote_cluster_epochs_table(name), [
+      {{{remote_node, :_}, :_}, [], [true]}
+    ])
 
     :ok
   end

@@ -401,9 +401,7 @@ end
 defmodule Group.Jepsen.ConflictResolver do
   @moduledoc false
 
-  def resolve(_name, _key, {pid1, meta1, _time1}, {pid2, meta2, _time2}) do
-    if rank(meta1) >= rank(meta2), do: pid1, else: pid2
-  end
+  def resolve(_name, _key, {_pid, meta, _time}), do: rank(meta)
 
   defp rank(%{revision: revision, token: token}), do: {revision, token}
   defp rank(_meta), do: {-1, ""}

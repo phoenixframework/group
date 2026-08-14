@@ -176,6 +176,11 @@ defmodule Group do
   - **Process ownership is local**: a shard monitors and exits only processes
     owned by its own node. Remote lifecycle changes arrive as sequenced replica
     records or are removed by `nodedown`/peer-lease expiry.
+
+  - **Replica recovery is bounded and leaderless**: per-origin sequence gaps use
+    retained deltas and then exact origin-slice snapshots after oplog pruning.
+    Persisted generation/revision hints fence every lane across authority races;
+    only an exact dist-Erlang hello can reintroduce a fully retired peer.
   """
 
   alias Group.Replica
@@ -200,10 +205,13 @@ defmodule Group do
     replication messages. `false` disables routine info/verbose logs; registry
     conflicts and busy distribution links still emit error/warning logs.
   - `:resolve_registry_conflict` — `{module, function, extra_args}` callback invoked when
-    two nodes hold the same registry key (partition heal or concurrent registration).
-    Called as `apply(module, function, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
-    Must return the winner pid (or neither contender to reject both). Group records
-    an authoritative delete and terminates a losing process only on its owner node.
+    multiple origins hold the same registry key after partition healing or concurrent
+    registration. Called once per claim as
+    `apply(module, function, [name, key, {pid, meta, time} | extra_args])` and must
+    return a deterministic Erlang term used as that claim's rank. Group chooses the
+    maximum `{rank, pid}` so every node obtains the same winner regardless of claim
+    arrival or grouping. It records an authoritative delete and terminates a losing
+    process only on its owner node.
     **Important:** This callback runs synchronously inside the shard GenServer — it must
     return quickly and never block. Any information needed for the decision should be
     carried in the registration metadata, not fetched at resolution time.
@@ -463,10 +471,14 @@ defmodule Group do
       when is_atom(name) and is_binary(key) and is_map(meta) and is_list(opts) do
     validate_key!(key)
     cluster = Keyword.get(opts, :cluster)
-    validate_cluster_connected!(name, cluster)
+    epoch = validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, key)
 
-    Replica.local_request(shard, {:register, cluster, key, self(), meta}, call_timeout(opts))
+    Replica.local_request(
+      shard,
+      {:register, cluster, epoch, key, self(), meta},
+      call_timeout(opts)
+    )
   end
 
   @doc """
@@ -497,10 +509,10 @@ defmodule Group do
       when is_atom(name) and is_binary(key) and is_list(opts) do
     validate_key!(key)
     cluster = Keyword.get(opts, :cluster)
-    validate_cluster_connected!(name, cluster)
+    epoch = validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, key)
 
-    Replica.local_request(shard, {:unregister, cluster, key}, call_timeout(opts))
+    Replica.local_request(shard, {:unregister, cluster, epoch, key}, call_timeout(opts))
   end
 
   @doc """
@@ -654,10 +666,14 @@ defmodule Group do
              is_list(opts) do
     validate_key!(group)
     cluster = Keyword.get(opts, :cluster)
-    validate_cluster_connected!(name, cluster)
+    epoch = validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, group)
 
-    Replica.local_request(shard, {:join, cluster, group, self(), meta}, call_timeout(opts))
+    Replica.local_request(
+      shard,
+      {:join, cluster, epoch, group, self(), meta},
+      call_timeout(opts)
+    )
   end
 
   @doc """
@@ -685,10 +701,10 @@ defmodule Group do
       when is_atom(name) and is_binary(group) and is_list(opts) do
     validate_key!(group)
     cluster = Keyword.get(opts, :cluster)
-    validate_cluster_connected!(name, cluster)
+    epoch = validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, group)
 
-    Replica.local_request(shard, {:leave, cluster, group, self()}, call_timeout(opts))
+    Replica.local_request(shard, {:leave, cluster, epoch, group, self()}, call_timeout(opts))
   end
 
   # ===========================================================================
@@ -1119,14 +1135,13 @@ defmodule Group do
   def connect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
     timeout = Data.await_closed_local_clusters(name, clusters, timeout)
-    _epochs = Data.activate_local_clusters(name, clusters)
-    Data.add_cluster_node(name, clusters, node())
+    epochs = Data.activate_local_clusters_durable(name, clusters)
 
     notify_shard = :rand.uniform(get_config(name).num_shards) - 1
 
     Replica.local_request(
       Replica.shard_name(name, notify_shard),
-      {:cluster_connect, clusters},
+      {:cluster_connect, clusters, epochs},
       timeout
     )
   end
@@ -1134,25 +1149,9 @@ defmodule Group do
   @doc false
   def disconnect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
-    _epochs = Data.deactivate_local_clusters(name, clusters)
-    Data.remove_cluster_node(name, clusters, node())
-
-    num_shards = get_config(name).num_shards
-
-    shard_names = for i <- 0..(num_shards - 1), do: Replica.shard_name(name, i)
-
-    result =
-      Replica.local_request_all(
-        shard_names,
-        {:cluster_disconnect, clusters},
-        timeout
-      )
-
-    # Keep the remote routing rows through the shard barrier so any buffered
-    # records are dispatched before the cluster-close control message. Once
-    # every shard has crossed the barrier, no cluster rows may remain locally.
-    Data.remove_clusters(name, clusters)
-    result
+    _epochs = Data.deactivate_local_clusters_durable(name, clusters)
+    _remaining_timeout = Data.await_closed_local_clusters(name, clusters, timeout)
+    :ok
   end
 
   # ===========================================================================
@@ -1224,12 +1223,16 @@ defmodule Group do
     |> List.flatten()
   end
 
-  defp validate_cluster_connected!(_name, nil), do: :ok
+  defp validate_cluster_connected!(name, nil), do: Data.generation(name)
 
   defp validate_cluster_connected!(name, cluster) do
-    unless node() in Data.cluster_nodes(name, cluster) do
-      raise ArgumentError,
-            "not connected to cluster #{inspect(cluster)}. Call Group.connect(#{inspect(name)}, #{inspect(cluster)}) first"
+    case Data.local_cluster_epoch(name, cluster) do
+      nil ->
+        raise ArgumentError,
+              "not connected to cluster #{inspect(cluster)}. Call Group.connect(#{inspect(name)}, #{inspect(cluster)}) first"
+
+      epoch ->
+        epoch
     end
   end
 
