@@ -29,6 +29,9 @@ defmodule Group.ReplicaSnapshotDistributedTest do
         )
     end)
 
+    forwarder = TestCluster.spawn_monitor_forwarder(node_b, name, :all, self())
+    assert_receive {:monitor_ready, ^forwarder}, 5_000
+
     stream_id = local_stream(node_a, name, nil)
     old_cursor = replica_cursor(node_b, name, stream_id)
     :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
@@ -100,6 +103,17 @@ defmodule Group.ReplicaSnapshotDistributedTest do
              )
            ) ==
              MapSet.new(fresh_pg)
+
+    {fresh_reg_key, fresh_reg_pid} = hd(fresh_reg)
+    fresh_pg_pid = hd(fresh_pg)
+
+    assert_receive {:got_event,
+                    %Group.Event{type: :registered, key: ^fresh_reg_key, pid: ^fresh_reg_pid}},
+                   5_000
+
+    assert_receive {:got_event,
+                    %Group.Event{type: :joined, key: ^fresh_pg_key, pid: ^fresh_pg_pid}},
+                   5_000
 
     assert snapshot_transfer_count(node_b, name) == 0
   end

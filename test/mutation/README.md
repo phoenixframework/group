@@ -10,7 +10,7 @@ also covers incomplete commit, conflicting retransmission rows, newer-snapshot
 supersession, stale-authority fencing, and staging expiry.
 Restart calibration covers per-lane eviction breadcrumbs and partially observed
 authority, while wire calibration rejects wrong-shard rows and unsequenced
-cluster lifecycle messages. The 65-mutant campaign also independently removes
+cluster lifecycle messages. The 64-mutant campaign also independently removes
 the generation and epoch fences, races authority changes against local-owner
 retirement, skips conflict reprojection after exact authority returns, bypasses
 shard-zero authority serialization, separates exact authority from its shared

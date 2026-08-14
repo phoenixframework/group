@@ -2531,6 +2531,46 @@ defmodule GroupTest do
       assert :ok = Group.TestCluster.assert_replica_consistent(name)
     end
 
+    test "streamed exact replacement deletes every claim across select continuations" do
+      name = start_single_shard_group(replicated_oplog_max_entries: 16)
+      stream_id = Group.Replica.Data.local_stream_id(name, 0, nil)
+      staging = Group.Replica.Snapshot.new_staging_table()
+
+      on_exit(fn -> Group.Replica.Snapshot.delete_staging_table(staging) end)
+
+      Enum.each(1..10_000, fn index ->
+        :ok =
+          Group.Replica.Data.put_registry_claim(
+            name,
+            0,
+            stream_id,
+            1,
+            "snapshot/select-continuation/#{index}",
+            self(),
+            %{},
+            index
+          )
+      end)
+
+      assert :ok = Group.Replica.Snapshot.stage_rows(staging, 1, [], [])
+
+      assert :ok =
+               Group.Replica.Data.replace_registry_claims_for_stream_from_staging(
+                 name,
+                 0,
+                 stream_id,
+                 1,
+                 staging,
+                 1,
+                 :ok,
+                 fn _key, :ok -> :ok end
+               )
+
+      assert Group.Replica.Data.registry_claims_for_stream(name, 0, stream_id) == []
+      assert :ets.info(Group.Replica.Data.reg_claim_by_key_table(name, 0), :size) == 0
+      assert :ets.info(Group.Replica.Data.reg_claim_by_pid_table(name, 0), :size) == 0
+    end
+
     test "a shard restart completes an interrupted named-cluster close without retained rows" do
       name = start_single_shard_group(replicated_oplog_max_entries: 16)
       cluster = "close/crash-window/#{System.unique_integer([:positive])}"

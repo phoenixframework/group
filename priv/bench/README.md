@@ -45,6 +45,22 @@ busy lane of a much larger sharded deployment):
   --coordinator-expr 'GroupBench.Distributed.run_snapshot_sync_only(shards: 1, entries: 50000)'
 ```
 
+To exercise one million rows across the recommended 32-shard scale point,
+including exact catch-up, hottest-shard restart repair, memory, and permanent
+peer eviction:
+
+```bash
+./run_distributed.sh --shards 32 \
+  --coordinator-expr 'GroupBench.Distributed.run_scale_recovery_only(shards: 32, entries: 1000000, mode: :registry)'
+
+./run_distributed.sh --shards 32 \
+  --coordinator-expr 'GroupBench.Distributed.run_scale_recovery_only(shards: 32, entries: 1000000, mode: :pg_hotspot)'
+```
+
+`:registry` spreads a million exact claims across all shards.
+`:pg_hotspot` deliberately puts a million memberships on one key/shard, which
+is the worst case for snapshot installation and restart rebuilding.
+
 ## Local Scenarios
 
 All local benchmarks run for both the default (nil) cluster and a named cluster

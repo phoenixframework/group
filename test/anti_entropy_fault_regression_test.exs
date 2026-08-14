@@ -620,7 +620,7 @@ defmodule Group.AntiEntropyFaultRegressionTest do
 
     assert 1 ==
              TestCluster.rpc!(context.node_a, :erlang, :trace_pattern, [
-               {Group.Replica.Data, :registry_claims_for_stream, 3},
+               {Group.Replica.Data, :reduce_registry_claim_batches_for_stream, 5},
                true,
                [:local]
              ])
@@ -636,7 +636,7 @@ defmodule Group.AntiEntropyFaultRegressionTest do
       TestCluster.rpc!(context.node_a, :erlang, :trace, [shard, false, [:all]])
 
       TestCluster.rpc!(context.node_a, :erlang, :trace_pattern, [
-        {Group.Replica.Data, :registry_claims_for_stream, 3},
+        {Group.Replica.Data, :reduce_registry_claim_batches_for_stream, 5},
         false,
         [:local]
       ])
@@ -652,7 +652,8 @@ defmodule Group.AntiEntropyFaultRegressionTest do
 
     assert_receive {:forwarded_trace,
                     {:trace, capture_pid, :call,
-                     {Group.Replica.Data, :registry_claims_for_stream, [^name, 0, ^stream_id]}}},
+                     {Group.Replica.Data, :reduce_registry_claim_batches_for_stream,
+                      [^name, 0, ^stream_id, _capture, _fun]}}},
                    1_000
 
     refute capture_pid == shard
@@ -2830,6 +2831,14 @@ defmodule Group.AntiEntropyFaultRegressionTest do
         _ -> false
       end
     end)
+
+    new_lane =
+      TestCluster.rpc!(context.node_b, Process, :whereis, [Group.Replica.shard_name(name, 1)])
+
+    # A registered GenServer name only proves the replacement process exists;
+    # init still has to finish its retained-ETS repair before direct ETS reads
+    # can assert the post-restart state.
+    _state = TestCluster.rpc!(context.node_b, :sys, :get_state, [new_lane])
 
     assert TestCluster.rpc!(context.node_b, :ets, :lookup, [
              Group.Replica.Data.replica_cursor_table(name, 1),

@@ -84,6 +84,29 @@ defmodule GroupBench.Distributed do
     IO.puts("\n  Done.\n")
   end
 
+  def run_scale_recovery_only(opts \\ []) do
+    shards = Keyword.get(opts, :shards, 32)
+    entries = Keyword.get(opts, :entries, 1_000_000)
+    mode = Keyword.get(opts, :mode, :registry)
+    Process.put(:bench_shards, shards)
+
+    unless mode in [:registry, :pg_hotspot] do
+      raise ArgumentError, "expected :mode to be :registry or :pg_hotspot"
+    end
+
+    header("Distributed Million-Row Recovery Benchmark")
+    IO.puts("  coordinator: #{node()}")
+    IO.puts("  shards:      #{shards}")
+    IO.puts("  entries:     #{format_number(entries)}")
+    IO.puts("  mode:        #{mode}")
+    IO.puts("  schedulers:  #{System.schedulers_online()}")
+
+    connect_replicas()
+    bench_scale_recovery(@replicas, mode, entries)
+
+    IO.puts("\n  Done.\n")
+  end
+
   # ── Connection ────────────────────────────────────────────────────────
 
   defp connect_replicas do
@@ -107,6 +130,148 @@ defmodule GroupBench.Distributed do
         Process.sleep(200)
         wait_for_connection(node_name, attempts - 1)
     end
+  end
+
+  defp bench_scale_recovery([source, receiver] = replicas, mode, entries) do
+    header("Exact snapshot, shard restart, and permanent Group loss")
+
+    group_opts = [
+      replicated_oplog_max_entries: 64,
+      replicated_snapshot_chunk_target_bytes: 1_048_576,
+      replicated_anti_entropy_interval: 250,
+      replicated_peer_lease_timeout: 5_000
+    ]
+
+    stop_groups(replicas)
+    start_group_on(source, group_opts)
+
+    {seed_us, seed_result} =
+      :timer.tc(fn ->
+        case mode do
+          :registry ->
+            :erpc.call(
+              source,
+              GroupBench.Replica,
+              :seed_registry_slice,
+              [@name, entries, "scale/registry/", 10_000],
+              1_800_000
+            )
+
+          :pg_hotspot ->
+            :erpc.call(
+              source,
+              GroupBench.Replica,
+              :seed_pg_hotspot,
+              [@name, entries, "scale/pg-hotspot", 10_000],
+              1_800_000
+            )
+        end
+      end)
+
+    source_memory = :erpc.call(source, GroupBench.Replica, :memory_snapshot, [@name])
+
+    {snapshot_us, _} =
+      :timer.tc(fn ->
+        start_group_on(receiver, group_opts)
+
+        poll_until(
+          fn -> replicated_row_count(receiver, mode) == entries end,
+          900_000
+        )
+
+        :ok =
+          :erpc.call(receiver, GroupBench.Replica, :flush_shards, [@name], 900_000)
+      end)
+
+    receiver_memory = :erpc.call(receiver, GroupBench.Replica, :memory_snapshot, [@name])
+
+    restart_shard =
+      case mode do
+        :registry ->
+          source
+          |> :erpc.call(GroupBench.Replica, :registry_counts_by_shard, [@name])
+          |> Enum.max_by(&elem(&1, 1))
+          |> elem(0)
+
+        :pg_hotspot ->
+          seed_result
+      end
+
+    restart =
+      :erpc.call(
+        receiver,
+        GroupBench.Replica,
+        :restart_shard,
+        [@name, restart_shard],
+        900_000
+      )
+
+    unless replicated_row_count(receiver, mode) == entries do
+      raise "row count changed across receiver shard restart"
+    end
+
+    {eviction_us, _} =
+      :timer.tc(fn ->
+        stop_group_on(source)
+
+        poll_until(
+          fn ->
+            counts = :erpc.call(receiver, GroupBench.Replica, :replica_row_counts, [@name])
+
+            counts.registry_rows == 0 and counts.registry_claim_rows == 0 and
+              counts.pg_rows == 0 and counts.replica_cursor_rows == 0
+          end,
+          900_000
+        )
+      end)
+
+    after_eviction_memory =
+      :erpc.call(receiver, GroupBench.Replica, :memory_snapshot, [@name])
+
+    unless after_eviction_memory.registry_rows == 0 and after_eviction_memory.pg_rows == 0 and
+             after_eviction_memory.registry_claim_rows == 0 and
+             after_eviction_memory.replica_cursor_rows == 0 do
+      raise "retired source left visible rows, authoritative claims, or receive cursors: " <>
+              inspect(
+                Map.take(after_eviction_memory, [
+                  :registry_rows,
+                  :registry_claim_rows,
+                  :pg_rows,
+                  :replica_cursor_rows
+                ])
+              )
+    end
+
+    if mode == :registry and is_pid(seed_result) do
+      :erpc.call(source, Process, :exit, [seed_result, :kill])
+    end
+
+    result = %{
+      mode: mode,
+      entries: entries,
+      shards: Process.get(:bench_shards),
+      seed_ms: div(seed_us, 1_000),
+      snapshot_ms: div(snapshot_us, 1_000),
+      snapshot_rows_per_second: round(entries * 1_000_000 / max(snapshot_us, 1)),
+      restart_shard: restart_shard,
+      restart_ms: div(restart.elapsed_us, 1_000),
+      eviction_ms: div(eviction_us, 1_000),
+      source_memory: source_memory,
+      receiver_memory: receiver_memory,
+      after_eviction_memory: after_eviction_memory
+    }
+
+    IO.puts("\n  PERF_RESULT #{inspect(result, pretty: true, limit: :infinity)}")
+    stop_groups(replicas)
+    result
+  end
+
+  defp replicated_row_count(node, :registry) do
+    :erpc.call(node, GroupBench.Replica, :total_registry_count, [@name])
+  end
+
+  defp replicated_row_count(node, :pg_hotspot) do
+    :erpc.call(node, GroupBench.Replica, :total_pg_count, [@name])
   end
 
   # ── Group lifecycle helpers (all MFA) ─────────────────────────────────

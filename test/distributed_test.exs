@@ -4282,8 +4282,8 @@ defmodule Group.DistributedTest do
       opts = [
         name: name,
         shards: shards,
-        replicated_anti_entropy_interval: 60_000,
-        replicated_peer_lease_timeout: 120_000
+        replicated_anti_entropy_interval: 600_000,
+        replicated_peer_lease_timeout: 1_200_000
       ]
 
       start_group_on_peers(peers, opts)

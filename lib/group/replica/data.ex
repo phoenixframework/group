@@ -593,9 +593,6 @@ defmodule Group.Replica.Data do
   def repair_shard_indexes(name, shard) do
     repair_interrupted_snapshot_installs(name, shard)
     repair_primary_replica_rows(name, shard)
-    rebuild_registry_reverse_index(name, shard)
-    rebuild_registry_claim_reverse_index(name, shard)
-    rebuild_pg_reverse_index(name, shard)
     :ok
   end
 
@@ -687,58 +684,32 @@ defmodule Group.Replica.Data do
     end
   end
 
-  defp rebuild_registry_reverse_index(name, shard) do
-    reverse = reg_by_pid_table(name, shard)
-    :ets.delete_all_objects(reverse)
-
-    reg_by_key_table(name, shard)
-    |> :ets.tab2list()
-    |> Enum.each(fn {{cluster, key}, pid, meta, time, entry_node} ->
-      :ets.insert(reverse, {{pid, cluster, key}, meta, time, entry_node})
-    end)
-  end
-
-  defp rebuild_registry_claim_reverse_index(name, shard) do
-    reverse = reg_claim_by_pid_table(name, shard)
-    :ets.delete_all_objects(reverse)
-
-    reg_claim_by_key_table(name, shard)
-    |> :ets.tab2list()
-    |> Enum.each(fn {{cluster, key, origin, generation, epoch}, pid, meta, time, seq} ->
-      :ets.insert(
-        reverse,
-        {{pid, cluster, key, origin, generation, epoch}, meta, time, seq}
-      )
-    end)
-  end
-
-  defp rebuild_pg_reverse_index(name, shard) do
-    reverse = pg_by_pid_table(name, shard)
-    :ets.delete_all_objects(reverse)
-
-    pg_by_key_table(name, shard)
-    |> :ets.tab2list()
-    |> Enum.each(fn {{cluster, key, pid}, meta, time, entry_node} ->
-      :ets.insert(reverse, {{pid, cluster, key}, meta, time, entry_node})
-    end)
-  end
-
   # A shard can crash between writes to its materialized rows and receive
   # cursor, or while retiring an epoch across multiple ETS tables. Recover from
   # the primary tables themselves: stale claims carry their complete stream
   # authority, while a remote PG row is retained only when the current stream
   # has a cursor (including the sequence-zero admission marker). This pass also
   # replaces the old multi-million-element cluster list with one fixed-table
-  # traversal and O(number of inactive clusters) accumulator memory.
+  # traversal and O(number of inactive clusters) accumulator memory. Reverse
+  # indexes are rebuilt during the same primary-table pass, avoiding both a
+  # second traversal and a complete `tab2list/1` heap copy per index.
   defp repair_primary_replica_rows(name, shard) do
+    reg_reverse = reg_by_pid_table(name, shard)
+    claim_reverse = reg_claim_by_pid_table(name, shard)
+    pg_reverse = pg_by_pid_table(name, shard)
+    :ets.delete_all_objects(reg_reverse)
+    :ets.delete_all_objects(claim_reverse)
+    :ets.delete_all_objects(pg_reverse)
+
     inactive_clusters = MapSet.new()
 
     inactive_clusters =
       repair_ets_table(
         reg_by_key_table(name, shard),
         inactive_clusters,
-        fn {{cluster, key}, _pid, _meta, _time, _entry_node}, inactive ->
+        fn {{cluster, key}, pid, meta, time, entry_node}, inactive ->
           if active_local_cluster?(name, cluster) do
+            :ets.insert(reg_reverse, {{pid, cluster, key}, meta, time, entry_node})
             inactive
           else
             :ets.delete(reg_by_key_table(name, shard), {cluster, key})
@@ -751,8 +722,7 @@ defmodule Group.Replica.Data do
       repair_ets_table(
         reg_claim_by_key_table(name, shard),
         inactive_clusters,
-        fn {{cluster, key, origin, claim_generation, epoch}, _pid, _meta, _time, _seq},
-           inactive ->
+        fn {{cluster, key, origin, claim_generation, epoch}, pid, meta, time, seq}, inactive ->
           if active_local_cluster?(name, cluster) and
                valid_claim_authority?(
                  name,
@@ -762,6 +732,11 @@ defmodule Group.Replica.Data do
                  claim_generation,
                  epoch
                ) do
+            :ets.insert(
+              claim_reverse,
+              {{pid, cluster, key, origin, claim_generation, epoch}, meta, time, seq}
+            )
+
             inactive
           else
             :ets.delete(
@@ -778,13 +753,14 @@ defmodule Group.Replica.Data do
       repair_ets_table(
         pg_by_key_table(name, shard),
         inactive_clusters,
-        fn {{cluster, key, pid}, _meta, _time, entry_node}, inactive ->
+        fn {{cluster, key, pid}, meta, time, entry_node}, inactive ->
           valid? =
             active_local_cluster?(name, cluster) and node(pid) == entry_node and
               (entry_node == node() or
                  valid_remote_pg_authority?(name, shard, cluster, entry_node))
 
           if valid? do
+            :ets.insert(pg_reverse, {{pid, cluster, key}, meta, time, entry_node})
             inactive
           else
             :ets.delete(pg_by_key_table(name, shard), {cluster, key, pid})
@@ -1219,11 +1195,15 @@ defmodule Group.Replica.Data do
 
     case :ets.lookup(reg_claim_by_key_table(name, shard), claim_key) do
       [{^claim_key, ^pid, _meta, _time, old_seq}] when old_seq <= seq ->
-        :ets.delete(reg_claim_by_key_table(name, shard), claim_key)
-
-        :ets.delete(
-          reg_claim_by_pid_table(name, shard),
-          {pid, cluster, key, origin_node, generation, epoch}
+        delete_registry_claim_indexes(
+          name,
+          shard,
+          cluster,
+          key,
+          origin_node,
+          generation,
+          epoch,
+          pid
         )
 
         :ok
@@ -1241,15 +1221,36 @@ defmodule Group.Replica.Data do
   end
 
   def registry_claims_for_stream(name, shard, stream_id) do
+    fold_registry_claims_for_stream(name, shard, stream_id, [], fn row, rows -> [row | rows] end)
+    |> Enum.reverse()
+  end
+
+  def fold_registry_claims_for_stream(name, shard, stream_id, acc, fun)
+      when is_function(fun, 2) do
+    {table, match_spec} = registry_claim_stream_selection(name, shard, stream_id)
+
+    fold_select_batches_fixed(table, match_spec, acc, fn rows, inner ->
+      Enum.reduce(rows, inner, fun)
+    end)
+  end
+
+  def reduce_registry_claim_batches_for_stream(name, shard, stream_id, acc, fun)
+      when is_function(fun, 2) do
+    {table, match_spec} = registry_claim_stream_selection(name, shard, stream_id)
+    fold_select_batches(table, match_spec, acc, fun)
+  end
+
+  defp registry_claim_stream_selection(name, shard, stream_id) do
     cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
     origin_node = Group.Replica.WireProtocol.stream_origin(stream_id)
     generation = Group.Replica.WireProtocol.stream_generation(stream_id)
     epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
 
-    :ets.select(reg_claim_by_key_table(name, shard), [
+    {
+      reg_claim_by_key_table(name, shard),
       {{{cluster, :"$1", origin_node, generation, epoch}, :"$2", :"$3", :"$4", :_}, [],
        [{{:"$1", :"$2", :"$3", :"$4"}}]}
-    ])
+    }
   end
 
   def replace_registry_claims_for_stream(name, shard, stream_id, snapshot_seq, claims) do
@@ -1260,14 +1261,15 @@ defmodule Group.Replica.Data do
     existing = registry_claims_for_stream(name, shard, stream_id)
 
     Enum.each(existing, fn {key, pid, _meta, _time} ->
-      :ets.delete(
-        reg_claim_by_key_table(name, shard),
-        {cluster, key, origin_node, generation, epoch}
-      )
-
-      :ets.delete(
-        reg_claim_by_pid_table(name, shard),
-        {pid, cluster, key, origin_node, generation, epoch}
+      delete_registry_claim_indexes(
+        name,
+        shard,
+        cluster,
+        key,
+        origin_node,
+        generation,
+        epoch,
+        pid
       )
     end)
 
@@ -1284,41 +1286,46 @@ defmodule Group.Replica.Data do
         stream_id,
         snapshot_seq,
         staging_table,
-        chunk_count
-      ) do
+        chunk_count,
+        acc,
+        fun
+      )
+      when is_function(fun, 2) do
     cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
     origin_node = Group.Replica.WireProtocol.stream_origin(stream_id)
     generation = Group.Replica.WireProtocol.stream_generation(stream_id)
     epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
-    existing = registry_claims_for_stream(name, shard, stream_id)
 
-    keys =
-      Enum.reduce(existing, MapSet.new(), fn {key, pid, _meta, _time}, keys ->
-        :ets.delete(
-          reg_claim_by_key_table(name, shard),
-          {cluster, key, origin_node, generation, epoch}
-        )
+    acc =
+      fold_registry_claims_for_stream(name, shard, stream_id, acc, fn
+        {key, pid, _meta, _time}, inner ->
+          delete_registry_claim_indexes(
+            name,
+            shard,
+            cluster,
+            key,
+            origin_node,
+            generation,
+            epoch,
+            pid
+          )
 
-        :ets.delete(
-          reg_claim_by_pid_table(name, shard),
-          {pid, cluster, key, origin_node, generation, epoch}
-        )
-
-        MapSet.put(keys, key)
+          if Group.Replica.Snapshot.member_registry?(staging_table, key) do
+            inner
+          else
+            fun.(key, inner)
+          end
       end)
 
-    keys =
-      Group.Replica.Snapshot.fold_registry(
-        staging_table,
-        chunk_count,
-        keys,
-        fn {key, pid, meta, time}, keys ->
-          put_registry_claim(name, shard, stream_id, snapshot_seq, key, pid, meta, time)
-          MapSet.put(keys, key)
-        end
-      )
-
-    MapSet.to_list(keys)
+    Group.Replica.Snapshot.fold_registry(
+      staging_table,
+      chunk_count,
+      acc,
+      fn {key, pid, meta, time}, inner ->
+        put_registry_claim(name, shard, stream_id, snapshot_seq, key, pid, meta, time)
+        fun.(key, inner)
+      end
+    )
   end
 
   def purge_registry_claims_for_origin(name, shard, origin_node) do
@@ -1329,14 +1336,15 @@ defmodule Group.Replica.Data do
       ])
 
     Enum.each(claims, fn {cluster, key, pid, _meta, _time, generation, epoch} ->
-      :ets.delete(
-        reg_claim_by_key_table(name, shard),
-        {cluster, key, origin_node, generation, epoch}
-      )
-
-      :ets.delete(
-        reg_claim_by_pid_table(name, shard),
-        {pid, cluster, key, origin_node, generation, epoch}
+      delete_registry_claim_indexes(
+        name,
+        shard,
+        cluster,
+        key,
+        origin_node,
+        generation,
+        epoch,
+        pid
       )
     end)
 
@@ -1361,14 +1369,15 @@ defmodule Group.Replica.Data do
     claims = :ets.select(reg_claim_by_key_table(name, shard), match_specs)
 
     Enum.each(claims, fn {{cluster, key, origin, generation, epoch}, pid, _meta, _time, _seq} ->
-      :ets.delete(
-        reg_claim_by_key_table(name, shard),
-        {cluster, key, origin, generation, epoch}
-      )
-
-      :ets.delete(
-        reg_claim_by_pid_table(name, shard),
-        {pid, cluster, key, origin, generation, epoch}
+      delete_registry_claim_indexes(
+        name,
+        shard,
+        cluster,
+        key,
+        origin,
+        generation,
+        epoch,
+        pid
       )
     end)
 
@@ -1403,18 +1412,39 @@ defmodule Group.Replica.Data do
 
   defp delete_registry_claim_rows(name, shard, cluster, claims) do
     Enum.each(claims, fn {key, pid, _meta, _time, claim_origin, generation, epoch} ->
-      :ets.delete(
-        reg_claim_by_key_table(name, shard),
-        {cluster, key, claim_origin, generation, epoch}
-      )
-
-      :ets.delete(
-        reg_claim_by_pid_table(name, shard),
-        {pid, cluster, key, claim_origin, generation, epoch}
+      delete_registry_claim_indexes(
+        name,
+        shard,
+        cluster,
+        key,
+        claim_origin,
+        generation,
+        epoch,
+        pid
       )
     end)
 
     Enum.uniq(Enum.map(claims, &elem(&1, 0)))
+  end
+
+  defp delete_registry_claim_indexes(
+         name,
+         shard,
+         cluster,
+         key,
+         origin,
+         generation,
+         epoch,
+         pid
+       ) do
+    :ets.delete(reg_claim_by_key_table(name, shard), {cluster, key, origin, generation, epoch})
+
+    :ets.delete(
+      reg_claim_by_pid_table(name, shard),
+      {pid, cluster, key, origin, generation, epoch}
+    )
+
+    :ok
   end
 
   def local_registry_claims_by_pids(name, shard, pids) do
@@ -1786,17 +1816,39 @@ defmodule Group.Replica.Data do
   end
 
   def pg_entries_for_origin(name, shard, cluster, origin_node) do
-    :ets.select(pg_by_key_table(name, shard), [
+    fold_pg_entries_for_origin(name, shard, cluster, origin_node, [], fn row, rows ->
+      [row | rows]
+    end)
+    |> Enum.reverse()
+  end
+
+  def fold_pg_entries_for_origin(name, shard, cluster, origin_node, acc, fun)
+      when is_function(fun, 2) do
+    {table, match_spec} = pg_origin_selection(name, shard, cluster, origin_node)
+
+    fold_select_batches_fixed(table, match_spec, acc, fn rows, inner ->
+      Enum.reduce(rows, inner, fun)
+    end)
+  end
+
+  def reduce_pg_entry_batches_for_origin(name, shard, cluster, origin_node, acc, fun)
+      when is_function(fun, 2) do
+    {table, match_spec} = pg_origin_selection(name, shard, cluster, origin_node)
+    fold_select_batches(table, match_spec, acc, fun)
+  end
+
+  defp pg_origin_selection(name, shard, cluster, origin_node) do
+    {
+      pg_by_key_table(name, shard),
       {{{cluster, :"$1", :"$2"}, :"$3", :"$4", origin_node}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
-    ])
+    }
   end
 
   def delete_pg_for_origin_cluster(name, shard, cluster, origin_node) do
     entries = pg_entries_for_origin(name, shard, cluster, origin_node)
 
     Enum.each(entries, fn {key, pid, _meta, _time} ->
-      :ets.delete(pg_by_key_table(name, shard), {cluster, key, pid})
-      :ets.delete(pg_by_pid_table(name, shard), {pid, cluster, key})
+      pg_delete(name, shard, cluster, key, pid)
     end)
 
     Enum.map(entries, fn {key, pid, meta, time} -> {cluster, key, pid, meta, time} end)
@@ -1817,8 +1869,7 @@ defmodule Group.Replica.Data do
       end)
 
     Enum.each(entries, fn {cluster, key, pid, _meta, _time} ->
-      :ets.delete(pg_by_key_table(name, shard), {cluster, key, pid})
-      :ets.delete(pg_by_pid_table(name, shard), {pid, cluster, key})
+      pg_delete(name, shard, cluster, key, pid)
     end)
 
     entries
@@ -1844,8 +1895,7 @@ defmodule Group.Replica.Data do
       ])
 
     Enum.each(entries, fn {key, pid, _meta, _time} ->
-      :ets.delete(pg_by_key_table(name, shard), {cluster, key, pid})
-      :ets.delete(pg_by_pid_table(name, shard), {pid, cluster, key})
+      pg_delete(name, shard, cluster, key, pid)
     end)
 
     Enum.map(entries, fn {key, pid, meta, time} -> {cluster, key, pid, meta, time} end)
@@ -2846,6 +2896,33 @@ defmodule Group.Replica.Data do
     ])
 
     :ok
+  end
+
+  defp fold_select_batches(table, match_spec, acc, fun) do
+    case :ets.select(table, [match_spec], 4_096) do
+      :"$end_of_table" -> acc
+      {matches, continuation} -> fold_select_batches(continuation, fun.(matches, acc), fun)
+    end
+  end
+
+  defp fold_select_batches_fixed(table, match_spec, acc, fun) do
+    # Some consumers delete the selected origin slice while folding it. Keep
+    # the traversal fixed so deleting the current batch cannot move unseen
+    # ordered-set keys past the continuation and leave a permanent stale row.
+    :ets.safe_fixtable(table, true)
+
+    try do
+      fold_select_batches(table, match_spec, acc, fun)
+    after
+      :ets.safe_fixtable(table, false)
+    end
+  end
+
+  defp fold_select_batches(continuation, acc, fun) do
+    case :ets.select(continuation) do
+      :"$end_of_table" -> acc
+      {matches, next} -> fold_select_batches(next, fun.(matches, acc), fun)
+    end
   end
 
   defp select(table, match_spec, :infinity), do: :ets.select(table, match_spec)

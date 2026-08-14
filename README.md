@@ -524,6 +524,13 @@ Exact-snapshot row capture runs in at most one off-shard worker per shard. The
 worker sends only when the stream identity and fully-applied head are unchanged
 after its scans. A concurrent write invalidates the capture and periodic
 anti-entropy retries, keeping million-row scans off the Group control process.
+The worker holds at most one byte-targeted chunk on its process heap and keeps
+completed chunks in an unnamed private ETS table for that snapshot attempt.
+The receiver uses the same bounded-chunk shape plus minimal row-presence markers
+until exact commit. Both sides delete this ephemeral staging after completion or
+retry, and owner death deletes it automatically; it is not steady-state state
+or an additional authority source. Exact-install monitor events are likewise
+buffered into bounded private-ETS batches before the cursor becomes visible.
 
 The optional `peer_up/5` and `peer_down/4` callbacks report one shard lane at a
 time. A sideband adapter that shares a single node connection must retain it

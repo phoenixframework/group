@@ -68,6 +68,9 @@ Group.Supervisor (rest_for_one)
 `Group.Replica.Data` owns every ETS table. A shard restart therefore preserves
 the tables, repairs interrupted index/journal work, replays appended-but-not-
 applied local mutations, and rebuilds monitors for locally owned processes.
+Restart repair streams each primary materialized table once while rebuilding
+its existing reverse index; it does not allocate a whole-table list or retain
+additional per-origin indexes.
 The optional transport precedes Data so losing its manager restarts the whole
 instance and cannot leave stale transport sessions attached to retained state.
 
@@ -176,7 +179,13 @@ supersession, stale authority, expiry, and shard crash must leave no partial
 visible state. Staging expires after one peer-lease interval without progress.
 At most one sender worker per shard captures rows off the control process and
 sends only if the stream identity and fully-applied head remain unchanged after
-the scan; otherwise anti-entropy retries.
+the scan; otherwise anti-entropy retries. Sender capture and receiver staging
+retain completed byte-bounded chunks in unnamed private ETS tables owned by
+their worker/shard. Only one chunk is assembled or copied on a process heap at
+a time. These tables are ephemeral: explicit completion/retry cleanup deletes
+them, and owner death deletes them automatically. Monitor events produced by a
+large exact install are staged in bounded private-ETS batches until the cursor
+commits.
 
 ## Nonblocking Transport
 
