@@ -4016,6 +4016,9 @@ defmodule Group.Replica do
             fn key, {acc, buffer} ->
               {acc, events} = reconcile_registry_projection(acc, cluster, key, :reconcile, [])
               {acc, Snapshot.buffer_events(Enum.reverse(events), buffer)}
+            end,
+            fn claims, {acc, buffer} ->
+              reconcile_registry_snapshot_batch(acc, cluster, stream_id, claims, buffer)
             end
           )
 
@@ -4592,59 +4595,45 @@ defmodule Group.Replica do
          source_node,
          cluster,
          staging_table,
-         chunk_count,
+         _chunk_count,
          event_buffer
        ) do
     event_buffer =
-      Snapshot.fold_pg(staging_table, chunk_count, event_buffer, fn {key, pid, meta, time},
-                                                                    buffer ->
-        case Data.pg_lookup(state.name, state.shard_index, cluster, key, pid) do
-          nil ->
-            :ok =
-              Data.pg_insert(
-                state.name,
-                state.shard_index,
-                cluster,
-                key,
-                pid,
-                meta,
-                time,
-                source_node
-              )
+      Snapshot.reduce_pg_batches(staging_table, event_buffer, fn rows, buffer ->
+        {inserts, buffer} =
+          Enum.reduce(rows, {[], buffer}, fn {key, pid, meta, time}, {inserts, inner} ->
+            case Data.pg_lookup(state.name, state.shard_index, cluster, key, pid) do
+              nil ->
+                event = build_event(state.name, :joined, key, pid, meta, %{cluster: cluster})
 
-            Snapshot.buffer_event(
-              build_event(state.name, :joined, key, pid, meta, %{cluster: cluster}),
-              buffer
-            )
+                {
+                  [{cluster, key, pid, meta, time, source_node} | inserts],
+                  Snapshot.buffer_event(event, inner)
+                }
 
-          {^meta, ^time, ^source_node} ->
-            buffer
+              {^meta, ^time, ^source_node} ->
+                {inserts, inner}
 
-          {old_meta, _old_time, ^source_node} ->
-            :ok =
-              Data.pg_insert(
-                state.name,
-                state.shard_index,
-                cluster,
-                key,
-                pid,
-                meta,
-                time,
-                source_node
-              )
+              {old_meta, _old_time, ^source_node} ->
+                inner =
+                  if old_meta != meta do
+                    Snapshot.buffer_event(
+                      build_event(state.name, :joined, key, pid, meta, %{
+                        previous_meta: old_meta,
+                        cluster: cluster
+                      }),
+                      inner
+                    )
+                  else
+                    inner
+                  end
 
-            if old_meta != meta do
-              Snapshot.buffer_event(
-                build_event(state.name, :joined, key, pid, meta, %{
-                  previous_meta: old_meta,
-                  cluster: cluster
-                }),
-                buffer
-              )
-            else
-              buffer
+                {[{cluster, key, pid, meta, time, source_node} | inserts], inner}
             end
-        end
+          end)
+
+        :ok = Data.pg_insert_many(state.name, state.shard_index, Enum.reverse(inserts))
+        buffer
       end)
 
     event_buffer =
@@ -5330,6 +5319,104 @@ defmodule Group.Replica do
           events
         )
     end
+  end
+
+  defp reconcile_registry_snapshot_batch(state, cluster, stream_id, claims, event_buffer) do
+    source_node = WireProtocol.stream_origin(stream_id)
+    generation = WireProtocol.stream_generation(stream_id)
+    epoch = WireProtocol.stream_epoch(stream_id)
+    claim_table = Data.reg_claim_by_key_table(state.name, state.shard_index)
+    projection_table = Data.reg_by_key_table(state.name, state.shard_index)
+
+    classified =
+      Enum.map(claims, fn {key, _pid, _meta, _time} = claim ->
+        claim_key = {cluster, key, source_node, generation, epoch}
+
+        {
+          claim,
+          Data.registry_claim_uncontended_in_table?(claim_table, claim_key)
+        }
+      end)
+
+    entries =
+      Enum.map(claims, fn {key, pid, meta, time} ->
+        {cluster, key, pid, meta, time, source_node}
+      end)
+
+    if Enum.all?(classified, &elem(&1, 1)) and
+         Data.registry_insert_new_many(state.name, state.shard_index, entries) do
+      event_buffer =
+        Enum.reduce(claims, event_buffer, fn {key, pid, meta, _time}, buffer ->
+          event = build_event(state.name, :registered, key, pid, meta, %{cluster: cluster})
+          Snapshot.buffer_event(event, buffer)
+        end)
+
+      {state, event_buffer}
+    else
+      reconcile_registry_snapshot_batch_rows(
+        state,
+        cluster,
+        source_node,
+        projection_table,
+        classified,
+        event_buffer
+      )
+    end
+  end
+
+  defp reconcile_registry_snapshot_batch_rows(
+         state,
+         cluster,
+         source_node,
+         projection_table,
+         classified,
+         event_buffer
+       ) do
+    {state, event_buffer, inserts} =
+      Enum.reduce(classified, {state, event_buffer, []}, fn
+        {{key, pid, meta, time}, uncontended?}, {acc, buffer, inserts} ->
+          current = Data.registry_lookup_in_table(projection_table, cluster, key)
+
+          case {uncontended?, current} do
+            {true, nil} ->
+              event = build_event(acc.name, :registered, key, pid, meta, %{cluster: cluster})
+
+              {
+                acc,
+                Snapshot.buffer_event(event, buffer),
+                [{cluster, key, pid, meta, time, source_node} | inserts]
+              }
+
+            {true, {^pid, old_meta, old_time, ^source_node}} ->
+              if old_meta == meta and old_time == time do
+                {acc, buffer, inserts}
+              else
+                event =
+                  build_event(acc.name, :registered, key, pid, meta, %{
+                    previous_meta: old_meta,
+                    cluster: cluster
+                  })
+
+                {
+                  acc,
+                  Snapshot.buffer_event(event, buffer),
+                  [{cluster, key, pid, meta, time, source_node} | inserts]
+                }
+              end
+
+            _ ->
+              :ok =
+                Data.registry_insert_many(acc.name, acc.shard_index, Enum.reverse(inserts))
+
+              {acc, events} =
+                reconcile_registry_projection(acc, cluster, key, :reconcile, [])
+
+              {acc, Snapshot.buffer_events(Enum.reverse(events), buffer), []}
+          end
+      end)
+
+    :ok = Data.registry_insert_many(state.name, state.shard_index, Enum.reverse(inserts))
+    {state, event_buffer}
   end
 
   defp reconcile_registry_keys(state, keys, reason, events) do

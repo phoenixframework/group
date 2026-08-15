@@ -99,7 +99,13 @@ defmodule Group.Replica.Snapshot do
   end
 
   def fold_registry(table, _chunk_count, acc, fun) when is_function(fun, 2) do
-    fold_staged_rows(
+    reduce_registry_batches(table, acc, fn rows, inner ->
+      Enum.reduce(rows, inner, fun)
+    end)
+  end
+
+  def reduce_registry_batches(table, acc, fun) when is_function(fun, 2) do
+    fold_staged_row_batches(
       table,
       [
         {{{:registry, :"$1"}, :"$2", :"$3", :"$4", :_}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
@@ -110,7 +116,13 @@ defmodule Group.Replica.Snapshot do
   end
 
   def fold_pg(table, _chunk_count, acc, fun) when is_function(fun, 2) do
-    fold_staged_rows(
+    reduce_pg_batches(table, acc, fn rows, inner ->
+      Enum.reduce(rows, inner, fun)
+    end)
+  end
+
+  def reduce_pg_batches(table, acc, fun) when is_function(fun, 2) do
+    fold_staged_row_batches(
       table,
       [
         {{{:pg, :"$1", :"$2"}, :"$3", :"$4", :_}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
@@ -170,17 +182,17 @@ defmodule Group.Replica.Snapshot do
     :ets.lookup(table, {:pg, key, pid}) == [{{:pg, key, pid}, meta, time, chunk_index}]
   end
 
-  defp fold_staged_rows(table, match_spec, acc, fun) do
+  defp fold_staged_row_batches(table, match_spec, acc, fun) do
     case :ets.select(table, match_spec, 4_096) do
       :"$end_of_table" -> acc
-      {rows, continuation} -> fold_staged_rows(continuation, Enum.reduce(rows, acc, fun), fun)
+      {rows, continuation} -> fold_staged_row_batches(continuation, fun.(rows, acc), fun)
     end
   end
 
-  defp fold_staged_rows(continuation, acc, fun) do
+  defp fold_staged_row_batches(continuation, acc, fun) do
     case :ets.select(continuation) do
       :"$end_of_table" -> acc
-      {rows, next} -> fold_staged_rows(next, Enum.reduce(rows, acc, fun), fun)
+      {rows, next} -> fold_staged_row_batches(next, fun.(rows, acc), fun)
     end
   end
 

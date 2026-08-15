@@ -1083,6 +1083,32 @@ defmodule Group.Replica.Data do
     :ok
   end
 
+  @doc false
+  def registry_insert_new_many(_name, _shard, []), do: true
+
+  def registry_insert_new_many(name, shard, entries) do
+    table = reg_by_key_table(name, shard)
+    table_pid = reg_by_pid_table(name, shard)
+
+    objects =
+      Enum.map(entries, fn {cluster, key, pid, meta, time, node} ->
+        {{cluster, key}, pid, meta, time, node}
+      end)
+
+    if :ets.insert_new(table, objects) do
+      :ets.insert(
+        table_pid,
+        Enum.map(entries, fn {cluster, key, pid, meta, time, node} ->
+          {{pid, cluster, key}, meta, time, node}
+        end)
+      )
+
+      true
+    else
+      false
+    end
+  end
+
   def registry_delete(name, shard, cluster, key, pid) do
     table = reg_by_key_table(name, shard)
     :ets.delete(table, {cluster, key})
@@ -1116,8 +1142,11 @@ defmodule Group.Replica.Data do
   end
 
   def registry_lookup(name, shard, cluster, key) do
-    table = reg_by_key_table(name, shard)
+    registry_lookup_in_table(reg_by_key_table(name, shard), cluster, key)
+  end
 
+  @doc false
+  def registry_lookup_in_table(table, cluster, key) do
     case :ets.lookup(table, {cluster, key}) do
       [{{^cluster, ^key}, pid, meta, time, node}] ->
         {pid, meta, time, node}
@@ -1186,6 +1215,33 @@ defmodule Group.Replica.Data do
     :ok
   end
 
+  @doc false
+  def insert_exact_registry_claims_many(_name, _shard, _stream_id, _seq, []), do: :ok
+
+  def insert_exact_registry_claims_many(name, shard, stream_id, seq, claims)
+      when is_list(claims) do
+    cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
+    origin_node = Group.Replica.WireProtocol.stream_origin(stream_id)
+    generation = Group.Replica.WireProtocol.stream_generation(stream_id)
+    epoch = Group.Replica.WireProtocol.stream_epoch(stream_id)
+
+    :ets.insert(
+      reg_claim_by_key_table(name, shard),
+      Enum.map(claims, fn {key, pid, meta, time} ->
+        {{cluster, key, origin_node, generation, epoch}, pid, meta, time, seq}
+      end)
+    )
+
+    :ets.insert(
+      reg_claim_by_pid_table(name, shard),
+      Enum.map(claims, fn {key, pid, meta, time} ->
+        {{pid, cluster, key, origin_node, generation, epoch}, meta, time, seq}
+      end)
+    )
+
+    :ok
+  end
+
   def delete_registry_claim(name, shard, stream_id, seq, key, pid) do
     cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
     origin_node = Group.Replica.WireProtocol.stream_origin(stream_id)
@@ -1219,6 +1275,20 @@ defmodule Group.Replica.Data do
        [{{:"$4", :"$5", :"$6", :"$1", :"$2", :"$3", :"$7"}}]}
     ])
   end
+
+  @doc false
+  def registry_claim_uncontended_in_table?(
+        table,
+        {cluster, key, _origin_node, _generation, _epoch} = claim_key
+      ) do
+    not same_registry_claim_key?(:ets.prev(table, claim_key), cluster, key) and
+      not same_registry_claim_key?(:ets.next(table, claim_key), cluster, key)
+  end
+
+  defp same_registry_claim_key?({cluster, key, _origin, _generation, _epoch}, cluster, key),
+    do: true
+
+  defp same_registry_claim_key?(_claim_key, _cluster, _key), do: false
 
   def registry_claims_for_stream(name, shard, stream_id) do
     fold_registry_claims_for_stream(name, shard, stream_id, [], fn row, rows -> [row | rows] end)
@@ -1291,6 +1361,35 @@ defmodule Group.Replica.Data do
         fun
       )
       when is_function(fun, 2) do
+    replace_registry_claims_for_stream_from_staging(
+      name,
+      shard,
+      stream_id,
+      snapshot_seq,
+      staging_table,
+      chunk_count,
+      acc,
+      fun,
+      fn claims, inner ->
+        Enum.reduce(claims, inner, fn {key, _pid, _meta, _time}, batch_inner ->
+          fun.(key, batch_inner)
+        end)
+      end
+    )
+  end
+
+  def replace_registry_claims_for_stream_from_staging(
+        name,
+        shard,
+        stream_id,
+        snapshot_seq,
+        staging_table,
+        _chunk_count,
+        acc,
+        removed_fun,
+        installed_batch_fun
+      )
+      when is_function(removed_fun, 2) and is_function(installed_batch_fun, 2) do
     cluster = Group.Replica.WireProtocol.stream_cluster(stream_id)
     origin_node = Group.Replica.WireProtocol.stream_origin(stream_id)
     generation = Group.Replica.WireProtocol.stream_generation(stream_id)
@@ -1313,17 +1412,16 @@ defmodule Group.Replica.Data do
           if Group.Replica.Snapshot.member_registry?(staging_table, key) do
             inner
           else
-            fun.(key, inner)
+            removed_fun.(key, inner)
           end
       end)
 
-    Group.Replica.Snapshot.fold_registry(
+    Group.Replica.Snapshot.reduce_registry_batches(
       staging_table,
-      chunk_count,
       acc,
-      fn {key, pid, meta, time}, inner ->
-        put_registry_claim(name, shard, stream_id, snapshot_seq, key, pid, meta, time)
-        fun.(key, inner)
+      fn claims, inner ->
+        :ok = insert_exact_registry_claims_many(name, shard, stream_id, snapshot_seq, claims)
+        installed_batch_fun.(claims, inner)
       end
     )
   end
