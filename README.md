@@ -602,7 +602,7 @@ a new or current generation and anti-entropy reconstructs its live state.
 
 ```bash
 mix test
-mix test.soak   # nightly/release qualification
+mix test.soak   # nightly mutation/live-checker and six-profile Jepsen qualification
 ```
 
 See [`test/README.md`](test/README.md) for the every-PR gate, shrinkable

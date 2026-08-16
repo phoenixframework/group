@@ -64,7 +64,9 @@
 
 (defn reset-oracle! [node]
   (exec-sh! node
-            "rm -f /tmp/group-jepsen-unexpected-deaths /tmp/group-jepsen-persistent-events"))
+            (str "rm -f /tmp/group-jepsen-unexpected-deaths "
+                 "/tmp/group-jepsen-persistent-events "
+                 "/tmp/group-jepsen-cursor-marker-corruption")))
 
 (defn ensure-firewall-chain! [node chain]
   (exec-sh!

@@ -11,6 +11,7 @@ services:
       GROUP_JEPSEN_PORT: 9080
       GROUP_JEPSEN_PEERS: group@n1,group@n2,group@n3
       GROUP_JEPSEN_TRANSPORT: ${GROUP_JEPSEN_TRANSPORT:-distribution}
+      GROUP_JEPSEN_SENDER_BUFFER_SIZE: ${GROUP_JEPSEN_SENDER_BUFFER_SIZE:-1}
     ports: ["19081:9080"]
     networks: [group]
 
@@ -26,6 +27,7 @@ services:
       GROUP_JEPSEN_PORT: 9080
       GROUP_JEPSEN_PEERS: group@n1,group@n2,group@n3
       GROUP_JEPSEN_TRANSPORT: ${GROUP_JEPSEN_TRANSPORT:-distribution}
+      GROUP_JEPSEN_SENDER_BUFFER_SIZE: ${GROUP_JEPSEN_SENDER_BUFFER_SIZE:-1}
     ports: ["19082:9080"]
     networks: [group]
 
@@ -41,6 +43,7 @@ services:
       GROUP_JEPSEN_PORT: 9080
       GROUP_JEPSEN_PEERS: group@n1,group@n2,group@n3
       GROUP_JEPSEN_TRANSPORT: ${GROUP_JEPSEN_TRANSPORT:-distribution}
+      GROUP_JEPSEN_SENDER_BUFFER_SIZE: ${GROUP_JEPSEN_SENDER_BUFFER_SIZE:-1}
     ports: ["19083:9080"]
     networks: [group]
 

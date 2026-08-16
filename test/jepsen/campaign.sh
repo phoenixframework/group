@@ -32,9 +32,17 @@ echo "Jepsen campaign artifacts: ${artifact_dir}"
 for transport in distribution tcp chaos; do
   for scenario in mixed permanent; do
     log="${artifact_dir}/${transport}-${scenario}.log"
-    echo "Starting ${transport}/${scenario}: ${test_count} histories x ${time_limit}s"
+    sender_buffer_size=1
+    min_delta_run_records=1
 
-    if "${script_dir}/run.sh" test \
+    if [[ "${transport}/${scenario}" == "chaos/mixed" ]]; then
+      sender_buffer_size=32
+      min_delta_run_records=2
+    fi
+
+    echo "Starting ${transport}/${scenario}: ${test_count} histories x ${time_limit}s (sender buffer ${sender_buffer_size})"
+
+    if GROUP_JEPSEN_SENDER_BUFFER_SIZE="${sender_buffer_size}" "${script_dir}/run.sh" test \
         --no-ssh \
         --nodes n1,n2,n3 \
         --concurrency "${concurrency}" \
@@ -44,6 +52,7 @@ for transport in distribution tcp chaos; do
         --owner-count "${owner_count}" \
         --fault-interval 2 \
         --recovery-time "${recovery_time}" \
+        --min-delta-run-records "${min_delta_run_records}" \
         --transport "${transport}" \
         --scenario "${scenario}" >"${log}" 2>&1; then
       valid_count="$(rg -c "Everything looks good" "${log}" || true)"

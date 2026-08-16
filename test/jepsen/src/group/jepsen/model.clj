@@ -146,6 +146,12 @@
              default-required-transport-events)
         missing-transport-events
         (set (remove #(pos? (get transport-events % 0)) required-transport-events))
+        delta-run-records-peak
+        (reduce max 0
+                (map #(get-in % [:transport-events :delta-run-records-peak] 0)
+                     (vals relevant-snapshots)))
+        min-delta-run-records (get test :min-delta-run-records 0)
+        delta-run-coverage? (>= delta-run-records-peak min-delta-run-records)
         expected-profile (keyword (:transport test))
         transport-profile-mismatches
         (into {}
@@ -186,6 +192,7 @@
                     (empty? unstable-observations)
                     (empty? peer-mismatches)
                     (empty? missing-transport-events)
+                    delta-run-coverage?
                     (empty? transport-profile-mismatches)
                     (empty? internal-errors)
                     (empty? (:conflicts expected))
@@ -202,6 +209,8 @@
      :peer-mismatches peer-mismatches
      :transport-events transport-events
      :missing-transport-events missing-transport-events
+     :delta-run-records-peak delta-run-records-peak
+     :min-delta-run-records min-delta-run-records
      :transport-profile-mismatches transport-profile-mismatches
      :internal-invariant-errors internal-errors
      :max-group-operation-latency-ms (/ max-latency-us 1000.0)

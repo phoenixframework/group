@@ -107,6 +107,25 @@ defmodule GroupBench.Distributed do
     IO.puts("\n  Done.\n")
   end
 
+  def run_registry_init_only(opts \\ []) do
+    shards = Keyword.get(opts, :shards, 32)
+    total_entries = Keyword.get(opts, :entries, 1_000_000)
+    samples = Keyword.get(opts, :samples, 3)
+    Process.put(:bench_shards, shards)
+
+    header("Registry Projection Shard-Init Benchmark")
+    IO.puts("  coordinator:  #{node()}")
+    IO.puts("  shards:       #{shards}")
+    IO.puts("  total rows:   #{format_number(total_entries)}")
+    IO.puts("  samples:      #{samples}")
+    IO.puts("  schedulers:   #{System.schedulers_online()}")
+
+    connect_replicas()
+    result = bench_registry_init(hd(@replicas), total_entries, samples)
+    IO.puts("\n  Done.\n")
+    result
+  end
+
   # ── Connection ────────────────────────────────────────────────────────
 
   defp connect_replicas do
@@ -263,6 +282,80 @@ defmodule GroupBench.Distributed do
 
     IO.puts("\n  PERF_RESULT #{inspect(result, pretty: true, limit: :infinity)}")
     stop_groups(replicas)
+    result
+  end
+
+  defp bench_registry_init(node, total_entries, samples) do
+    header("Synchronous projection rebuild during shard restart")
+    shards = Process.get(:bench_shards)
+    rows_per_shard = div(total_entries + shards - 1, shards)
+    target_shard = 0
+
+    stop_group_on(node)
+
+    start_group_on(node,
+      replicated_anti_entropy_interval: 60_000,
+      replicated_peer_lease_timeout: 120_000
+    )
+
+    {seed_us, owner} =
+      :timer.tc(fn ->
+        :erpc.call(
+          node,
+          GroupBench.Replica,
+          :seed_registry_shard,
+          [@name, target_shard, rows_per_shard, "init/registry/", 10_000],
+          1_800_000
+        )
+      end)
+
+    counts = :erpc.call(node, GroupBench.Replica, :registry_counts_by_shard, [@name])
+
+    unless List.keyfind(counts, target_shard, 0) == {target_shard, rows_per_shard} do
+      raise "registry init benchmark seeded the wrong target-shard row count"
+    end
+
+    before_memory = :erpc.call(node, GroupBench.Replica, :memory_snapshot, [@name])
+
+    restart_us =
+      Enum.map(1..samples, fn _sample ->
+        result =
+          :erpc.call(
+            node,
+            GroupBench.Replica,
+            :restart_shard,
+            [@name, target_shard],
+            900_000
+          )
+
+        unless List.keyfind(
+                 :erpc.call(node, GroupBench.Replica, :registry_counts_by_shard, [@name]),
+                 target_shard,
+                 0
+               ) == {target_shard, rows_per_shard} do
+          raise "registry row count changed across shard restart"
+        end
+
+        result.elapsed_us
+      end)
+      |> Enum.sort()
+
+    result = %{
+      total_entries: total_entries,
+      shards: shards,
+      rows_per_shard: rows_per_shard,
+      samples: samples,
+      seed_ms: div(seed_us, 1_000),
+      restart_ms: Enum.map(restart_us, &Float.round(&1 / 1_000, 3)),
+      restart_min_ms: Float.round(hd(restart_us) / 1_000, 3),
+      restart_p50_ms: Float.round(Enum.at(restart_us, div(length(restart_us), 2)) / 1_000, 3),
+      restart_max_ms: Float.round(List.last(restart_us) / 1_000, 3),
+      table_memory_bytes: before_memory.group_table_bytes
+    }
+
+    IO.puts("\n  PERF_RESULT #{inspect(result, pretty: true, limit: :infinity)}")
+    :erpc.call(node, Process, :exit, [owner, :kill])
+    stop_group_on(node)
     result
   end
 

@@ -14,10 +14,11 @@ test/jepsen/run.sh                 # one OS-partition/restart Jepsen model test
 
 `mix test` preserves normal Mix test arguments while always running the pure
 Jepsen lifecycle-checker qualification after ExUnit. It does not require
-Docker. `mix test.soak` first runs that complete PR gate, then runs the
-distribution/TCP/chaos × mixed/permanent Jepsen campaign. The soak defaults to
-20 five-minute fault histories per combination and is intended for nightly and
-release qualification rather than individual edits.
+Docker. `mix test.soak` first runs that complete PR gate, kills every defined
+protocol mutant, runs live positive/negative checker qualification, and then
+runs the distribution/TCP/chaos × mixed/permanent Jepsen campaign. The soak
+defaults to 20 five-minute fault histories per combination and is intended for
+nightly and release qualification rather than individual edits.
 
 ## Test files
 
@@ -69,7 +70,9 @@ PG, claim, cluster, cursor, oplog, snapshot-staging, and retired-origin
 invariants. Its permanent-retirement scenario proves eviction even when a peer
 never returns. `test/jepsen/campaign.sh` runs the full profile/scenario matrix;
 `test/jepsen/qualify.sh` mutation-tests the implementation and proves that the
-live checker rejects injected faults.
+live checker rejects injected faults. Chaos/mixed uses a larger repair window
+and is invalid unless it observes a multi-record delta run; the other profiles
+retain the one-record stress configuration.
 
 ## How distribution works
 

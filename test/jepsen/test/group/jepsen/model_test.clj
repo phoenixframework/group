@@ -184,6 +184,36 @@
     (is (:valid? result))
     (is (empty? (:missing-transport-events result)))))
 
+(deftest rejects-a-profile-which-never-repairs-a-multi-record-delta-run
+  (let [single-record-events {:delta-batch 3
+                              :snapshot-chunk 2
+                              :multi-chunk-snapshot 1
+                              :registry-conflict-death 1
+                              :delta-run-records-peak 1}
+        with-events #(assoc-in % [:value :transport-events] single-record-events)
+        history [(with-events (snapshot-op 1 "n1" [] (empty-registry) (empty-pg)))
+                 (with-events (snapshot-op 2 "n2" [] (empty-registry) (empty-pg)))
+                 (with-events (snapshot-op 3 "n3" [] (empty-registry) (empty-pg)))]
+        result (model/analyze (assoc test-map :min-delta-run-records 2) history)]
+    (is (false? (:valid? result)))
+    (is (= 1 (:delta-run-records-peak result)))
+    (is (= 2 (:min-delta-run-records result)))))
+
+(deftest accepts-a-profile-which-repairs-a-multi-record-delta-run
+  (let [events {:delta-batch 1
+                :snapshot-chunk 1
+                :multi-chunk-snapshot 1
+                :registry-conflict-death 1
+                :delta-run-records-peak 8}
+        history [(assoc-in (snapshot-op 1 "n1" [] (empty-registry) (empty-pg))
+                           [:value :transport-events]
+                           events)
+                 (snapshot-op 2 "n2" [] (empty-registry) (empty-pg))
+                 (snapshot-op 3 "n3" [] (empty-registry) (empty-pg))]
+        result (model/analyze (assoc test-map :min-delta-run-records 2) history)]
+    (is (:valid? result))
+    (is (= 8 (:delta-run-records-peak result)))))
+
 (deftest rejects-internal-corruption-or-leftover-snapshot-staging
   (let [bad (-> (snapshot-op 1 "n1" [] (empty-registry) (empty-pg))
                 (assoc-in [:value :internal :healthy] false)

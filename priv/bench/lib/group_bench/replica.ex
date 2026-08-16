@@ -205,6 +205,46 @@ defmodule GroupBench.Replica do
   end
 
   @doc false
+  def seed_registry_shard(name, shard, count, key_prefix, batch_size \\ 10_000) do
+    owner = spawn(fn -> Process.sleep(:infinity) end)
+    shards = Group.get_config(name).num_shards
+    stream_id = Group.Replica.Data.local_stream_id(name, shard, nil)
+
+    1
+    |> Stream.iterate(&(&1 + 1))
+    |> Stream.filter(fn index ->
+      Group.Replica.shard_index_for(nil, "#{key_prefix}#{index}", shards) == shard
+    end)
+    |> Stream.take(count)
+    |> Stream.chunk_every(batch_size)
+    |> Enum.each(fn indexes ->
+      entries =
+        Enum.map(indexes, fn index ->
+          key = "#{key_prefix}#{index}"
+
+          :ok =
+            Group.Replica.Data.put_registry_claim(
+              name,
+              shard,
+              stream_id,
+              1,
+              key,
+              owner,
+              %{},
+              index
+            )
+
+          {nil, key, owner, %{}, index, node()}
+        end)
+
+      :ok = Group.Replica.Data.registry_insert_many(name, shard, entries)
+    end)
+
+    install_benchmark_stream_heads(name)
+    owner
+  end
+
+  @doc false
   def seed_pg_hotspot(name, count, key, batch_size \\ 10_000) do
     shard = Group.Replica.shard_index_for(nil, key, Group.get_config(name).num_shards)
 

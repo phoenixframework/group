@@ -110,11 +110,9 @@ Run mutation qualification plus live positive- and negative-checker tests:
 test/jepsen/qualify.sh
 ```
 
-This must reject production mutations which remove generation fencing, gap
-detection, exact snapshot replacement, complete snapshot assembly, periodic
-repair, or retirement purging. It then verifies that a healthy live history is
-accepted and deliberately injected owner-death and internal-index corruption
-are rejected.
+This runs every mutation defined by `test/mutation/run.exs`, then verifies that
+a healthy live history is accepted and deliberately injected owner-death,
+internal-index, and stranded snapshot-cursor corruption are rejected.
 
 Results and histories are written below `test/jepsen/store/`. Containers are
 removed after a run. Set `GROUP_JEPSEN_KEEP_CONTAINERS=1` to retain them and
@@ -132,7 +130,10 @@ test/jepsen/checker.sh
 
 At the repository root, `mix test` runs this pure checker after the complete
 ExUnit, StreamData, and deterministic-chaos suite. `mix test.soak` runs that
-same PR gate followed by `campaign.sh`.
+same PR gate, the complete mutation/live-checker qualification, and then
+`campaign.sh`. Chaos/mixed uses a sender/repair buffer of 32 and requires
+evidence that one repaired delta run contained at least two records; all other
+profiles keep the single-record stress setting.
 
 ## Scope
 

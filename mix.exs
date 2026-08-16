@@ -67,6 +67,7 @@ defmodule Group.MixProject do
       test: ["test", "cmd test/jepsen/checker.sh"],
       "test.soak": [
         "test",
+        "cmd env GROUP_JEPSEN_SKIP_CHECKER=1 test/jepsen/qualify.sh",
         "cmd env GROUP_JEPSEN_SKIP_CHECKER=1 test/jepsen/campaign.sh"
       ]
     ]

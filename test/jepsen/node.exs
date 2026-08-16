@@ -108,7 +108,20 @@ defmodule Group.Jepsen.Transport.Common do
     end
   end
 
-  def record({:delta_batch, _version, _runs}), do: Stats.increment(:delta_batch)
+  def record({:delta_batch, _version, runs}) do
+    Stats.increment(:delta_batch)
+
+    peak =
+      runs
+      |> Enum.map(fn
+        {_stream, _first_seq, records, _head} when is_list(records) -> length(records)
+        _invalid_run -> 0
+      end)
+      |> Enum.max(fn -> 0 end)
+
+    Stats.observe_max(:delta_run_records_peak, peak)
+  end
+
   def record(_message), do: Stats.increment(:other_message)
 
   defp transport_result(:ok), do: :transport_ok
@@ -575,7 +588,12 @@ defmodule Group.Jepsen.Driver do
 
   def owner_snapshots do
     names()
-    |> Enum.flat_map(&GenServer.call(&1, :owner_snapshots, 30_000))
+    |> Enum.flat_map(fn driver ->
+      case GenServer.call(driver, :owner_snapshots, 30_000) do
+        {:ok, snapshots} -> snapshots
+        {:error, reason} -> raise "owner snapshot refresh failed: #{inspect(reason)}"
+      end
+    end)
     |> Enum.sort_by(& &1.token)
   end
 
@@ -657,14 +675,41 @@ defmodule Group.Jepsen.Driver do
   end
 
   def handle_call(:owner_snapshots, _from, state) do
-    owners =
-      state.owners
-      |> Enum.flat_map(fn
-        {_logical_owner, {_pid, _token, _monitor_ref, nil}} -> []
-        {_logical_owner, {_pid, _token, _monitor_ref, owner_state}} -> [owner_state]
+    result =
+      Enum.reduce_while(state.owners, {[], %{}}, fn
+        {logical_owner, {pid, token, monitor_ref, cached}}, {snapshots, acc} ->
+          case live_owner_snapshot(pid) do
+            {:ok, owner_state} ->
+              {:cont,
+               {
+                 [owner_state | snapshots],
+                 Map.put(acc, logical_owner, {pid, token, monitor_ref, owner_state})
+               }}
+
+            {:error, reason} ->
+              {:halt, {:error, {logical_owner, token, reason, cached}}}
+          end
       end)
 
-    {:reply, owners, state}
+    case result do
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+
+      {owners, refreshed} ->
+        {:reply, {:ok, Enum.reverse(owners)}, %{state | owners: refreshed}}
+    end
+  end
+
+  defp live_owner_snapshot(pid) do
+    if Process.alive?(pid) do
+      try do
+        {:ok, GenServer.call(pid, :snapshot, 10_000)}
+      catch
+        :exit, reason -> {:error, reason}
+      end
+    else
+      {:error, :not_alive}
+    end
   end
 
   def handle_call(:unexpected_deaths, _from, state) do
@@ -823,6 +868,7 @@ defmodule Group.Jepsen.Invariant do
   def snapshot(retired_nodes) do
     config = Group.get_config(:jepsen_group)
     shards = 0..(config.num_shards - 1)
+    maybe_inject_cursor_marker_corruption(shards)
 
     errors =
       check("dual indexes", &assert_dual_indexes/0) ++
@@ -861,6 +907,31 @@ defmodule Group.Jepsen.Invariant do
         errors: ["invariant snapshot failed: #{Exception.message(exception)}"],
         snapshot_staging_count: -1
       }
+  end
+
+  defp maybe_inject_cursor_marker_corruption(shards) do
+    if File.exists?("/tmp/group-jepsen-cursor-marker-corruption") do
+      cursor =
+        Enum.find_value(shards, fn shard ->
+          Data.replica_cursor_table(:jepsen_group, shard)
+          |> :ets.tab2list()
+          |> case do
+            [{stream, _cursor} | _] -> {shard, stream}
+            [] -> nil
+          end
+        end)
+
+      case cursor do
+        {shard, stream} ->
+          :ets.insert(
+            Data.replica_cursor_table(:jepsen_group, shard),
+            {stream, {:snapshot_installing, 1}}
+          )
+
+        nil ->
+          raise "no remote replica cursor available for corruption"
+      end
+    end
   end
 
   defp check(label, fun) do
@@ -1017,7 +1088,8 @@ defmodule Group.Jepsen.Invariant do
             WireProtocol.stream_generation(stream) ==
               Data.remote_generation(:jepsen_group, origin) and
             WireProtocol.stream_epoch(stream) ==
-              Data.remote_cluster_epoch(:jepsen_group, origin, cluster) and seq >= 0
+              Data.remote_cluster_epoch(:jepsen_group, origin, cluster) and is_integer(seq) and
+            seq >= 0
 
         unless valid?, do: raise("cursor lacks current authority #{inspect({stream, seq})}")
       end)
@@ -1308,6 +1380,11 @@ defmodule Group.Jepsen.Wire do
     %{status: :ok}
   end
 
+  defp corrupt("cursor-marker") do
+    File.write!("/tmp/group-jepsen-cursor-marker-corruption", "enabled\n")
+    %{status: :ok}
+  end
+
   defp corrupt(other), do: %{status: :fail, error: "unknown corruption #{inspect(other)}"}
   defp parse_cluster("root"), do: nil
   defp parse_cluster(cluster), do: cluster
@@ -1346,7 +1423,7 @@ defmodule Group.Jepsen.Main do
         log: false,
         resolve_registry_conflict: {Group.Jepsen.ConflictResolver, :resolve, []},
         replica_transport: Group.Jepsen.Transport.Control.transport(node_id),
-        replicated_sender_buffer_size: 1,
+        replicated_sender_buffer_size: positive_env!("GROUP_JEPSEN_SENDER_BUFFER_SIZE", 1),
         replicated_oplog_max_entries: 16,
         replicated_snapshot_chunk_target_bytes: 1_024,
         replicated_anti_entropy_interval: 50,
@@ -1376,6 +1453,11 @@ defmodule Group.Jepsen.Main do
 
     Process.sleep(100)
     reconnect_loop(peers)
+  end
+
+  defp positive_env!(name, default) do
+    value = System.get_env(name, Integer.to_string(default)) |> String.to_integer()
+    if value > 0, do: value, else: raise("#{name} must be positive")
   end
 end
 

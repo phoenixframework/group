@@ -37,7 +37,7 @@ priv/bench/                        — local and distributed benchmark project
 
 ```bash
 mix test              # every-PR ExUnit/property/chaos/pure-checker gate
-mix test.soak         # nightly/release six-profile Jepsen campaign
+mix test.soak         # nightly mutation/live-checker + six-profile Jepsen campaign
 
 # Focused development
 mix test test/group_test.exs
@@ -46,8 +46,11 @@ mix test test/replica_model_property_test.exs
 ```
 
 `mix test` accepts normal Mix test paths/options and then runs the pure Jepsen
-checker qualification. `mix test.soak` runs that gate first, then twenty
-five-minute histories for distribution/TCP/chaos × mixed/permanent scenarios.
+checker qualification. `mix test.soak` runs that gate first, kills every
+defined protocol mutant, proves the live checker rejects injected corruption,
+then runs twenty five-minute histories for distribution/TCP/chaos ×
+mixed/permanent scenarios. Chaos/mixed must exercise a multi-record delta
+repair; the remaining profiles retain the one-record stress configuration.
 See `test/README.md`, `test/formal/README.md`, and `test/jepsen/README.md`.
 
 ## Supervision and Ownership

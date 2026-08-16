@@ -52,6 +52,52 @@ defmodule Group.ReplicaSnapshotDistributedTest do
            end)
   end
 
+  test "exact PG install repairs an impossible conflicting stored origin", context do
+    %{name: name, node_a: node_a, node_b: node_b, node_c: node_c} = start_pair(context)
+    :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+
+    key = "snapshot/pg-origin-collision"
+    member = TestCluster.spawn_join(node_a, name, key, %{source: true})
+
+    # Move the source stream floor past the membership so requesting sequence
+    # one necessarily exercises an exact snapshot rather than a delta.
+    for index <- 1..4 do
+      TestCluster.spawn_register(node_a, name, "snapshot/pg-origin-filler/#{index}", %{})
+    end
+
+    TestCluster.flush_shards(node_a, name)
+    stream_id = local_stream(node_a, name, nil)
+    {chunks, commit} = capture_snapshot_with_commit(node_a, node_b, name, stream_id, 1)
+
+    :ok =
+      TestCluster.rpc!(node_b, Group.Replica.Data, :pg_insert_many, [
+        name,
+        0,
+        [{nil, key, member, %{corrupt: true}, 0, node_c}]
+      ])
+
+    shard = TestCluster.rpc!(node_b, Process, :whereis, [Group.Replica.shard_name(name, 0)])
+    monitor = Process.monitor(shard)
+
+    deliver_frames(node_b, node_a, name, chunks ++ [commit])
+    TestCluster.flush_shards(node_b, name)
+
+    refute_receive {:DOWN, ^monitor, :process, ^shard, _reason}, 250
+    assert TestCluster.rpc!(node_b, Process, :alive?, [shard])
+    assert [{^member, %{source: true}}] = TestCluster.rpc!(node_b, Group, :members, [name, key])
+
+    assert {%{source: true}, _time, ^node_a} =
+             TestCluster.rpc!(node_b, Group.Replica.Data, :pg_lookup, [
+               name,
+               0,
+               nil,
+               key,
+               member
+             ])
+
+    assert :ok = TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+  end
+
   test "a source mutation during a single-pass scan prevents terminal commit", context do
     %{name: name, node_a: node_a, node_b: node_b} = start_pair(context)
     :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])

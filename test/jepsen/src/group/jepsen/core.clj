@@ -173,11 +173,16 @@
    [nil "--scenario SCENARIO" "Lifecycle scenario: mixed or permanent"
     :default "mixed"
     :validate [#{"mixed" "permanent"} "Unsupported scenario"]]
-   [nil "--corruption MODE" "Checker qualification: none, unexpected-death, internal-index"
+   [nil "--corruption MODE" "Checker qualification corruption mode"
     :default "none"
-    :validate [#{"none" "unexpected-death" "internal-index"} "Unsupported corruption"]]
+    :validate [#{"none" "unexpected-death" "internal-index" "cursor-marker"}
+               "Unsupported corruption"]]
    [nil "--max-operation-latency-ms MILLIS" "Maximum acknowledged Group call latency"
     :default 2000
+    :parse-fn #(Long/parseLong %)
+    :validate [pos? "Must be positive"]]
+   [nil "--min-delta-run-records NUMBER" "Required peak records in one repaired delta run"
+    :default 1
     :parse-fn #(Long/parseLong %)
     :validate [pos? "Must be positive"]]])
 

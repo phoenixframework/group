@@ -4614,6 +4614,24 @@ defmodule Group.Replica do
               {^meta, ^time, ^source_node} ->
                 {inserts, inner}
 
+              {old_meta, _old_time, old_source} when old_source != source_node ->
+                Logger.error(
+                  "#{log_prefix_shard(state)} repaired PG row with impossible stored origin " <>
+                    "#{inspect(old_source)} while installing exact snapshot from " <>
+                    inspect(source_node)
+                )
+
+                event =
+                  build_event(state.name, :joined, key, pid, meta, %{
+                    previous_meta: old_meta,
+                    cluster: cluster
+                  })
+
+                {
+                  [{cluster, key, pid, meta, time, source_node} | inserts],
+                  Snapshot.buffer_event(event, inner)
+                }
+
               {old_meta, _old_time, ^source_node} ->
                 inner =
                   if old_meta != meta do

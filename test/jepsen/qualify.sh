@@ -7,13 +7,9 @@ artifact_dir="$(mktemp -d "${script_dir}/.cache/qualification.XXXXXX")"
 
 cd "${repo_dir}"
 
-mix run test/mutation/run.exs \
-  accept_old_generation \
-  advance_cursor_across_gap \
-  registry_snapshot_is_additive \
-  commit_incomplete_snapshot \
-  disable_periodic_heads \
-  skip_generation_purge
+mix run test/mutation/run.exs
+
+export GROUP_JEPSEN_SKIP_CHECKER=1
 
 run_jepsen() {
   local expectation="$1"
@@ -51,5 +47,6 @@ run_jepsen() {
 run_jepsen pass none
 run_jepsen fail unexpected-death
 run_jepsen fail internal-index
+run_jepsen fail cursor-marker
 
 echo "mutation and live checker qualification passed"

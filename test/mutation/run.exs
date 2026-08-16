@@ -92,7 +92,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "        if MapSet.size(transfer.received) >= 1 and chunk_count >= 1 and\n" <>
           "             registry_count >= 0 and pg_count >= 0 do",
-      test: ["test/replica_snapshot_distributed_test.exs:177"]
+      test: ["test/replica_snapshot_distributed_test.exs:223"]
     },
     %{
       name: "commit_snapshot_without_terminal_manifest",
@@ -122,7 +122,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "          MapSet.member?(transfer.received, chunk_index) and\n" <>
           "              Process.alive?(self()) ->",
-      test: ["test/replica_snapshot_distributed_test.exs:339"]
+      test: ["test/replica_snapshot_distributed_test.exs:385"]
     },
     %{
       name: "retain_conflicting_snapshot_manifest",
@@ -135,7 +135,7 @@ defmodule Group.MutationCampaign do
             {:ok, state, _conflicting_transfer} ->
               state
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:145"]
+      test: ["test/replica_snapshot_distributed_test.exs:191"]
     },
     %{
       name: "commit_snapshot_after_source_changes_during_scan",
@@ -154,14 +154,14 @@ defmodule Group.MutationCampaign do
           "        :complete\n" <>
           "      end\n" <>
           "    catch",
-      test: ["test/replica_snapshot_distributed_test.exs:55"]
+      test: ["test/replica_snapshot_distributed_test.exs:101"]
     },
     %{
       name: "drop_final_snapshot_event_batch",
       file: "lib/group/replica.ex",
       correct_source: "        _event_buffer = Snapshot.finish_event_buffer(event_buffer)",
       faulty_source: "        _event_buffer = event_buffer",
-      test: ["test/replica_snapshot_distributed_test.exs:177"]
+      test: ["test/replica_snapshot_distributed_test.exs:223"]
     },
     %{
       name: "allow_duplicate_snapshot_rows",
@@ -173,7 +173,7 @@ defmodule Group.MutationCampaign do
       faulty_source: """
           if :ets.insert(table, objects) and size_before >= 0 do
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:339"]
+      test: ["test/replica_snapshot_distributed_test.exs:385"]
     },
     %{
       name: "do_not_supersede_partial_snapshot",
@@ -187,7 +187,7 @@ defmodule Group.MutationCampaign do
         "      %{snapshot_seq: existing_seq} when existing_seq < snapshot_seq ->\n" <>
           "        _ = existing_seq\n" <>
           "        {:ignore, state}",
-      test: ["test/replica_snapshot_distributed_test.exs:282"]
+      test: ["test/replica_snapshot_distributed_test.exs:328"]
     },
     %{
       name: "accept_stale_snapshot_authority",
@@ -203,7 +203,7 @@ defmodule Group.MutationCampaign do
           snapshot_seq > Data.replica_cursor(state.name, state.shard_index, stream_id)
         end
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:510"]
+      test: ["test/replica_snapshot_distributed_test.exs:556"]
     },
     %{
       name: "disable_snapshot_staging_expiry",
@@ -224,7 +224,7 @@ defmodule Group.MutationCampaign do
               acc
             end
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:436"]
+      test: ["test/replica_snapshot_distributed_test.exs:482"]
     },
     %{
       name: "disable_below_floor_snapshot",
@@ -440,7 +440,7 @@ defmodule Group.MutationCampaign do
           state
         end
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:680"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3823"]
     },
     %{
       name: "skip_generation_purge",
@@ -921,7 +921,7 @@ defmodule Group.MutationCampaign do
               _chunk_resume -> {:chunk, 1}
             end
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:831"]
+      test: ["test/replica_snapshot_distributed_test.exs:877"]
     },
     %{
       name: "drain_oversized_ingress_batch_without_yield",
@@ -1085,6 +1085,11 @@ defmodule Group.MutationCampaign do
           "--exclude=.git",
           "--exclude=deps",
           "--exclude=tmp",
+          # Jepsen histories and caches are runtime artifacts. Copying them into
+          # every mutant can multiply a long soak's disk usage by the number of
+          # mutations without contributing anything to compilation or tests.
+          "--exclude=test/jepsen/store",
+          "--exclude=test/jepsen/.cache",
           "#{@repo}/",
           "#{target}/"
         ],
@@ -1096,7 +1101,11 @@ defmodule Group.MutationCampaign do
 
   defp run_test(directory, test) do
     run_with_timeout(directory, ["mix", "test" | test],
-      env: [{"GROUP_MODEL_RUNS", "1"}, {"GROUP_MODEL_COMMANDS", "8"}]
+      env: [
+        {"GROUP_MODEL_RUNS", "1"},
+        {"GROUP_MODEL_COMMANDS", "8"},
+        {"GROUP_JEPSEN_SKIP_CHECKER", "1"}
+      ]
     )
   end
 

@@ -61,6 +61,16 @@ peer eviction:
 `:pg_hotspot` deliberately puts a million memberships on one key/shard, which
 is the worst case for snapshot installation and restart rebuilding.
 
+To isolate the synchronous registry projection rebuild performed by a
+restarting shard, seed only the proportional load for one shard. For example,
+one million total rows at 32 shards benchmarks 31,250 rows in the restarted
+lane without including snapshot or network time:
+
+```bash
+./run_distributed.sh --shards 32 \
+  --coordinator-expr 'GroupBench.Distributed.run_registry_init_only(shards: 32, entries: 1000000, samples: 3)'
+```
+
 ## Local Scenarios
 
 All local benchmarks run for both the default (nil) cluster and a named cluster

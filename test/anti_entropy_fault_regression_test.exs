@@ -3910,6 +3910,37 @@ defmodule Group.AntiEntropyFaultRegressionTest do
       ]) == generation
     end)
 
+    # Once authority is exact, a lane can still start after shard-zero's
+    # best-effort fanout (or lose its lane-local view on restart). Prove that
+    # the lane hello itself reconstructs that view; merely observing the first
+    # fanout would not exercise install_current_replica_lane/3.
+    :ok =
+      TestCluster.rpc!(context.node_b, TestCluster, :delete_remote_view_info, [
+        name,
+        1,
+        context.node_a
+      ])
+
+    assert TestCluster.rpc!(context.node_b, Group.Replica.Data, :remote_view_generation, [
+             name,
+             1,
+             context.node_a
+           ]) == nil
+
+    send(
+      target_lane,
+      {:replica_lane_hello, source_lane, Group.Replica.WireProtocol.version(), generation,
+       revision, Group.TestReplicaTransport.id(), Group.TestReplicaTransport.descriptor(name, [])}
+    )
+
+    TestCluster.assert_eventually(fn ->
+      TestCluster.rpc!(context.node_b, Group.Replica.Data, :remote_view_generation, [
+        name,
+        1,
+        context.node_a
+      ]) == generation
+    end)
+
     # The source lane is suspended, so the only way this peer_connect can be
     # present is the immediate post-authority re-probe from the target lane.
     TestCluster.assert_eventually(fn ->
