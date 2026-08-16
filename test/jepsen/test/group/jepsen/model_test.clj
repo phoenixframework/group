@@ -162,11 +162,27 @@
         result (model/analyze
                  (assoc test-map
                         :required-transport-events
-                        #{:delta-batch :snapshot-chunk :multi-chunk-snapshot-chunk})
+                        model/default-required-transport-events)
                  history)]
     (is (false? (:valid? result)))
-    (is (= #{:delta-batch :snapshot-chunk :multi-chunk-snapshot-chunk}
+    (is (= model/default-required-transport-events
            (:missing-transport-events result)))))
+
+(deftest accepts-the-transport-event-names-emitted-by-the-live-nodes
+  (let [events {:delta-batch 1
+                :snapshot-chunk 2
+                :multi-chunk-snapshot 1
+                :registry-conflict-death 1}
+        history [(assoc-in (snapshot-op 1 "n1" [] (empty-registry) (empty-pg))
+                           [:value :transport-events]
+                           events)
+                 (snapshot-op 2 "n2" [] (empty-registry) (empty-pg))
+                 (snapshot-op 3 "n3" [] (empty-registry) (empty-pg))]
+        result (model/analyze
+                 (dissoc test-map :required-transport-events)
+                 history)]
+    (is (:valid? result))
+    (is (empty? (:missing-transport-events result)))))
 
 (deftest rejects-internal-corruption-or-leftover-snapshot-staging
   (let [bad (-> (snapshot-op 1 "n1" [] (empty-registry) (empty-pg))

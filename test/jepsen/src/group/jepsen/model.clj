@@ -3,6 +3,10 @@
             [jepsen.checker :as checker]
             [jepsen.history :as history]))
 
+(def default-required-transport-events
+  #{:delta-batch :snapshot-chunk :multi-chunk-snapshot
+    :registry-conflict-death})
+
 (defn successful-snapshots [history]
   (->> history
        (remove history/invoke?)
@@ -139,8 +143,7 @@
                 (map #(or (:transport-events %) {}) (vals relevant-snapshots)))
         required-transport-events
         (get test :required-transport-events
-             #{:delta-batch :snapshot-chunk :multi-chunk-snapshot-chunk
-               :registry-conflict-death})
+             default-required-transport-events)
         missing-transport-events
         (set (remove #(pos? (get transport-events % 0)) required-transport-events))
         expected-profile (keyword (:transport test))
