@@ -2721,10 +2721,11 @@ defmodule Group.Replica.Data do
 
         not is_nil(hint_generation) and
             WireProtocol.generation_newer?(generation, hint_generation) ->
-          # This one shared row is the cross-lane fence. Public readers include
-          # it in replica_view_current?/2, so no lane can admit the prior
+          # This one shared row is the cross-lane admission fence. Replica lanes
+          # include it in replica_view_current?/2, so no lane can admit the prior
           # generation after this insert even while the per-lane breadcrumbs
-          # below are being updated.
+          # below are being updated. Existing materialized projections may remain
+          # visible until exact-authority repair or bounded lease retirement.
           put_remote_authority_hint(state.name, remote_node, generation, revision)
 
           # Preserve each lane's old generation as the later exact install's
