@@ -10,6 +10,7 @@ concurrency="${GROUP_JEPSEN_CAMPAIGN_CONCURRENCY:-4n}"
 owner_count="${GROUP_JEPSEN_CAMPAIGN_OWNERS:-128}"
 key_count="${GROUP_JEPSEN_CAMPAIGN_KEYS:-32}"
 recovery_time="${GROUP_JEPSEN_CAMPAIGN_RECOVERY:-15}"
+profile_grace="${GROUP_JEPSEN_CAMPAIGN_PROFILE_GRACE:-90}"
 artifact_dir="${GROUP_JEPSEN_CAMPAIGN_ARTIFACT_DIR:-}"
 
 cd "${repo_dir}"
@@ -42,7 +43,14 @@ for transport in distribution tcp chaos; do
 
     echo "Starting ${transport}/${scenario}: ${test_count} histories x ${time_limit}s (sender buffer ${sender_buffer_size})"
 
-    if GROUP_JEPSEN_SENDER_BUFFER_SIZE="${sender_buffer_size}" "${script_dir}/run.sh" test \
+    # Jepsen's active generator is time-limited, but setup, recovery, checker,
+    # and bugs in a terminal generator live outside that limit. Keep the
+    # nightly gate itself bounded as a final defense against hung campaigns.
+    profile_timeout=$((test_count * (time_limit + recovery_time + profile_grace)))
+
+    if GROUP_JEPSEN_SENDER_BUFFER_SIZE="${sender_buffer_size}" timeout \
+        --signal=TERM --kill-after=30 "${profile_timeout}" \
+        "${script_dir}/run.sh" test \
         --no-ssh \
         --nodes n1,n2,n3 \
         --concurrency "${concurrency}" \

@@ -91,6 +91,19 @@
           (gen/once read)
           (gen/until-ok (repeat read)))))))
 
+(defn recovery-connect-round [opts]
+  ;; A dead node can reject connections immediately. An unpaced until-ok loop
+  ;; then creates an unbounded history after the active workload's time limit
+  ;; has already elapsed. Bound terminal recovery too: failure to reconnect is
+  ;; evidence for an invalid history, not a reason for the harness to run
+  ;; forever.
+  (gen/clients
+    (gen/each-thread
+      (->> (repeat {:f :connect-all, :value {}})
+           (gen/stagger 0.1)
+           gen/until-ok
+           (gen/time-limit (:recovery-time opts))))))
+
 (defn terminal-phases [opts]
   (let [permanent? (= "permanent" (:scenario opts))
         corruption (keyword (:corruption opts))]
@@ -99,9 +112,7 @@
        (gen/nemesis {:type :info, :f :restart-node})
        (gen/nemesis {:type :info, :f :partition-stop})
        (gen/nemesis {:type :info, :f :replica-partition-stop})
-       (gen/clients
-         (gen/each-thread
-           (gen/until-ok (repeat {:f :connect-all, :value {}}))))
+       (recovery-connect-round opts)
        (gen/sleep (:recovery-time opts))]
       permanent?
       (conj (gen/log "Retiring n1 permanently and waiting for complete eviction")

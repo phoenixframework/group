@@ -66,7 +66,11 @@ defmodule Group.MixProject do
     [
       test: ["test", "cmd test/jepsen/checker.sh"],
       "test.soak": [
-        "test",
+        # Run the PR gate in a child VM. test_helper starts distribution, and
+        # keeping that VM alive for the following `cmd` phases can retain a
+        # fixed ERL_AFLAGS distribution port and make qualification fail with
+        # eaddrinuse.
+        "cmd mix test",
         "cmd env GROUP_JEPSEN_SKIP_CHECKER=1 test/jepsen/qualify.sh",
         "cmd env GROUP_JEPSEN_SKIP_CHECKER=1 test/jepsen/campaign.sh"
       ]
