@@ -3207,7 +3207,7 @@ defmodule Group.AntiEntropyFaultRegressionTest do
       ])
 
     :ok =
-      TestCluster.rpc!(context.node_b, Group.Replica.Data, :pg_insert, [
+      TestCluster.rpc!(context.node_b, TestCluster, :insert_partial_pg_and_clear_counts, [
         name,
         1,
         nil,

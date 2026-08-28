@@ -56,6 +56,16 @@ defmodule Group.Replica.Data do
   `entries_by_pid` can select all entries for a pid as a contiguous range scan. Also used
   by `maybe_demonitor` to check if a pid has any remaining entries (select with limit 1).
 
+  ### pg_counts — `:set`, keyed by `{cluster, kind, pattern}`
+
+      {{cluster, :exact, key}, total_count, local_count}
+      {{cluster, :prefix, prefix}, total_count, local_count}
+
+  Derived cardinality projection for constant-cost exact member counts and one lookup per
+  shard for slash-prefix counts. Counts follow actual `pg_by_key` row transitions, never raw
+  replica operations. Shard startup rebuilds the complete projection while repairing the PG
+  primary/reverse indexes, so a crash between a row and counter write cannot cause drift.
+
   ### reg_claim_by_key / reg_claim_by_pid — authoritative registry claims
 
       {{cluster, key, origin, generation, epoch}, pid, meta, time, sequence}
@@ -154,10 +164,11 @@ defmodule Group.Replica.Data do
     deletes. O(table size) for the scan, but this only runs on nodedown, remote shard death,
     or peer-lease expiry — rare paths.
 
-  - `registry_count`, `pg_count`, `pg_count_by_prefix`, `local_registry_count`,
-    `local_pg_count`, `local_registry_present?`, `local_pg_present?`: Uses
-    `ets.select_count`. Full scan but returns only a count/existence signal
-    without materializing matching rows.
+  - `registry_count`, `local_registry_count`, `local_registry_present?`, and
+    `local_pg_present?`: Use bounded-result ETS scans without materializing rows.
+
+  - `pg_count` and `local_pg_count`: One direct lookup in the owning shard's
+    materialized count table. Prefix variants perform one lookup per shard.
 
   - `entries_by_pid/3`: Range scan on the by_pid ordered_set tables. O(entries for that pid).
 
@@ -647,7 +658,12 @@ defmodule Group.Replica.Data do
       streams
       |> Enum.group_by(&WireProtocol.stream_origin/1, &WireProtocol.stream_cluster/1)
       |> Enum.each(fn {origin, clusters} ->
-        delete_pg_for_origin_clusters(name, shard, Enum.uniq(clusters), origin)
+        delete_pg_for_origin_clusters_before_rebuild(
+          name,
+          shard,
+          Enum.uniq(clusters),
+          origin
+        )
       end)
 
       Enum.each(streams, &:ets.delete(replica_cursor_table(name, shard), &1))
@@ -697,9 +713,11 @@ defmodule Group.Replica.Data do
     reg_reverse = reg_by_pid_table(name, shard)
     claim_reverse = reg_claim_by_pid_table(name, shard)
     pg_reverse = pg_by_pid_table(name, shard)
+    pg_counts = pg_count_table(name, shard)
     :ets.delete_all_objects(reg_reverse)
     :ets.delete_all_objects(claim_reverse)
     :ets.delete_all_objects(pg_reverse)
+    :ets.delete_all_objects(pg_counts)
 
     inactive_clusters = MapSet.new()
 
@@ -749,11 +767,12 @@ defmodule Group.Replica.Data do
         end
       )
 
-    inactive_clusters =
+    {inactive_clusters, count_deltas, _count_batch_size} =
       repair_ets_table(
         pg_by_key_table(name, shard),
-        inactive_clusters,
-        fn {{cluster, key, pid}, meta, time, entry_node}, inactive ->
+        {inactive_clusters, %{}, 0},
+        fn {{cluster, key, pid}, meta, time, entry_node},
+           {inactive, count_deltas, count_batch_size} ->
           valid? =
             active_local_cluster?(name, cluster) and node(pid) == entry_node and
               (entry_node == node() or
@@ -761,13 +780,26 @@ defmodule Group.Replica.Data do
 
           if valid? do
             :ets.insert(pg_reverse, {{pid, cluster, key}, meta, time, entry_node})
-            inactive
+
+            count_deltas =
+              accumulate_pg_count_delta(count_deltas, cluster, key, entry_node, 1)
+
+            count_batch_size = count_batch_size + 1
+
+            if count_batch_size >= 4_096 do
+              :ok = apply_pg_count_deltas(name, shard, count_deltas)
+              {inactive, %{}, 0}
+            else
+              {inactive, count_deltas, count_batch_size}
+            end
           else
             :ets.delete(pg_by_key_table(name, shard), {cluster, key, pid})
-            remember_inactive_cluster(name, inactive, cluster)
+            {remember_inactive_cluster(name, inactive, cluster), count_deltas, count_batch_size}
           end
         end
       )
+
+    :ok = apply_pg_count_deltas(name, shard, count_deltas)
 
     inactive_clusters =
       repair_ets_table(
@@ -1561,11 +1593,7 @@ defmodule Group.Replica.Data do
   # =====================================================================
 
   def pg_insert(name, shard, cluster, key, pid, meta, time, node) do
-    table = pg_by_key_table(name, shard)
-    :ets.insert(table, {{cluster, key, pid}, meta, time, node})
-    table_pid = pg_by_pid_table(name, shard)
-    :ets.insert(table_pid, {{pid, cluster, key}, meta, time, node})
-    :ok
+    pg_insert_many(name, shard, [{cluster, key, pid, meta, time, node}])
   end
 
   def pg_insert_many(_name, _shard, []), do: :ok
@@ -1573,6 +1601,29 @@ defmodule Group.Replica.Data do
   def pg_insert_many(name, shard, entries) do
     table = pg_by_key_table(name, shard)
     table_pid = pg_by_pid_table(name, shard)
+
+    # One batch may mention the same membership more than once. Preserve the
+    # final row while comparing it with the one resident row that preceded the
+    # batch, so metadata replays and join/leave collapse cannot change counts.
+    transitions =
+      Enum.reduce(entries, %{}, fn {cluster, key, pid, _meta, _time, _entry_node} = entry,
+                                   transitions ->
+        member = {cluster, key, pid}
+
+        case Map.fetch(transitions, member) do
+          {:ok, {initial, _current}} ->
+            Map.put(transitions, member, {initial, entry})
+
+          :error ->
+            Map.put(
+              transitions,
+              member,
+              {pg_lookup(name, shard, cluster, key, pid), entry}
+            )
+        end
+      end)
+
+    entries = Enum.map(transitions, fn {_member, {_initial, entry}} -> entry end)
 
     :ets.insert(
       table,
@@ -1588,15 +1639,27 @@ defmodule Group.Replica.Data do
       end)
     )
 
+    count_deltas =
+      Enum.reduce(transitions, %{}, fn
+        {{cluster, key, _member_pid},
+         {nil, {_entry_cluster, _entry_key, _entry_pid, _entry_meta, _entry_time, entry_node}}},
+        deltas ->
+          accumulate_pg_count_delta(deltas, cluster, key, entry_node, 1)
+
+        {{cluster, key, _member_pid},
+         {{_old_meta, _old_time, old_node},
+          {_entry_cluster, _entry_key, _entry_pid, _new_meta, _new_time, new_node}}},
+        deltas ->
+          accumulate_pg_local_count_transition(deltas, cluster, key, old_node, new_node)
+      end)
+
+    :ok = apply_pg_count_deltas(name, shard, count_deltas)
+
     :ok
   end
 
   def pg_delete(name, shard, cluster, key, pid) do
-    table = pg_by_key_table(name, shard)
-    :ets.delete(table, {cluster, key, pid})
-    table_pid = pg_by_pid_table(name, shard)
-    :ets.delete(table_pid, {pid, cluster, key})
-    :ok
+    pg_delete_many(name, shard, [{cluster, key, pid}])
   end
 
   def pg_delete_many(_name, _shard, []), do: :ok
@@ -1606,19 +1669,29 @@ defmodule Group.Replica.Data do
     table = pg_by_key_table(name, shard)
     table_pid = pg_by_pid_table(name, shard)
 
-    :ets.select_delete(
-      table,
-      Enum.map(entries, fn {cluster, key, pid} ->
-        {{{cluster, key, pid}, :_, :_, :_}, [], [true]}
-      end)
-    )
+    existing =
+      Enum.flat_map(entries, fn {cluster, key, pid} ->
+        case :ets.take(table, {cluster, key, pid}) do
+          [{{^cluster, ^key, ^pid}, _meta, _time, entry_node}] ->
+            [{cluster, key, pid, entry_node}]
 
-    :ets.select_delete(
-      table_pid,
-      Enum.map(entries, fn {cluster, key, pid} ->
-        {{{pid, cluster, key}, :_, :_, :_}, [], [true]}
+          [] ->
+            []
+        end
       end)
-    )
+
+    if existing != [] do
+      Enum.each(existing, fn {cluster, key, pid, _entry_node} ->
+        :ets.delete(table_pid, {pid, cluster, key})
+      end)
+    end
+
+    count_deltas =
+      Enum.reduce(existing, %{}, fn {cluster, key, _pid, entry_node}, deltas ->
+        accumulate_pg_count_delta(deltas, cluster, key, entry_node, -1)
+      end)
+
+    :ok = apply_pg_count_deltas(name, shard, count_deltas)
 
     :ok
   end
@@ -1757,16 +1830,16 @@ defmodule Group.Replica.Data do
 
     select_delete_pids(reg_pid_table, pids)
 
-    pg_table = pg_by_key_table(name, shard)
     pg_pid_table = pg_by_pid_table(name, shard)
 
     pg_entries = select_entries_for_pids(pg_pid_table, pids)
 
-    for {pid, cluster, key, _meta} <- pg_entries do
-      :ets.delete(pg_table, {cluster, key, pid})
-    end
-
-    select_delete_pids(pg_pid_table, pids)
+    :ok =
+      pg_delete_many(
+        name,
+        shard,
+        Enum.map(pg_entries, fn {pid, cluster, key, _meta} -> {cluster, key, pid} end)
+      )
 
     {reg_entries, pg_entries}
   end
@@ -1795,20 +1868,20 @@ defmodule Group.Replica.Data do
 
   def pg_delete_matching_many(name, shard, entries) do
     pg_table = pg_by_key_table(name, shard)
-    pg_pid_table = pg_by_pid_table(name, shard)
 
-    Enum.reduce(entries, [], fn {pid, cluster, key, _meta, _reason} = entry, acc ->
-      case :ets.lookup(pg_table, {cluster, key, pid}) do
-        [{{^cluster, ^key, ^pid}, _current_meta, _time, _node}] ->
-          :ets.delete(pg_table, {cluster, key, pid})
-          :ets.delete(pg_pid_table, {pid, cluster, key})
-          [entry | acc]
+    existing =
+      Enum.filter(entries, fn {pid, cluster, key, _meta, _reason} ->
+        :ets.member(pg_table, {cluster, key, pid})
+      end)
 
-        _ ->
-          acc
-      end
-    end)
-    |> Enum.reverse()
+    :ok =
+      pg_delete_many(
+        name,
+        shard,
+        Enum.map(existing, fn {pid, cluster, key, _meta, _reason} -> {cluster, key, pid} end)
+      )
+
+    existing
   end
 
   # =====================================================================
@@ -1945,9 +2018,12 @@ defmodule Group.Replica.Data do
   def delete_pg_for_origin_cluster(name, shard, cluster, origin_node) do
     entries = pg_entries_for_origin(name, shard, cluster, origin_node)
 
-    Enum.each(entries, fn {key, pid, _meta, _time} ->
-      pg_delete(name, shard, cluster, key, pid)
-    end)
+    :ok =
+      pg_delete_many(
+        name,
+        shard,
+        Enum.map(entries, fn {key, pid, _meta, _time} -> {cluster, key, pid} end)
+      )
 
     Enum.map(entries, fn {key, pid, meta, time} -> {cluster, key, pid, meta, time} end)
   end
@@ -1955,22 +2031,45 @@ defmodule Group.Replica.Data do
   def delete_pg_for_origin_clusters(_name, _shard, [], _origin_node), do: []
 
   def delete_pg_for_origin_clusters(name, shard, clusters, origin_node) do
-    cluster_set = MapSet.new(clusters)
+    entries = pg_entries_for_origin_clusters(name, shard, clusters, origin_node)
 
-    entries =
-      :ets.select(pg_by_key_table(name, shard), [
-        {{{:"$1", :"$2", :"$3"}, :"$4", :"$5", origin_node}, [],
-         [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
-      ])
-      |> Enum.filter(fn {cluster, _key, _pid, _meta, _time} ->
-        MapSet.member?(cluster_set, cluster)
-      end)
-
-    Enum.each(entries, fn {cluster, key, pid, _meta, _time} ->
-      pg_delete(name, shard, cluster, key, pid)
-    end)
+    :ok =
+      pg_delete_many(
+        name,
+        shard,
+        Enum.map(entries, fn {cluster, key, pid, _meta, _time} -> {cluster, key, pid} end)
+      )
 
     entries
+  end
+
+  # Interrupted snapshot installation is repaired before the derived count
+  # projection is cleared and rebuilt. Never consult that possibly interrupted
+  # projection while removing provisional rows: doing so could turn a stale
+  # zero into a negative counter and crash-loop the restarting shard.
+  defp delete_pg_for_origin_clusters_before_rebuild(name, shard, clusters, origin_node) do
+    entries = pg_entries_for_origin_clusters(name, shard, clusters, origin_node)
+    primary = pg_by_key_table(name, shard)
+    reverse = pg_by_pid_table(name, shard)
+
+    Enum.each(entries, fn {cluster, key, pid, _meta, _time} ->
+      :ets.delete(primary, {cluster, key, pid})
+      :ets.delete(reverse, {pid, cluster, key})
+    end)
+
+    :ok
+  end
+
+  defp pg_entries_for_origin_clusters(name, shard, clusters, origin_node) do
+    cluster_set = MapSet.new(clusters)
+
+    :ets.select(pg_by_key_table(name, shard), [
+      {{{:"$1", :"$2", :"$3"}, :"$4", :"$5", origin_node}, [],
+       [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
+    ])
+    |> Enum.filter(fn {cluster, _key, _pid, _meta, _time} ->
+      MapSet.member?(cluster_set, cluster)
+    end)
   end
 
   def delete_registry_keys(name, shard, cluster, keys) do
@@ -1992,9 +2091,12 @@ defmodule Group.Replica.Data do
         {{{cluster, :"$1", :"$2"}, :"$3", :"$4", :_}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
       ])
 
-    Enum.each(entries, fn {key, pid, _meta, _time} ->
-      pg_delete(name, shard, cluster, key, pid)
-    end)
+    :ok =
+      pg_delete_many(
+        name,
+        shard,
+        Enum.map(entries, fn {key, pid, _meta, _time} -> {cluster, key, pid} end)
+      )
 
     Enum.map(entries, fn {key, pid, meta, time} -> {cluster, key, pid, meta, time} end)
   end
@@ -2015,7 +2117,6 @@ defmodule Group.Replica.Data do
     end
 
     pg_table = pg_by_key_table(name, shard)
-    pg_pid_table = pg_by_pid_table(name, shard)
 
     purged_pg =
       :ets.select(pg_table, [
@@ -2023,10 +2124,14 @@ defmodule Group.Replica.Data do
          [{{:"$1", :"$2", :"$3", :"$4", :"$5"}}]}
       ])
 
-    for {cluster, key, pid, _meta, _time} <- purged_pg do
-      :ets.delete(pg_table, {cluster, key, pid})
-      :ets.delete(pg_pid_table, {pid, cluster, key})
-    end
+    :ok =
+      pg_delete_many(
+        name,
+        shard,
+        Enum.map(purged_pg, fn {cluster, key, pid, _meta, _time} ->
+          {cluster, key, pid}
+        end)
+      )
 
     {purged_reg, purged_pg}
   end
@@ -2049,26 +2154,12 @@ defmodule Group.Replica.Data do
   end
 
   def pg_count(name, shard, cluster, key) do
-    table = pg_by_key_table(name, shard)
-
-    :ets.select_count(table, [
-      {{{cluster, key, :_}, :_, :_, :_}, [], [true]}
-    ])
+    pg_materialized_count(name, shard, cluster, :exact, key, 2)
   end
 
   def pg_count_by_prefix(name, num_shards, cluster, prefix) do
-    prefix_end = next_binary_prefix(prefix)
-
     Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
-      table = pg_by_key_table(name, shard)
-
-      count =
-        :ets.select_count(table, [
-          {{{cluster, :"$1", :_}, :_, :_, :_},
-           [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}], [true]}
-        ])
-
-      acc + count
+      acc + pg_materialized_count(name, shard, cluster, :prefix, prefix, 2)
     end)
   end
 
@@ -2100,12 +2191,7 @@ defmodule Group.Replica.Data do
   end
 
   def local_pg_count(name, shard, cluster, key) do
-    local_node = node()
-    table = pg_by_key_table(name, shard)
-
-    :ets.select_count(table, [
-      {{{cluster, key, :_}, :_, :_, :"$1"}, [{:==, :"$1", local_node}], [true]}
-    ])
+    pg_materialized_count(name, shard, cluster, :exact, key, 3)
   end
 
   def local_pg_present?(name, num_shards, cluster) do
@@ -2121,23 +2207,90 @@ defmodule Group.Replica.Data do
   end
 
   def local_pg_count_by_prefix(name, num_shards, cluster, prefix) do
-    local_node = node()
-    prefix_end = next_binary_prefix(prefix)
-
     Enum.reduce(0..(num_shards - 1), 0, fn shard, acc ->
-      table = pg_by_key_table(name, shard)
-
-      count =
-        :ets.select_count(table, [
-          {{{cluster, :"$1", :_}, :_, :_, :"$2"},
-           [
-             {:==, :"$2", local_node},
-             {:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}}
-           ], [true]}
-        ])
-
-      acc + count
+      acc + pg_materialized_count(name, shard, cluster, :prefix, prefix, 3)
     end)
+  end
+
+  defp pg_materialized_count(name, shard, cluster, kind, pattern, position) do
+    count_key = {cluster, kind, pattern}
+
+    case :ets.lookup(pg_count_table(name, shard), count_key) do
+      [{^count_key, total_count, _local_count}] when position == 2 -> total_count
+      [{^count_key, _total_count, local_count}] when position == 3 -> local_count
+      [] -> 0
+    end
+  end
+
+  @doc false
+  def prefix_patterns_for_key(key) when is_binary(key) do
+    for {position, _length} <- :binary.matches(key, "/") do
+      binary_part(key, 0, position + 1)
+    end
+  end
+
+  defp accumulate_pg_count_delta(deltas, cluster, key, entry_node, direction) do
+    local_direction = if entry_node == node(), do: direction, else: 0
+
+    [{:exact, key} | Enum.map(prefix_patterns_for_key(key), &{:prefix, &1})]
+    |> Enum.reduce(deltas, fn {kind, pattern}, acc ->
+      Map.update(
+        acc,
+        {cluster, kind, pattern},
+        {direction, local_direction},
+        fn {total, local} -> {total + direction, local + local_direction} end
+      )
+    end)
+  end
+
+  defp accumulate_pg_local_count_transition(deltas, _cluster, _key, node, node), do: deltas
+
+  defp accumulate_pg_local_count_transition(deltas, cluster, key, old_node, new_node) do
+    local_delta = local_node_value(new_node) - local_node_value(old_node)
+
+    if local_delta == 0 do
+      deltas
+    else
+      [{:exact, key} | Enum.map(prefix_patterns_for_key(key), &{:prefix, &1})]
+      |> Enum.reduce(deltas, fn {kind, pattern}, acc ->
+        Map.update(acc, {cluster, kind, pattern}, {0, local_delta}, fn {total, local} ->
+          {total, local + local_delta}
+        end)
+      end)
+    end
+  end
+
+  defp local_node_value(entry_node), do: if(entry_node == node(), do: 1, else: 0)
+
+  defp apply_pg_count_deltas(_name, _shard, deltas) when map_size(deltas) == 0, do: :ok
+
+  defp apply_pg_count_deltas(name, shard, deltas) do
+    table = pg_count_table(name, shard)
+
+    Enum.each(deltas, fn
+      {_count_key, {0, 0}} ->
+        :ok
+
+      {count_key, {total_delta, local_delta}} ->
+        [total_count, local_count] =
+          :ets.update_counter(
+            table,
+            count_key,
+            [{2, total_delta}, {3, local_delta}],
+            {count_key, 0, 0}
+          )
+
+        if total_count < 0 or local_count < 0 or local_count > total_count do
+          raise "invalid materialized PG count #{inspect(count_key)}: " <>
+                  "total=#{total_count} local=#{local_count}"
+        end
+
+        if total_count == 0 and local_count == 0 do
+          :ets.delete(table, count_key)
+        end
+    end)
+
+    :ok
   end
 
   defp select_exists?(table, match_spec) do
@@ -2231,6 +2384,7 @@ defmodule Group.Replica.Data do
   def reg_claim_by_pid_table(name, shard), do: :"#{name}_s#{shard}_reg_claim_by_pid"
   def pg_by_key_table(name, shard), do: :"#{name}_s#{shard}_pg_by_key"
   def pg_by_pid_table(name, shard), do: :"#{name}_s#{shard}_pg_by_pid"
+  def pg_count_table(name, shard), do: :"#{name}_s#{shard}_pg_counts"
   def cluster_nodes_table(name), do: :"#{name}_cluster_nodes"
   def node_clusters_table(name), do: :"#{name}_node_clusters"
   def cluster_leases_table(name), do: :"#{name}_cluster_leases"
@@ -2871,6 +3025,7 @@ defmodule Group.Replica.Data do
       :ets.new(reg_claim_by_pid_table(name, shard), ordered_set_opts)
       :ets.new(pg_by_key_table(name, shard), ordered_set_opts)
       :ets.new(pg_by_pid_table(name, shard), ordered_set_opts)
+      :ets.new(pg_count_table(name, shard), set_opts)
       :ets.new(replica_stream_meta_table(name, shard), set_opts)
       :ets.new(replica_oplog_table(name, shard), ordered_set_opts)
       :ets.new(replica_oplog_order_table(name, shard), ordered_set_opts)

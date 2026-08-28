@@ -11,7 +11,7 @@ and manifests, source mutation during a single-pass scan, newer-snapshot
 supersession, stale-authority fencing, and staging expiry.
 Restart calibration covers per-lane eviction breadcrumbs and partially observed
 authority, while wire calibration rejects wrong-shard rows and unsequenced
-cluster lifecycle messages. The 68-mutant campaign also independently removes
+cluster lifecycle messages. The 72-mutant campaign also independently removes
 the generation and epoch fences, races authority changes against local-owner
 retirement, skips conflict reprojection after exact authority returns, bypasses
 shard-zero authority serialization, separates exact authority from its shared
@@ -24,7 +24,10 @@ allows newer heartbeats or lane hellos to leave old lane views unfenced, retains
 cursorless claims, admits incremental authority across a revision race or gap,
 lets an unknown post-retirement hint recreate authority or an unleased lane
 route, delays a pre-authority lane's rediscovery until the periodic probe, and
-disables bounded snapshot-send/receive progress.
+disables bounded snapshot-send/receive progress, skips membership-count
+projection updates, retains stale count rows across shard repair, and consults
+an interrupted count projection while rolling back a partial snapshot install,
+and replays local write-ahead records before repairing derived counts.
 
 The runner first verifies every unmodified regression target. It then copies
 the current checkout once per mutant, changes only that copy, recompiles it,

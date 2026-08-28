@@ -1835,13 +1835,13 @@ defmodule GroupTest do
         end)
 
       :ok = Group.join(name, key, %{})
-      expected_table = Group.Replica.Data.pg_by_key_table(name, target_shard)
+      expected_table = Group.Replica.Data.pg_count_table(name, target_shard)
       parent = self()
 
-      :erlang.trace_pattern({:ets, :select_count, 2}, true, [:local])
+      :erlang.trace_pattern({:ets, :lookup, 2}, true, [:local])
 
       on_exit(fn ->
-        :erlang.trace_pattern({:ets, :select_count, 2}, false, [:local])
+        :erlang.trace_pattern({:ets, :lookup, 2}, false, [:local])
       end)
 
       checks = [
@@ -1860,12 +1860,11 @@ defmodule GroupTest do
         :erlang.trace(worker, true, [:call])
         send(worker, :count)
 
-        assert_receive {:trace, ^worker, :call,
-                        {:ets, :select_count, [^expected_table, _match_spec]}},
+        assert_receive {:trace, ^worker, :call, {:ets, :lookup, [^expected_table, _count_key]}},
                        1_000
 
         assert_receive {:count_result, ^kind, 1}, 1_000
-        refute_receive {:trace, ^worker, :call, {:ets, :select_count, _args}}, 20
+        refute_receive {:trace, ^worker, :call, {:ets, :lookup, _args}}, 20
       end
     end
 
@@ -1906,6 +1905,120 @@ defmodule GroupTest do
 
       assert Group.local_member_count(name, prefix) == 2
       assert Group.local_member_count(name, other) == 1
+    end
+
+    test "materialized counts follow membership diffs and remove zero rows", %{name: name} do
+      key = "counts/materialized/tenant/a1"
+      prefixes = Group.Replica.Data.prefix_patterns_for_key(key)
+      shard = Group.Replica.shard_index_for(nil, key, Group.get_config(name).num_shards)
+      count_table = Group.Replica.Data.pg_count_table(name, shard)
+
+      assert :ok = Group.join(name, key, %{revision: 1})
+      assert :ok = Group.join(name, key, %{revision: 2})
+      assert Group.member_count(name, key) == 1
+      assert Group.local_member_count(name, key) == 1
+
+      parent = self()
+
+      member =
+        spawn(fn ->
+          :ok = Group.join(name, key, %{revision: 3})
+          send(parent, {:joined, self()})
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive {:joined, ^member}, 1_000
+      assert Group.member_count(name, key) == 2
+      assert Group.local_member_count(name, key) == 2
+
+      Enum.each(prefixes, fn prefix ->
+        assert Group.member_count(name, prefix) == 2
+        assert Group.local_member_count(name, prefix) == 2
+      end)
+
+      assert :ok = Group.leave(name, key)
+      Process.exit(member, :kill)
+
+      Group.TestCluster.assert_eventually(fn ->
+        Group.member_count(name, key) == 0 and
+          Enum.all?(prefixes, &(Group.member_count(name, &1) == 0))
+      end)
+
+      refute :ets.member(count_table, {nil, :exact, key})
+
+      Enum.each(prefixes, fn prefix ->
+        refute :ets.member(count_table, {nil, :prefix, prefix})
+      end)
+
+      assert :ok = Group.TestCluster.assert_ets_consistent(name)
+    end
+
+    test "randomized public membership transitions preserve materialized counts", %{name: name} do
+      cluster = "count_invariant"
+      assert :ok = Group.connect(name, cluster)
+
+      keys = ["count/a/1", "count/a/2", "count/b/1", "other/1"]
+      scopes = for cluster <- [nil, cluster], key <- keys, do: {cluster, key}
+
+      prefixes =
+        keys |> Enum.flat_map(&Group.Replica.Data.prefix_patterns_for_key/1) |> Enum.uniq()
+
+      owners =
+        for _ <- 1..8 do
+          spawn(&membership_count_owner_loop/0)
+        end
+
+      on_exit(fn -> Enum.each(owners, &kill_if_alive/1) end)
+      :rand.seed(:exsss, {11, 22, 33})
+
+      _resident =
+        Enum.reduce(1..200, MapSet.new(), fn revision, resident ->
+          owner = Enum.at(owners, :rand.uniform(length(owners)) - 1)
+          {scope_cluster, key} = Enum.at(scopes, :rand.uniform(length(scopes)) - 1)
+          operation = if :rand.uniform(100) <= 60, do: :join, else: :leave
+          opts = if scope_cluster, do: [cluster: scope_cluster], else: []
+
+          result =
+            membership_count_owner_call(
+              owner,
+              {operation, name, key, %{revision: revision}, opts}
+            )
+
+          expected_result =
+            case {operation, MapSet.member?(resident, {scope_cluster, key, owner})} do
+              {:leave, false} -> {:error, :not_in_group}
+              _ -> :ok
+            end
+
+          assert result == expected_result
+
+          resident =
+            case operation do
+              :join -> MapSet.put(resident, {scope_cluster, key, owner})
+              :leave -> MapSet.delete(resident, {scope_cluster, key, owner})
+            end
+
+          Enum.each(scopes, fn {cluster_name, exact_key} ->
+            expected = Enum.count(resident, &match?({^cluster_name, ^exact_key, _pid}, &1))
+            query_opts = if cluster_name, do: [cluster: cluster_name], else: []
+            assert Group.member_count(name, exact_key, query_opts) == expected
+            assert Group.local_member_count(name, exact_key, query_opts) == expected
+          end)
+
+          for cluster_name <- [nil, cluster], prefix <- prefixes do
+            expected =
+              Enum.count(resident, fn {resident_cluster, key, _pid} ->
+                resident_cluster == cluster_name and String.starts_with?(key, prefix)
+              end)
+
+            query_opts = if cluster_name, do: [cluster: cluster_name], else: []
+            assert Group.member_count(name, prefix, query_opts) == expected
+            assert Group.local_member_count(name, prefix, query_opts) == expected
+          end
+
+          assert :ok = Group.TestCluster.assert_ets_consistent(name)
+          resident
+        end)
     end
   end
 
@@ -2491,6 +2604,12 @@ defmodule GroupTest do
 
       :ets.delete(Group.Replica.Data.reg_by_pid_table(name, 0), {self(), nil, reg_key})
       :ets.delete(Group.Replica.Data.pg_by_pid_table(name, 0), {self(), nil, pg_key})
+      :ets.delete(Group.Replica.Data.pg_count_table(name, 0), {nil, :exact, pg_key})
+
+      :ets.insert(
+        Group.Replica.Data.pg_count_table(name, 0),
+        {{nil, :exact, "indexes/orphan/count"}, 99, 99}
+      )
 
       :ets.delete(
         Group.Replica.Data.reg_claim_by_pid_table(name, 0),
@@ -2526,6 +2645,14 @@ defmodule GroupTest do
       :sys.get_state(Group.Replica.shard_name(name, 0))
       assert Group.lookup(name, reg_key) == {self(), %{kind: :registry}}
       assert Group.members(name, pg_key) == [{self(), %{kind: :pg}}]
+      assert Group.member_count(name, pg_key) == 1
+      assert Group.local_member_count(name, pg_key) == 1
+
+      refute :ets.member(
+               Group.Replica.Data.pg_count_table(name, 0),
+               {nil, :exact, "indexes/orphan/count"}
+             )
+
       assert Group.Replica.Data.registry_lookup_by_pid(name, 0, orphan) == []
       assert Group.Replica.Data.entries_by_pid(name, 0, orphan) == []
       assert :ok = Group.TestCluster.assert_replica_consistent(name)
@@ -2963,6 +3090,51 @@ defmodule GroupTest do
     end
   end
 
+  describe "materialized count crash repair order" do
+    test "a stale count projection cannot crash-loop local journal replay" do
+      name = start_single_shard_group(replicated_oplog_max_entries: 16)
+      prefix = "count/journal-replay/#{System.unique_integer([:positive])}"
+      keys = Enum.map(1..8, &"#{prefix}/#{&1}")
+
+      Enum.each(keys, fn key ->
+        assert :ok = Group.join(name, key, %{kind: :pg})
+      end)
+
+      stream_id = Group.Replica.Data.local_stream_id(name, 0, nil)
+
+      leave_seq =
+        Enum.reduce(keys, nil, fn key, _last_seq ->
+          {seq, _mutations} =
+            Group.Replica.Data.append_replica_record(name, 0, stream_id, [
+              {:leave, nil, key, self(), %{kind: :pg}, :leave}
+            ])
+
+          seq
+        end)
+
+      true = :ets.delete_all_objects(Group.Replica.Data.pg_count_table(name, 0))
+      group_supervisor = Process.whereis(:"#{name}_group_sup")
+      supervisor_monitor = Process.monitor(group_supervisor)
+      old_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+      Process.exit(old_shard, :kill)
+
+      Group.TestCluster.assert_eventually(fn ->
+        new_shard = Process.whereis(Group.Replica.shard_name(name, 0))
+
+        is_pid(new_shard) and new_shard != old_shard and
+          Enum.all?(keys, &(Group.members(name, &1) == [])) and
+          Group.member_count(name, prefix <> "/") == 0
+      end)
+
+      refute_receive {:DOWN, ^supervisor_monitor, :process, ^group_supervisor, _reason}, 500
+
+      assert {_floor, ^leave_seq, ^leave_seq} =
+               Group.Replica.Data.replica_stream_head(name, 0, stream_id)
+
+      assert :ok = Group.TestCluster.assert_replica_consistent(name)
+    end
+  end
+
   defp start_single_shard_group(opts \\ []) do
     name = :"test_timeout_group_#{System.unique_integer([:positive])}"
     opts = Keyword.merge([name: name, shards: 1, log: false], opts)
@@ -3058,6 +3230,29 @@ defmodule GroupTest do
         {reply, calls} = receive_local_write_with_trace(shard, ref, 0)
         send(parent, {:local_write_finished, self(), reply, calls})
         Process.sleep(:infinity)
+    end
+  end
+
+  defp membership_count_owner_loop do
+    receive do
+      {:membership_count_call, caller, ref, {:join, name, key, meta, opts}} ->
+        send(caller, {ref, Group.join(name, key, meta, opts)})
+        membership_count_owner_loop()
+
+      {:membership_count_call, caller, ref, {:leave, name, key, _meta, opts}} ->
+        send(caller, {ref, Group.leave(name, key, opts)})
+        membership_count_owner_loop()
+    end
+  end
+
+  defp membership_count_owner_call(owner, request) do
+    ref = make_ref()
+    send(owner, {:membership_count_call, self(), ref, request})
+
+    receive do
+      {^ref, result} -> result
+    after
+      1_000 -> flunk("membership count owner call timed out")
     end
   end
 

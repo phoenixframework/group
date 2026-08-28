@@ -877,6 +877,10 @@ defmodule Group do
   Supports prefix matching: if `group` ends with `"/"`, counts all
   members whose group key starts with that prefix.
 
+  Exact counts perform one ETS lookup in the key's owning shard. Prefix
+  counts perform one ETS lookup per configured shard; neither path scans
+  resident memberships.
+
   ## Parameters
 
   - `name` - The Group name
@@ -911,6 +915,10 @@ defmodule Group do
 
   Supports prefix matching: if `group` ends with `"/"`, counts all local
   members whose group key starts with that prefix.
+
+  Exact counts perform one ETS lookup in the key's owning shard. Prefix
+  counts perform one ETS lookup per configured shard; neither path scans
+  resident memberships.
 
   ## Parameters
 

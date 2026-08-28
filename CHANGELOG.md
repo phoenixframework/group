@@ -1,4 +1,10 @@
 ## Unreleased
+
+- Materialize per-shard exact and slash-prefix process-group cardinalities so
+  `Group.member_count/3` and `Group.local_member_count/3` no longer scan
+  memberships. Counts follow resident-row diffs across local writes,
+  replication, snapshots, and peer eviction, and rebuild from primary ETS rows
+  after a shard restart.
 - Add layered anti-entropy qualification: three-node StreamData lifecycle
   models, seeded adversarial transport histories, TLA+ models for convergence,
   chunk assembly, and permanent peer eviction, plus a Docker-backed Jepsen

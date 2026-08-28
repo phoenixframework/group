@@ -975,6 +975,25 @@ defmodule Group.Jepsen.Invariant do
 
       assert_equal!(reg_key, reg_pid, "registry dual indexes shard #{shard}")
       assert_equal!(pg_key, pg_pid, "PG dual indexes shard #{shard}")
+
+      expected_counts =
+        Enum.reduce(pg_key, %{}, fn {cluster, key, _pid, _meta, _time, origin}, counts ->
+          local_increment = if origin == node(), do: 1, else: 0
+
+          [{:exact, key} | Enum.map(Data.prefix_patterns_for_key(key), &{:prefix, &1})]
+          |> Enum.reduce(counts, fn {kind, pattern}, inner ->
+            Map.update(inner, {cluster, kind, pattern}, {1, local_increment}, fn {total, local} ->
+              {total + 1, local + local_increment}
+            end)
+          end)
+        end)
+
+      materialized_counts =
+        Data.pg_count_table(:jepsen_group, shard)
+        |> :ets.tab2list()
+        |> Map.new(fn {count_key, total, local} -> {count_key, {total, local}} end)
+
+      assert_equal!(expected_counts, materialized_counts, "PG counts shard #{shard}")
     end)
 
     cluster_nodes =

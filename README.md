@@ -341,8 +341,10 @@ Keys are routed to shards via `:erlang.phash2({cluster, key}, num_shards)`.
 Including the cluster in the hash avoids false contention between the default
 cluster and named clusters.
 
-**Reads** (`lookup`, `members`) go directly to ETS — no GenServer hop. This is
-the hot path and runs at millions of ops/sec.
+**Reads** (`lookup`, `members`, membership counts) go directly to ETS — no
+GenServer hop. This is the hot path and runs at millions of ops/sec. Exact
+membership counts use one lookup in the owning shard; slash-prefix counts use
+one lookup per configured shard, independent of membership cardinality.
 
 **Writes** (`register`, `join`, etc.) go through the shard's GenServer, which
 updates ETS and broadcasts replication messages. Multiple shards reduce write
@@ -360,6 +362,7 @@ Each shard has materialized read indexes plus authority/recovery indexes:
 | `reg_claim_by_pid` | `:ordered_set` | `{pid, cluster, key, origin, generation, epoch}` | Reverse claim index for owner death and repair |
 | `pg_by_key` | `:ordered_set` | `{cluster, key, pid}` | Group membership lookup |
 | `pg_by_pid` | `:ordered_set` | `{pid, cluster, key}` | Reverse index for death cleanup |
+| `pg_counts` | `:set` | `{cluster, exact\|prefix, pattern}` | Derived total/local membership cardinalities |
 | `replica_stream_meta` | `:set` | `stream_id` | Local stream head, retained floor, and applied journal position |
 | `replica_oplog` | `:ordered_set` | `{stream_id, sequence}` | Bounded sequenced mutation records |
 | `replica_oplog_order` | `:ordered_set` | `append_id` | Shard-wide pruning order across streams |
@@ -370,6 +373,13 @@ of the visible winner. Stream metadata, oplog, append-order, and receive-cursor
 tables support crash replay and gap repair. Keeping claims separate from the
 single visible `reg_by_key` projection prevents a losing-but-still-live remote
 claim from being forgotten before its owner emits an authoritative delete.
+
+`pg_counts` is a derived projection of resident `pg_by_key` rows. Inserts,
+metadata rejoins, duplicate replication, deletes, peer eviction, and exact
+snapshot replacement update it from the actual before/after membership diff.
+Each shard rebuilds the projection from its surviving primary rows before its
+Replica finishes restarting, repairing interruption between membership and
+count-table writes without adding count records to the replication protocol.
 
 The node also has shared control/authority tables:
 

@@ -347,12 +347,14 @@ defmodule Group.Replica do
 
     state = schedule_anti_entropy(state)
 
-    # Repair any interrupted multi-table journal/index mutation, complete
-    # write-ahead records left unapplied by a shard crash, then rebuild local
-    # process monitors from the surviving materialized tables.
+    # Repair any interrupted multi-table journal/index mutation before
+    # completing write-ahead records left unapplied by a shard crash. Journal
+    # replay is idempotent against the repaired primary/count projection; the
+    # opposite order could consume an interrupted derived count and repeatedly
+    # crash while replaying a legitimate leave.
     :ok = Data.repair_local_replica_journal(name, shard_index)
-    state = replay_local_journal(state)
     :ok = Data.repair_shard_indexes(name, shard_index)
+    state = replay_local_journal(state)
     {state, _events} = rebuild_registry_projections(state)
 
     _completed_clusters =
@@ -4655,26 +4657,31 @@ defmodule Group.Replica do
       end)
 
     event_buffer =
-      Data.fold_pg_entries_for_origin(
+      Data.reduce_pg_entry_batches_for_origin(
         state.name,
         state.shard_index,
         cluster,
         source_node,
         event_buffer,
-        fn {key, pid, old_meta, _old_time}, buffer ->
-          if Snapshot.member_pg?(staging_table, key, pid) do
-            buffer
-          else
-            :ok = Data.pg_delete(state.name, state.shard_index, cluster, key, pid)
+        fn rows, buffer ->
+          {deletes, buffer} =
+            Enum.reduce(rows, {[], buffer}, fn {key, pid, old_meta, _old_time},
+                                               {deletes, inner} ->
+              if Snapshot.member_pg?(staging_table, key, pid) do
+                {deletes, inner}
+              else
+                event =
+                  build_event(state.name, :left, key, pid, old_meta, %{
+                    reason: :reconcile,
+                    cluster: cluster
+                  })
 
-            event =
-              build_event(state.name, :left, key, pid, old_meta, %{
-                reason: :reconcile,
-                cluster: cluster
-              })
+                {[{cluster, key, pid} | deletes], Snapshot.buffer_event(event, inner)}
+              end
+            end)
 
-            Snapshot.buffer_event(event, buffer)
-          end
+          :ok = Data.pg_delete_many(state.name, state.shard_index, deletes)
+          buffer
         end
       )
 
@@ -5801,9 +5808,12 @@ defmodule Group.Replica do
       ])
       |> Enum.map(fn {key, pid, meta, time} -> {cluster, key, pid, meta, time} end)
 
-    for {^cluster, key, pid, _meta, _time} <- purged_pg do
-      Data.pg_delete(name, shard, cluster, key, pid)
-    end
+    :ok =
+      Data.pg_delete_many(
+        name,
+        shard,
+        Enum.map(purged_pg, fn {^cluster, key, pid, _meta, _time} -> {cluster, key, pid} end)
+      )
 
     {purged_reg, purged_pg}
   end
@@ -5905,8 +5915,9 @@ defmodule Group.Replica do
       |> put_subscribers(exact_subscribers)
 
     {subscriber_set, cache} =
-      Enum.reduce(prefix_patterns_for_key(key), {subscriber_set, cache}, fn prefix,
-                                                                            {acc, inner_cache} ->
+      Enum.reduce(Data.prefix_patterns_for_key(key), {subscriber_set, cache}, fn prefix,
+                                                                                 {acc,
+                                                                                  inner_cache} ->
         {prefix_subscribers, inner_cache} =
           get_cached_subscribers(name, cluster, {:prefix, prefix}, inner_cache)
 
@@ -5937,12 +5948,6 @@ defmodule Group.Replica do
 
   defp put_subscribers(acc, subscribers) do
     Enum.reduce(subscribers, acc, fn subscriber, inner -> Map.put(inner, subscriber, true) end)
-  end
-
-  defp prefix_patterns_for_key(key) do
-    for {position, _length} <- :binary.matches(key, "/") do
-      binary_part(key, 0, position + 1)
-    end
   end
 
   # =====================================================================

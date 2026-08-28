@@ -92,18 +92,34 @@ defmodule Group.DistributedTest do
         members = TestCluster.rpc!(node_b, Group, :members, [name, "room/1"])
 
         case members do
-          [{pid, %{role: :player}}] when is_pid(pid) -> true
-          _ -> false
+          [{pid, %{role: :player}}] when is_pid(pid) ->
+            TestCluster.rpc!(node_a, Group, :member_count, [name, "room/1"]) == 1 and
+              TestCluster.rpc!(node_a, Group, :local_member_count, [name, "room/1"]) == 1 and
+              TestCluster.rpc!(node_b, Group, :member_count, [name, "room/1"]) == 1 and
+              TestCluster.rpc!(node_b, Group, :local_member_count, [name, "room/1"]) == 0 and
+              TestCluster.rpc!(node_b, Group, :member_count, [name, "room/"]) == 1
+
+          _ ->
+            false
         end
       end)
+
+      assert :ok = TestCluster.rpc!(node_a, TestCluster, :assert_ets_consistent, [name])
+      assert :ok = TestCluster.rpc!(node_b, TestCluster, :assert_ets_consistent, [name])
 
       # Kill process on A
       Process.exit(remote_pid, :kill)
 
       # Should be gone from node B
       TestCluster.assert_eventually(fn ->
-        TestCluster.rpc!(node_b, Group, :members, [name, "room/1"]) == []
+        TestCluster.rpc!(node_b, Group, :members, [name, "room/1"]) == [] and
+          TestCluster.rpc!(node_a, Group, :member_count, [name, "room/1"]) == 0 and
+          TestCluster.rpc!(node_b, Group, :member_count, [name, "room/1"]) == 0 and
+          TestCluster.rpc!(node_b, Group, :member_count, [name, "room/"]) == 0
       end)
+
+      assert :ok = TestCluster.rpc!(node_a, TestCluster, :assert_ets_consistent, [name])
+      assert :ok = TestCluster.rpc!(node_b, TestCluster, :assert_ets_consistent, [name])
     end
   end
 

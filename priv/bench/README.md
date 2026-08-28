@@ -19,6 +19,21 @@ Single-node, no distribution required:
 ./run_local.sh
 ```
 
+To isolate materialized membership-count reads at 1K, 100K, and one million
+distinct keys (32 shards and 100K samples per query by default):
+
+```bash
+mix run -e 'GroupBench.main(["member_counts"])'
+
+GROUP_BENCH_SHARDS=64 GROUP_BENCH_COUNT_SAMPLES=200000 \
+  mix run -e 'GroupBench.main(["member_counts"])'
+```
+
+This microbenchmark seeds the derived count index directly so it measures
+lookup behavior as that dynamic ETS table grows without requiring one million
+live BEAM processes. The normal join/leave and recovery scenarios measure the
+write and rebuild costs through real Group paths.
+
 ### Distributed benchmarks
 
 Uses 3 separate BEAM VMs (coordinator + 2 replicas) as OS processes:
@@ -112,7 +127,12 @@ Reports per-cycle latency percentiles.
 Same shape as register throughput but with `Group.join/4`. 10K processes each
 join a group concurrently, varying shard count.
 
-### 6. Monitor event delivery
+### 6. Join/leave cycle
+
+Sequential join + leave pairs on unique keys with two slash-prefixes. This
+quantifies the materialized counter write amplification on the public API path.
+
+### 7. Monitor event delivery
 
 Calls `Group.monitor(:bench, :all)`, then registers 5K keys and measures the
 time until all 5K `:registered` events are received by the monitoring process.

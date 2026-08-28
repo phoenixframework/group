@@ -93,6 +93,7 @@ Per shard:
 | `reg_claim_by_pid` | `{pid, cluster, key, origin, generation, epoch}` | claim reverse index |
 | `pg_by_key` | `{cluster, key, pid}` | visible PG membership |
 | `pg_by_pid` | `{pid, cluster, key}` | PG reverse index |
+| `pg_counts` | `{cluster, exact\|prefix, pattern}` | derived total/local PG cardinality |
 | `replica_stream_meta` | stream id | head, retained floor, journal position |
 | `replica_oplog` | `{stream, sequence}` | retained mutation record |
 | `replica_oplog_order` | append id | shard-wide pruning order |
@@ -107,6 +108,13 @@ writes. The shared replication metadata table uses
 `write_concurrency: :auto`: every shard atomically updates only its own
 `{:append_counter, shard}` object. Cross-shard arrival order has no semantic
 meaning; an append id exists only to bound that shard's oplog across streams.
+
+`pg_counts` is not replicated authority. It is maintained from actual
+`pg_by_key` row transitions, including exact snapshot installation and peer
+purges, and rebuilt alongside the reverse PG index on every shard start.
+Exact member counts are one ETS lookup; slash-prefix counts sum one lookup per
+shard. This preserves the existing eventually consistent read semantics while
+making query cost independent of resident membership cardinality.
 
 ## Authority and Stream Identity
 

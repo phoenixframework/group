@@ -102,6 +102,22 @@ defmodule Group.TestCluster do
   end
 
   @doc false
+  def insert_partial_pg_and_clear_counts(
+        name,
+        shard,
+        cluster,
+        key,
+        pid,
+        meta,
+        time,
+        origin
+      ) do
+    :ok = Group.Replica.Data.pg_insert(name, shard, cluster, key, pid, meta, time, origin)
+    true = :ets.delete_all_objects(Group.Replica.Data.pg_count_table(name, shard))
+    :ok
+  end
+
+  @doc false
   def spawn_trace_forwarder(node, target_pid) do
     :erpc.call(node, fn -> spawn(fn -> forward_trace_messages(target_pid) end) end)
   end
@@ -685,6 +701,7 @@ defmodule Group.TestCluster do
   Verifies:
   - reg_by_key ↔ reg_by_pid contain the same entries (across all shards)
   - pg_by_key ↔ pg_by_pid contain the same entries (across all shards)
+  - pg_counts exactly matches the total/local cardinalities derived from pg_by_key
   - cluster_nodes ↔ node_clusters contain the same pairs
 
   Raises on inconsistency with details about orphaned/missing entries.
@@ -745,6 +762,33 @@ defmodule Group.TestCluster do
         raise "ETS inconsistency in #{name} shard #{shard} (PG)!\n" <>
                 "  Orphaned in pg_by_pid (no matching by_key): #{inspect(orphaned)}\n" <>
                 "  Missing from pg_by_pid (in by_key only): #{inspect(missing)}"
+      end
+
+      expected_counts =
+        Enum.reduce(pg_key_set, %{}, fn {cluster, key, _pid, _meta, _time, origin}, counts ->
+          local_increment = if origin == node(), do: 1, else: 0
+
+          [
+            {:exact, key}
+            | Enum.map(Group.Replica.Data.prefix_patterns_for_key(key), &{:prefix, &1})
+          ]
+          |> Enum.reduce(counts, fn {kind, pattern}, inner ->
+            Map.update(inner, {cluster, kind, pattern}, {1, local_increment}, fn {total, local} ->
+              {total + 1, local + local_increment}
+            end)
+          end)
+        end)
+
+      actual_counts =
+        name
+        |> Group.Replica.Data.pg_count_table(shard)
+        |> :ets.tab2list()
+        |> Map.new(fn {count_key, total, local} -> {count_key, {total, local}} end)
+
+      if expected_counts != actual_counts do
+        raise "ETS inconsistency in #{name} shard #{shard} (PG counts)!\n" <>
+                "  Expected: #{inspect(expected_counts)}\n" <>
+                "  Actual: #{inspect(actual_counts)}"
       end
     end
 

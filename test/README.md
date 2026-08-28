@@ -24,7 +24,7 @@ nightly and release qualification rather than individual edits.
 
 | File | What it tests |
 |------|---------------|
-| `group_test.exs` | Single-node: register/unregister, join/leave, members, monitor/demonitor, named clusters, concurrent operations |
+| `group_test.exs` | Single-node: register/unregister, join/leave, materialized exact/prefix counts, restart rebuild and journal-replay crash boundaries, monitors, named clusters, and concurrent operations |
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts, and adversarial replica-transport loss/busy/snapshot recovery |
 | `anti_entropy_fault_regression_test.exs` | Three-node regressions for hidden-winner projection, receiver restart eviction, nodedown/lease lane retirement, authority gaps and cross-lane races, in-flight conflict fencing, crash-journal replay, cursorless/interrupted snapshot repair, malformed ingress, and sideband rediscovery |
 | `replica_adversarial_test.exs` | Reproducible three-node mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
@@ -39,8 +39,9 @@ The controlled transport queues each replica message so generated commands can
 deliver, duplicate, drop, reorder, or strand it. After the bounded-fault
 prefix, the test enables fair delivery and compares every tracked registry and
 PG key against an independent application-level lifecycle oracle. It also
-requires internal replica indexes to be consistent, every retained owner to be
-alive, and registry conflict losers to be dead. Restart, pruning, and named
+requires internal replica indexes—including PG count projections—to be
+consistent, every retained owner to be alive, and registry conflict losers to
+be dead. Restart, pruning, and named
 cluster histories retain independent C-owned state while A recovers, so repair
 cannot pass merely by making one origin and one receiver agree. Model groups
 use a deliberately tiny snapshot target so pruning recovery traverses the real
