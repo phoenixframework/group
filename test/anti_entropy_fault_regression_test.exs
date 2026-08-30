@@ -1018,6 +1018,146 @@ defmodule Group.AntiEntropyFaultRegressionTest do
     end
   end
 
+  test "sideband reconnect replaces a potentially blackholed writer", context do
+    name = unique_name(:sideband_reconnect)
+
+    opts = [
+      name: name,
+      shards: 2,
+      replica_transport:
+        {Group.TestTCPTransport,
+         [connect_timeout: 250, send_timeout: 250, reconnect_interval: 10]},
+      replicated_anti_entropy_interval: 25,
+      replicated_peer_lease_timeout: 1_000
+    ]
+
+    start_group_on_peers(context.peers, opts)
+
+    TestCluster.assert_eventually(fn ->
+      TestCluster.rpc!(context.node_b, Group.TestTCPTransport, :connected?, [
+        name,
+        context.node_a
+      ])
+    end)
+
+    manager = :"#{name}_replica_tcp_transport"
+
+    old_writer =
+      TestCluster.rpc!(context.node_b, :sys, :get_state, [manager]).writers[context.node_a]
+
+    :ok =
+      TestCluster.rpc!(context.node_b, Group.TestTCPTransport, :reconnect_peer, [
+        name,
+        context.node_a
+      ])
+
+    TestCluster.assert_eventually(fn ->
+      state = TestCluster.rpc!(context.node_b, :sys, :get_state, [manager])
+      writer = state.writers[context.node_a]
+
+      is_pid(writer) and writer != old_writer and
+        TestCluster.rpc!(context.node_b, Group.TestTCPTransport, :connected?, [
+          name,
+          context.node_a
+        ])
+    end)
+  end
+
+  test "sideband snapshot repair retires a partitioned registry conflict loser", context do
+    name = unique_name(:sideband_snapshot_conflict)
+    nodes = [context.node_a, context.node_b, context.node_c]
+    shards = 4
+
+    opts = [
+      name: name,
+      shards: shards,
+      replica_transport:
+        {Group.TestTCPTransport,
+         [
+           max_queue: 32,
+           connect_timeout: 100,
+           send_timeout: 100,
+           reconnect_interval: 10,
+           outbox_batch_size: 16,
+           outbox_batch_bytes: 65_536,
+           outbox_flush_interval: 1,
+           outbox_deadline: 100
+         ]},
+      resolve_registry_conflict: {Group.ModelConflictResolver, :resolve, []},
+      replicated_sender_buffer_size: 1,
+      replicated_anti_entropy_interval: 25,
+      replicated_peer_lease_timeout: 750,
+      replicated_oplog_max_entries: 2,
+      replicated_snapshot_chunk_target_bytes: 1_024
+    ]
+
+    start_group_on_peers(context.peers, opts)
+
+    TestCluster.assert_eventually(
+      fn ->
+        Enum.all?(nodes, fn source ->
+          Enum.all?(nodes -- [source], fn target ->
+            TestCluster.rpc!(source, Group.TestTCPTransport, :connected?, [name, target])
+          end)
+        end)
+      end,
+      timeout: 10_000
+    )
+
+    for source <- nodes, target <- nodes -- [source] do
+      :ok =
+        TestCluster.rpc!(source, Group.TestTCPTransport, :disconnect_peer, [name, target])
+    end
+
+    key = "sideband/snapshot-conflict"
+    shard = Group.Replica.shard_index_for(nil, key, shards)
+    loser = TestCluster.spawn_register(context.node_b, name, key, %{rank: 1})
+
+    # Restarting the uninvolved third replica while the sideband is unavailable
+    # reproduces the authority and route churn from the live Jepsen history.
+    supervisor = TestCluster.rpc!(context.node_a, Process, :whereis, [:"#{name}_group_sup"])
+    :ok = TestCluster.rpc!(context.node_a, Supervisor, :stop, [supervisor, :normal, 5_000])
+    {:ok, _pid} = TestCluster.start_group(context.node_a, opts)
+
+    winner = TestCluster.spawn_register(context.node_c, name, key, %{rank: 2})
+
+    # Prune the winning registration from the retained oplog so n2 must learn
+    # it through the exact snapshot fallback rather than a convenient delta.
+    churn_keys =
+      Stream.iterate(0, &(&1 + 1))
+      |> Stream.map(&"sideband/snapshot-conflict/churn/#{&1}")
+      |> Stream.filter(&(Group.Replica.shard_index_for(nil, &1, shards) == shard))
+      |> Enum.take(4)
+
+    Enum.each(churn_keys, fn churn_key ->
+      churn = TestCluster.spawn_register(context.node_c, name, churn_key, %{rank: 0})
+      true = TestCluster.rpc!(context.node_c, Process, :exit, [churn, :kill])
+    end)
+
+    TestCluster.flush_shards(context.node_c, name)
+
+    for source <- nodes, target <- nodes -- [source] do
+      :ok = TestCluster.rpc!(source, Group.TestTCPTransport, :reconnect_peer, [name, target])
+    end
+
+    TestCluster.assert_eventually(
+      fn ->
+        Enum.all?(nodes, fn node ->
+          match?(
+            {^winner, %{rank: 2}},
+            TestCluster.rpc!(node, Group, :lookup, [name, key])
+          )
+        end) and not TestCluster.rpc!(context.node_b, Process, :alive?, [loser])
+      end,
+      timeout: 15_000,
+      interval: 25
+    )
+
+    for node <- nodes do
+      assert :ok = TestCluster.rpc!(node, TestCluster, :assert_replica_consistent, [name])
+    end
+  end
+
   test "three-origin conflict resolution cannot retire every owner", context do
     name = unique_name(:three_origin_conflict)
     key = "three-origin/conflict"

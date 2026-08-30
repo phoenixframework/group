@@ -18,7 +18,7 @@ run_jepsen() {
   local status=0
 
   set +e
-  "${script_dir}/run.sh" test \
+  timeout --signal=TERM --kill-after=30 180 "${script_dir}/run.sh" test \
     --no-ssh \
     --nodes n1,n2,n3 \
     --concurrency 2n \
@@ -48,5 +48,7 @@ run_jepsen pass none
 run_jepsen fail unexpected-death
 run_jepsen fail internal-index
 run_jepsen fail cursor-marker
+run_jepsen fail registry-projection
+run_jepsen fail terminal-unavailable
 
 echo "mutation and live checker qualification passed"

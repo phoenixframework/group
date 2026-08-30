@@ -228,7 +228,13 @@ defmodule Group.TestTCPTransport do
 
   def handle_call({:enable_peer, remote_node}, _from, state) do
     state = %{state | disabled: MapSet.delete(state.disabled, remote_node)}
-    {:reply, :ok, ensure_writer(state, remote_node)}
+
+    # A writer can remain alive on a socket whose TCP retransmission timer was
+    # driven into a long backoff by a network blackhole. Healing the network
+    # does not make that route promptly usable, and ensure_writer/2 would treat
+    # the live PID as sufficient. An explicit reconnect is a recovery barrier:
+    # discard any old writer/socket and establish a fresh route.
+    {:reply, :ok, state |> drop_writer(remote_node) |> ensure_writer(remote_node)}
   end
 
   def handle_call(:status, _from, state) do

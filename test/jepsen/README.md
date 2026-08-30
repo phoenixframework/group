@@ -23,7 +23,9 @@ The replica lane is selectable without changing the workload or checker:
 
 - `distribution` delegates to Group's production Erlang-distribution adapter;
 - `tcp` uses Group's hidden test-only TCP adapter while Erlang distribution
-  remains the control plane; and
+  remains the control plane; healing a replica-port blackhole replaces each
+  writer/socket so TCP retransmission backoff cannot outlive the bounded fault;
+  and
 - `chaos` is a local per-shard outbox which deterministically drops,
   duplicates, delays, and reorders replica messages.
 
@@ -112,7 +114,11 @@ test/jepsen/qualify.sh
 
 This runs every mutation defined by `test/mutation/run.exs`, then verifies that
 a healthy live history is accepted and deliberately injected owner-death,
-internal-index, and stranded snapshot-cursor corruption are rejected.
+internal-index, stranded snapshot-cursor, registry claim/projection, and
+unavailable-terminal-node corruption are rejected. Terminal reconnect and
+snapshot retries are paced and bounded by the configured recovery time, so a
+node that cannot recover yields a finite invalid history instead of an
+unbounded qualification run.
 
 Results and histories are written below `test/jepsen/store/`. Containers are
 removed after a run. Set `GROUP_JEPSEN_KEEP_CONTAINERS=1` to retain them and

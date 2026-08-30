@@ -1036,8 +1036,34 @@ defmodule Group.Jepsen.Invariant do
 
       if invalid_origin, do: raise("claim with invalid PID origin #{inspect(invalid_origin)}")
 
-      authority =
-        MapSet.new(by_key, fn {cluster, key, pid, meta, time, origin, _gen, _epoch, _seq} ->
+      stale_claim =
+        Enum.find(by_key, fn
+          {cluster, _key, _pid, _meta, _time, origin, generation, epoch, _seq} ->
+            not current_registry_claim?(shard, cluster, origin, generation, epoch)
+        end)
+
+      if stale_claim, do: raise("claim outside current authority #{inspect(stale_claim)}")
+
+      expected =
+        by_key
+        |> Enum.group_by(fn {cluster, key, _pid, _meta, _time, _origin, _gen, _epoch, _seq} ->
+          {cluster, key}
+        end)
+        |> MapSet.new(fn {{cluster, key}, claims} ->
+          {^cluster, ^key, pid, meta, time, origin, _generation, _epoch, _seq} =
+            Enum.max_by(claims, fn
+              {^cluster, ^key, claim_pid, claim_meta, claim_time, _origin, _generation, _epoch,
+               _seq} ->
+                {
+                  Group.Jepsen.ConflictResolver.resolve(
+                    :jepsen_group,
+                    key,
+                    {claim_pid, claim_meta, claim_time}
+                  ),
+                  claim_pid
+                }
+            end)
+
           {cluster, key, pid, meta, time, origin}
         end)
 
@@ -1048,11 +1074,28 @@ defmodule Group.Jepsen.Invariant do
           {cluster, key, pid, meta, time, origin}
         end)
 
-      missing = MapSet.difference(visible, authority)
-
-      if MapSet.size(missing) > 0,
-        do: raise("visible registry rows lack claims #{inspect(missing)}")
+      assert_equal!(expected, visible, "registry projection shard #{shard}")
     end)
+  end
+
+  defp current_registry_claim?(shard, cluster, origin, generation, epoch) do
+    if origin == node() do
+      generation == Data.generation(:jepsen_group) and
+        epoch == Data.local_cluster_epoch(:jepsen_group, cluster)
+    else
+      known_generation = Data.remote_generation(:jepsen_group, origin)
+      observed_revision = Data.remote_cluster_epoch_observed_revision(:jepsen_group, origin)
+
+      generation == known_generation and
+        epoch == Data.remote_cluster_epoch(:jepsen_group, origin, cluster) and
+        Data.remote_replica_authority_hint(:jepsen_group, origin) ==
+          {known_generation, observed_revision} and
+        Data.remote_cluster_epoch_revision(:jepsen_group, origin) == observed_revision and
+        Data.remote_view_generation(:jepsen_group, shard, origin) == known_generation and
+        Data.remote_view_cluster_epoch_revision(:jepsen_group, shard, origin) ==
+          Data.remote_cluster_epoch_exact_revision(:jepsen_group, origin) and
+        Data.remote_view_observed_revision(:jepsen_group, shard, origin) == observed_revision
+    end
   end
 
   defp assert_oplogs do
@@ -1402,6 +1445,48 @@ defmodule Group.Jepsen.Wire do
   defp corrupt("cursor-marker") do
     File.write!("/tmp/group-jepsen-cursor-marker-corruption", "enabled\n")
     %{status: :ok}
+  end
+
+  defp corrupt("registry-projection") do
+    config = Group.get_config(:jepsen_group)
+
+    corrupted =
+      Enum.find_value(0..(config.num_shards - 1), fn shard ->
+        by_key = Group.Replica.Data.reg_claim_by_key_table(:jepsen_group, shard)
+
+        Enum.find_value(:ets.tab2list(by_key), fn
+          {{cluster, key, origin, generation, epoch}, pid, %{revision: revision} = meta, time,
+           seq} = claim ->
+            case Group.Replica.Data.registry_lookup(:jepsen_group, shard, cluster, key) do
+              {^pid, ^meta, ^time, ^origin} ->
+                changed_meta = %{meta | revision: revision + 1}
+
+                :ets.insert(
+                  by_key,
+                  {{cluster, key, origin, generation, epoch}, pid, changed_meta, time, seq}
+                )
+
+                :ets.insert(
+                  Group.Replica.Data.reg_claim_by_pid_table(:jepsen_group, shard),
+                  {{pid, cluster, key, origin, generation, epoch}, changed_meta, time, seq}
+                )
+
+                claim
+
+              _other_projection ->
+                nil
+            end
+
+          _other_claim ->
+            nil
+        end)
+      end)
+
+    if corrupted do
+      %{status: :ok}
+    else
+      %{status: :fail, error: "no visible registry claim available for corruption"}
+    end
   end
 
   defp corrupt(other), do: %{status: :fail, error: "unknown corruption #{inspect(other)}"}

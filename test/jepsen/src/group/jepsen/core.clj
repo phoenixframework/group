@@ -89,7 +89,10 @@
       (gen/each-thread
         (if permanent?
           (gen/once read)
-          (gen/until-ok (repeat read)))))))
+          (->> (repeat read)
+               (gen/stagger 0.1)
+               gen/until-ok
+               (gen/time-limit (:recovery-time opts))))))))
 
 (defn recovery-connect-round [opts]
   ;; A dead node can reject connections immediately. An unpaced until-ok loop
@@ -119,7 +122,13 @@
             (gen/nemesis {:type :info, :f :retire-node, :value {:node :n1}})
             (gen/sleep (:recovery-time opts)))
 
-      (not= :none corruption)
+      (= :terminal-unavailable corruption)
+      (conj (gen/log "Making one required terminal node unavailable")
+            (gen/nemesis {:type :info,
+                          :f :retire-node,
+                          :value {:node (first (:terminal-nodes opts))}}))
+
+      (and (not= :none corruption) (not= :terminal-unavailable corruption))
       (conj (gen/log "Injecting a checker-qualification corruption")
             (gen/clients
               (gen/once
@@ -186,7 +195,9 @@
     :validate [#{"mixed" "permanent"} "Unsupported scenario"]]
    [nil "--corruption MODE" "Checker qualification corruption mode"
     :default "none"
-    :validate [#{"none" "unexpected-death" "internal-index" "cursor-marker"}
+    :validate [#{"none" "unexpected-death" "internal-index" "cursor-marker"
+                 "registry-projection"
+                 "terminal-unavailable"}
                "Unsupported corruption"]]
    [nil "--max-operation-latency-ms MILLIS" "Maximum acknowledged Group call latency"
     :default 2000
