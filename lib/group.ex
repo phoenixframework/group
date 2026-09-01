@@ -708,25 +708,6 @@ defmodule Group do
     Replica.local_request(shard, {:leave, cluster, epoch, group, self()}, call_timeout(opts))
   end
 
-  @doc """
-  Leaves a group without waiting for the local shard to apply the mutation.
-
-  The local shard preserves mailbox ordering and replicates the leave normally.
-  Use this when the caller already provides the serialization needed to stop
-  new work and waiting for membership propagation would block a hot path.
-  """
-  def leave_async(name, group, opts \\ [])
-
-  def leave_async(name, group, opts)
-      when is_atom(name) and is_binary(group) and is_list(opts) do
-    validate_key!(group)
-    cluster = Keyword.get(opts, :cluster)
-    epoch = validate_cluster_connected!(name, cluster)
-    shard = Replica.shard_for(name, cluster, group)
-
-    Replica.local_cast(shard, {:leave, cluster, epoch, group, self()})
-  end
-
   # ===========================================================================
   # Queries
   # ===========================================================================

@@ -160,26 +160,6 @@ defmodule GroupTest do
       assert Group.members(name, key) == []
     end
 
-    test "leave_async removes the caller without waiting for the shard", %{name: name} do
-      key = "async-leave"
-      :ok = Group.join(name, key)
-      assert Group.member_count(name, key) == 1
-
-      shard = Group.Replica.shard_for(name, nil, key)
-      :ok = :sys.suspend(shard)
-
-      try do
-        started_at = System.monotonic_time(:millisecond)
-        assert :ok = Group.leave_async(name, key)
-        assert System.monotonic_time(:millisecond) - started_at < 100
-      after
-        :ok = :sys.resume(shard)
-      end
-
-      wait_until(fn -> Group.member_count(name, key) == 0 end)
-      assert Group.member_count(name, key) == 0
-    end
-
     test "process death triggers automatic :left event", %{name: name} do
       key = "chat/room/#{System.unique_integer([:positive])}"
 
