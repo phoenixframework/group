@@ -10,15 +10,18 @@ defmodule Group do
 
   ## Consistency Model
 
-  All operations are **eventually consistent**. The built-in replication layer uses
-  Erlang distribution to propagate state across nodes, which means:
+  All operations are **eventually consistent**. Erlang distribution remains
+  the membership/control plane; replica state uses a configurable nonblocking
+  transport with sequenced anti-entropy streams. This means:
 
   - Writes (register, join, etc.) return immediately after local update
-  - Other nodes receive updates asynchronously via Erlang distribution
+  - Other nodes receive updates asynchronously over the replica transport
   - During network partitions, nodes may have divergent views
-  - When partitions heal, conflicts are resolved. The built-in resolver kills
-    the losing process with `{:group_registry_conflict, key, winner_meta}`;
-    custom resolvers control any process exits themselves
+  - When connectivity heals, stream gaps are repaired from a bounded oplog or
+    an exact per-origin snapshot; dropped replica sends are therefore safe
+  - Registry conflicts resolve deterministically. Each losing origin records an
+    authoritative delete and terminates only its own local process with
+    `{:group_registry_conflict, key, winner_meta}`
 
   ## Clusters
 
@@ -169,6 +172,15 @@ defmodule Group do
 
   - **Memberships** are stored in replicated, sharded ETS indexes and are
     automatically cleaned up when member processes die.
+
+  - **Process ownership is local**: a shard monitors and exits only processes
+    owned by its own node. Remote lifecycle changes arrive as sequenced replica
+    records or are removed by `nodedown`/peer-lease expiry.
+
+  - **Replica recovery is bounded and leaderless**: per-origin sequence gaps use
+    retained deltas and then exact origin-slice snapshots after oplog pruning.
+    Persisted generation/revision hints fence every lane across authority races;
+    only an exact dist-Erlang hello can reintroduce a fully retired peer.
   """
 
   alias Group.Replica
@@ -193,12 +205,14 @@ defmodule Group do
     replication messages. `false` disables routine info/verbose logs; registry
     conflicts and busy distribution links still emit error/warning logs.
   - `:resolve_registry_conflict` — `{module, function, extra_args}` callback invoked when
-    two nodes hold the same registry key (partition heal or concurrent registration).
-    Called as `apply(module, function, [name, key, {pid1, meta1, time1}, {pid2, meta2, time2} | extra_args])`.
-    Must return the winner pid and is responsible for any process exits it requires. When
-    no callback is configured, the built-in resolver kills the loser with
-    `{:group_registry_conflict, key, winner_meta}`. **Important:** This callback runs
-    synchronously inside the shard GenServer — it must
+    multiple origins hold the same registry key after partition healing or concurrent
+    registration. Called once per claim as
+    `apply(module, function, [name, key, {pid, meta, time} | extra_args])` and must
+    return a deterministic Erlang term used as that claim's rank. Group chooses the
+    maximum `{rank, pid}` so every node obtains the same winner regardless of claim
+    arrival or grouping. It records an authoritative delete and terminates a losing
+    process only on its owner node.
+    **Important:** This callback runs synchronously inside the shard GenServer — it must
     return quickly and never block. Any information needed for the decision should be
     carried in the registration metadata, not fetched at resolution time.
   - `:extract_meta` — `{module, function, args}` or a one-argument function to
@@ -218,13 +232,32 @@ defmodule Group do
     buffer replicated outbound ops before flushing during idle periods. Sender
     buffers also flush on size, overdue enqueue, and control/routing barriers
     (default: `5`)
-  - `:busy_dist_retry_attempts` — max reconnect attempts after a shard hits
-    `send_nosuspend == false` to a remote node and forces a disconnect
+  - `:busy_dist_retry_attempts` — max reconnect attempts after a remote
+    `Group.dispatch/4` send reports a busy dist link and forces a disconnect
     (default: `300`)
-  - `:busy_dist_retry_interval` — interval in milliseconds between reconnect
-    attempts after a busy-dist disconnect (default: `1_000`)
-  - `:replicated_pg_receiver_local_request_quota` — max queued local PG shard requests
-    drained after each replicated PG flush before yielding (default: `8`)
+  - `:busy_dist_retry_interval` — interval in milliseconds between dispatch
+    busy-link reconnect attempts (default: `1_000`)
+  - `:replicated_pg_receiver_local_request_quota` — legacy-named quota for queued
+    local shard requests drained in each fairness turn, including while replica
+    data or cluster controls are busy (default: `8`)
+  - `:replica_transport` — replica data transport module or `{module, opts}` tuple.
+    Defaults to `Group.Transport.DistErl`. The transport must be
+    nonblocking and may return `:busy`; anti-entropy repairs dropped messages.
+    Sideband transports can use `Group.Transport.Outbox` for lossy,
+    batched, per-shard isolation without adding a hop to the default transport.
+  - `:replicated_oplog_max_entries` — maximum retained replica records per shard
+    before old prefixes are pruned and lagging peers require a snapshot
+    (default: `65_536`)
+  - `:replicated_snapshot_chunk_target_bytes` — target maximum encoded size of
+    each transport-neutral exact-snapshot chunk (default: `1_048_576`). A
+    single registry or membership row larger than the target remains one chunk;
+    a separate small terminal manifest commits the complete candidate.
+  - `:replicated_anti_entropy_interval` — milliseconds between repeated stream
+    head advertisements (default: `1_000`)
+  - `:replicated_peer_lease_timeout` — milliseconds without a dist-Erlang
+    replica heartbeat before remote Group state is purged (default: `15_000`).
+    Must be greater than `:replicated_anti_entropy_interval`. Discovery probes
+    an expired peer so a restarted Group can recover automatically.
   """
   def child_spec(opts) do
     name = Keyword.fetch!(opts, :name)
@@ -232,6 +265,26 @@ defmodule Group do
   end
 
   def start_link(opts), do: Group.Supervisor.start_link(opts)
+
+  @doc """
+  Monitors the process that owns the local Group membership generation.
+
+  All local registry and process-group entries are stored in ETS tables owned
+  by this process. If it exits, those entries no longer exist even when their
+  owner processes remain alive. Long-lived owners can use this monitor to
+  terminate and re-register against the next Group generation.
+
+  A generation that exits between lookup and monitor creation still produces
+  the normal immediate `:DOWN` message for the returned monitor reference.
+
+  Returns `{:ok, pid, monitor_ref}` or `{:error, :not_running}`.
+  """
+  def monitor_generation(name) when is_atom(name) do
+    case GenServer.whereis(Data.data_name(name)) do
+      pid when is_pid(pid) -> {:ok, pid, Process.monitor(pid)}
+      nil -> {:error, :not_running}
+    end
+  end
 
   # ===========================================================================
   # Cluster Management (Node <-> Cluster)
@@ -419,10 +472,14 @@ defmodule Group do
       when is_atom(name) and is_binary(key) and is_map(meta) and is_list(opts) do
     validate_key!(key)
     cluster = Keyword.get(opts, :cluster)
-    validate_cluster_connected!(name, cluster)
+    epoch = validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, key)
 
-    Replica.local_request(shard, {:register, cluster, key, self(), meta}, call_timeout(opts))
+    Replica.local_request(
+      shard,
+      {:register, cluster, epoch, key, self(), meta},
+      call_timeout(opts)
+    )
   end
 
   @doc """
@@ -453,10 +510,10 @@ defmodule Group do
       when is_atom(name) and is_binary(key) and is_list(opts) do
     validate_key!(key)
     cluster = Keyword.get(opts, :cluster)
-    validate_cluster_connected!(name, cluster)
+    epoch = validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, key)
 
-    Replica.local_request(shard, {:unregister, cluster, key}, call_timeout(opts))
+    Replica.local_request(shard, {:unregister, cluster, epoch, key}, call_timeout(opts))
   end
 
   @doc """
@@ -610,10 +667,14 @@ defmodule Group do
              is_list(opts) do
     validate_key!(group)
     cluster = Keyword.get(opts, :cluster)
-    validate_cluster_connected!(name, cluster)
+    epoch = validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, group)
 
-    Replica.local_request(shard, {:join, cluster, group, self(), meta}, call_timeout(opts))
+    Replica.local_request(
+      shard,
+      {:join, cluster, epoch, group, self(), meta},
+      call_timeout(opts)
+    )
   end
 
   @doc """
@@ -641,10 +702,10 @@ defmodule Group do
       when is_atom(name) and is_binary(group) and is_list(opts) do
     validate_key!(group)
     cluster = Keyword.get(opts, :cluster)
-    validate_cluster_connected!(name, cluster)
+    epoch = validate_cluster_connected!(name, cluster)
     shard = Replica.shard_for(name, cluster, group)
 
-    Replica.local_request(shard, {:leave, cluster, group, self()}, call_timeout(opts))
+    Replica.local_request(shard, {:leave, cluster, epoch, group, self()}, call_timeout(opts))
   end
 
   # ===========================================================================
@@ -816,6 +877,10 @@ defmodule Group do
   Supports prefix matching: if `group` ends with `"/"`, counts all
   members whose group key starts with that prefix.
 
+  Exact counts perform one ETS lookup in the key's owning shard. Prefix
+  counts perform one ETS lookup per configured shard; neither path scans
+  resident memberships.
+
   ## Parameters
 
   - `name` - The Group name
@@ -850,6 +915,10 @@ defmodule Group do
 
   Supports prefix matching: if `group` ends with `"/"`, counts all local
   members whose group key starts with that prefix.
+
+  Exact counts perform one ETS lookup in the key's owning shard. Prefix
+  counts perform one ETS lookup per configured shard; neither path scans
+  resident memberships.
 
   ## Parameters
 
@@ -1074,13 +1143,14 @@ defmodule Group do
   @doc false
   def connect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
-    Data.add_cluster_node(name, clusters, node())
+    timeout = Data.await_closed_local_clusters(name, clusters, timeout)
+    epochs = Data.activate_local_clusters_durable(name, clusters)
 
     notify_shard = :rand.uniform(get_config(name).num_shards) - 1
 
     Replica.local_request(
       Replica.shard_name(name, notify_shard),
-      {:cluster_connect, clusters},
+      {:cluster_connect, clusters, epochs},
       timeout
     )
   end
@@ -1088,17 +1158,9 @@ defmodule Group do
   @doc false
   def disconnect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
-    Data.remove_cluster_node(name, clusters, node())
-
-    num_shards = get_config(name).num_shards
-
-    shard_names = for i <- 0..(num_shards - 1), do: Replica.shard_name(name, i)
-
-    Replica.local_request_all(
-      shard_names,
-      {:cluster_disconnect, clusters},
-      timeout
-    )
+    _epochs = Data.deactivate_local_clusters_durable(name, clusters)
+    _remaining_timeout = Data.await_closed_local_clusters(name, clusters, timeout)
+    :ok
   end
 
   # ===========================================================================
@@ -1170,12 +1232,16 @@ defmodule Group do
     |> List.flatten()
   end
 
-  defp validate_cluster_connected!(_name, nil), do: :ok
+  defp validate_cluster_connected!(name, nil), do: Data.generation(name)
 
   defp validate_cluster_connected!(name, cluster) do
-    unless node() in Data.cluster_nodes(name, cluster) do
-      raise ArgumentError,
-            "not connected to cluster #{inspect(cluster)}. Call Group.connect(#{inspect(name)}, #{inspect(cluster)}) first"
+    case Data.local_cluster_epoch(name, cluster) do
+      nil ->
+        raise ArgumentError,
+              "not connected to cluster #{inspect(cluster)}. Call Group.connect(#{inspect(name)}, #{inspect(cluster)}) first"
+
+      epoch ->
+        epoch
     end
   end
 

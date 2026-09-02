@@ -17,6 +17,6 @@ defmodule GroupBench.MixProject do
   end
 
   defp deps do
-    [{:group, path: "../../"}]
+    [{:group, path: System.get_env("GROUP_BENCH_GROUP_PATH", "../../")}]
   end
 end

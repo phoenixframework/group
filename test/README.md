@@ -3,17 +3,77 @@
 ## Running tests
 
 ```bash
-mix test                           # all tests
+mix test                           # every-PR ExUnit/property/chaos/checker gate
+mix test.soak                      # nightly six-profile Jepsen campaign
 mix test test/group_test.exs       # local only
 mix test test/distributed_test.exs # distributed only
+mix test test/replica_adversarial_test.exs # seeded transport chaos
+mix test test/replica_model_property_test.exs # shrinkable model-based histories
+test/jepsen/run.sh                 # one OS-partition/restart Jepsen model test
 ```
+
+`mix test` preserves normal Mix test arguments while always running the pure
+Jepsen lifecycle-checker qualification after ExUnit. It does not require
+Docker. `mix test.soak` first runs that complete PR gate, kills every defined
+protocol mutant, runs live positive/negative checker qualification, and then
+runs the distribution/TCP/chaos × mixed/permanent Jepsen campaign. The soak
+defaults to 20 five-minute fault histories per combination and is intended for
+nightly and release qualification rather than individual edits.
 
 ## Test files
 
 | File | What it tests |
 |------|---------------|
-| `group_test.exs` | Single-node: register/unregister, join/leave, members, monitor/demonitor, named clusters, concurrent operations |
-| `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts |
+| `group_test.exs` | Single-node: register/unregister, join/leave, materialized exact/prefix counts, restart rebuild and journal-replay crash boundaries, monitors, named clusters, and concurrent operations |
+| `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts, and adversarial replica-transport loss/busy/snapshot recovery |
+| `anti_entropy_fault_regression_test.exs` | Three-node regressions for hidden-winner projection, receiver restart eviction, nodedown/lease lane retirement, authority gaps and cross-lane races, in-flight conflict fencing, crash-journal replay, cursorless/interrupted snapshot repair, malformed ingress, and sideband rediscovery |
+| `replica_adversarial_test.exs` | Reproducible three-node mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
+| `replica_model_property_test.exs` | StreamData-generated and shrunk owner histories against an independent lifecycle oracle and scheduler-controlled replica transport |
+| `replica_snapshot_test.exs` | Pure single-pass byte-bounded streaming, suffix resume, receive staging, and event batching |
+| `replica_snapshot_distributed_test.exs` | Real-node provisional-chunk/terminal-commit loss, reorder, duplicate, conflicting retransmission/manifest, concurrent-source invalidation, supersession, authority fencing, expiry, pooled staging, and shard-crash recovery |
+
+## Model-based and formal checks
+
+`replica_model_property_test.exs` runs real Group instances on three peer VMs.
+The controlled transport queues each replica message so generated commands can
+deliver, duplicate, drop, reorder, or strand it. After the bounded-fault
+prefix, the test enables fair delivery and compares every tracked registry and
+PG key against an independent application-level lifecycle oracle. It also
+requires internal replica indexes—including PG count projections—to be
+consistent, every retained owner to be alive, and registry conflict losers to
+be dead. Restart, pruning, and named
+cluster histories retain independent C-owned state while A recovers, so repair
+cannot pass merely by making one origin and one receiver agree. Model groups
+use a deliberately tiny snapshot target so pruning recovery traverses the real
+multi-chunk assembly path.
+
+StreamData reports the ExUnit seed and shrinks a failure to its smallest command
+history. Local defaults are intentionally quick. Increase the budgets without
+changing the generator:
+
+```bash
+GROUP_MODEL_RUNS=1000 GROUP_MODEL_COMMANDS=100 \
+  mix test test/replica_model_property_test.exs
+```
+
+The independent TLA+ model and TLC configuration live in `test/formal/`.
+See [`formal/README.md`](formal/README.md) for its checked invariants, finite
+model bounds, and run command.
+
+The Docker-backed Jepsen harness lives in [`jepsen/`](jepsen/). It drives
+three independent BEAM containers through concurrent, multi-entry owner
+lifecycles, named-cluster epoch churn, directed/full partitions, transport
+session resets, and VM restarts. The same workload runs over distribution,
+a test-only real sideband TCP lane, and a lossy/duplicating/reordering
+transport. After healing,
+its independent oracle checks exact public views and the internal registry,
+PG, claim, cluster, cursor, oplog, snapshot-staging, and retired-origin
+invariants. Its permanent-retirement scenario proves eviction even when a peer
+never returns. `test/jepsen/campaign.sh` runs the full profile/scenario matrix;
+`test/jepsen/qualify.sh` mutation-tests the implementation and proves that the
+live checker rejects injected faults. Chaos/mixed uses a larger repair window
+and is invalid unless it observes a multi-record delta run; the other profiles
+retain the one-record stress configuration.
 
 ## How distribution works
 
@@ -191,8 +251,93 @@ TestCluster.start_group(
 )
 ```
 
-The resolver uses "most recent wins" — keeps the registration with the higher
-timestamp.
+The resolver ranks each claim by timestamp. Group chooses the maximum
+`{rank, pid}`, so every peer reaches the same winner regardless of claim arrival
+order.
+
+### Replica transport fault injection
+
+`Group.TestReplicaTransport` implements the production transport behaviour but
+can return `:busy`, drop selected message types, duplicate or delay messages,
+and capture messages for explicit stale-generation/epoch replay. Its
+`{:chaos, opts}` mode is deterministic for a given message, which makes failures
+reproducible.
+
+`Group.ControlledReplicaTransport` is the model-test transport. It queues messages
+at the test process without scheduling timers; `Group.ReplicaModelScheduler`
+then owns the exact delivery schedule. These roles are separate so the existing
+timing-oriented regressions retain their original mechanics while property
+failures can be replayed and shrunk exactly.
+
+The distributed anti-entropy tests cover dropped creates and deletes, cursor
+gaps, globally pruned multi-stream oplogs, exact snapshot fallback, malformed
+authority, stale message replay, lease expiry on a live VM, and multi-shard
+generation recovery. They also restart a suspended data lane after deliberately
+losing its cluster-close fence and require the lane to sweep the stale registry
+and PG slices from shared authority. Authority topology tests suspend every
+receiver shard and inspect the queued protocol: only shard 0 may receive/install
+the full epoch snapshot, nonzero shards receive constant-size lane hellos, and
+incremental controls arriving on any lane are serialized through shard 0.
+Separate tests suspend a
+backlogged authority shard while other replica lanes continue converging and
+deliver data before authority to prove rejection does not advance the cursor
+and the same message applies after authority repair. Concurrent snapshot tests
+require every advertised revision to contain exactly that many unique named
+epochs, and heartbeat tests prove observed revisions cannot advance the exact
+authority marker. Crash-window tests interrupt journal, dual-index, receive
+cursor, and named-cluster close updates, then require startup repair to remove
+every invisible row and temporary close barrier. A three-node test-only TCP test
+disconnects one origin's real socket, prunes its oplog, reconnects it, and
+requires snapshot recovery without changing the third node's independent
+registry or PG state.
+
+Authority races also replace authority while conflict resolution is paused,
+remove the local shard-zero owner, and deliver `nodedown` while a sibling lane
+is suspended. The assertions require that stale remote winners cannot terminate
+local owners, that retained conflict claims are reprojected after an authority
+gap closes even when their stream cursor is already current, and that each lane
+keeps its own restart breadcrumb until its rows and cursor are gone.
+The same conflict-gap schedule is held open until lease expiry to prove a source
+that never returns leaves no deferred projection key, claim, cursor, or visible
+remote winner behind. A separate nodedown regression proves the immediate
+retirement path cannot strand that deferred state after removing its lease.
+Newer-generation and same-generation heartbeat schedules assert the persisted
+hint fences every lane before exact repair, rejects delayed exact/incremental
+authority, and reconstructs its retirement deadline after a lane crash. Once
+the peer is fully retired, replayed heartbeats and lane hellos must create no
+hint, lease, or outbound route. A separate compare-and-install regression races
+a newer hint across an older incremental control and requires no epoch row or
+lane view to become authoritative.
+The inverse ordering is forced independently: a first-time lane hello is
+processed while shard zero is suspended, then exact authority must trigger an
+immediate shard-local re-probe without first admitting the speculative route.
+Exact-authority regression also activates a local cluster alongside a remote
+epoch install and requires the authority plus both cluster indexes to become
+visible as one operation; the high-volume control test repeats the projection
+check over three nodes before admitting replica writes.
+Interrupted lifecycle tests suspend the notification shard, stop after the
+durable activation/deactivation mutation, and require activation routing to be
+complete immediately and close cleanup to finish after the shard resumes. This
+proves neither path relies on the API caller remaining alive.
+
+`replica_transport_outbox_test.exs` proves that a blocked sideband backend
+cannot delay the Group-facing local push, messages expire behind that backend,
+busy batches are not retried locally, batching preserves per-target order,
+invalid deadlines fail at boot, and ingress drops rather than raising while a
+destination shard is absent. Admission is bounded across the local mailbox,
+pending batch, and backend send.
+The real three-node TCP recovery test runs through the same outbox path.
+
+`Group.TestCluster.assert_replica_consistent/1` checks the
+public dual indexes plus exact deterministic registry projection, row/shard
+placement, lane authority revisions, registry/PG origin authority,
+oplog/order equivalence, and contiguous retained stream ranges. Seeded tests
+additionally require every PID retained as authority to still be alive after
+convergence.
+
+The isolated mutation runner in `test/mutation/` disables individual protocol
+guards and repair steps only in copied checkouts. See
+[`mutation/README.md`](mutation/README.md) for the command and artifact format.
 
 ## Typical test patterns
 
