@@ -600,11 +600,17 @@ defmodule Group do
     cluster = Keyword.get(opts, :cluster)
     pattern = parse_pattern(pattern_string)
     key = {name, cluster, pattern}
+    registry = registry_name(name)
 
-    case Registry.register(registry_name(name), key, nil) do
-      {:ok, _} -> :ok
-      {:error, {:already_registered, _}} -> :ok
-      {:error, reason} -> {:error, reason}
+    # Duplicate registries allow repeated registrations even by the same PID.
+    # Only this process can register its subscriptions, so no lock is needed.
+    if key in Registry.keys(registry, self()) do
+      :ok
+    else
+      case Registry.register(registry, key, nil) do
+        {:ok, _} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
 

@@ -654,6 +654,10 @@ defmodule GroupTest do
       assert :ok = Group.monitor(name, key)
       assert :ok = Group.monitor(name, key)
 
+      assert Registry.keys(Group.registry_name(name), self()) == [
+               {name, nil, {:exact, key}}
+             ]
+
       # Spawn a process to join (use join, not start_child)
       test_pid = self()
 
@@ -688,6 +692,27 @@ defmodule GroupTest do
 
       assert_receive {:group, [%Group.Event{type: :joined, key: ^key} = event], _}, 1000
       assert event.pid == self()
+      refute_receive {:group, _, _}, 100
+    end
+
+    test "repeated subscriptions stay bounded and can be renewed after demonitor", %{name: name} do
+      registry = Group.registry_name(name)
+      patterns = [:all, "bounded/", "bounded/exact"]
+
+      for _ <- 1..100, pattern <- patterns do
+        assert :ok = Group.monitor(name, pattern)
+      end
+
+      assert length(Registry.keys(registry, self())) == length(patterns)
+
+      for pattern <- patterns, do: assert(:ok = Group.demonitor(name, pattern))
+      assert Registry.keys(registry, self()) == []
+
+      for pattern <- patterns, do: assert(:ok = Group.monitor(name, pattern))
+      assert length(Registry.keys(registry, self())) == length(patterns)
+
+      assert :ok = Group.join(name, "bounded/exact", %{})
+      assert_receive {:group, [%Group.Event{type: :joined, key: "bounded/exact"}], _}, 1000
       refute_receive {:group, _, _}, 100
     end
 
