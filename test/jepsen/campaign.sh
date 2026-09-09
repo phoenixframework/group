@@ -13,6 +13,23 @@ recovery_time="${GROUP_JEPSEN_CAMPAIGN_RECOVERY:-15}"
 profile_grace="${GROUP_JEPSEN_CAMPAIGN_PROFILE_GRACE:-90}"
 artifact_dir="${GROUP_JEPSEN_CAMPAIGN_ARTIFACT_DIR:-}"
 
+transports=(distribution tcp chaos)
+scenarios=(mixed permanent)
+
+if [[ -n "${GROUP_JEPSEN_CAMPAIGN_TRANSPORT:-}" ]]; then
+  case "${GROUP_JEPSEN_CAMPAIGN_TRANSPORT}" in
+    distribution|tcp|chaos) transports=("${GROUP_JEPSEN_CAMPAIGN_TRANSPORT}") ;;
+    *) echo "invalid campaign transport" >&2; exit 1 ;;
+  esac
+fi
+
+if [[ -n "${GROUP_JEPSEN_CAMPAIGN_SCENARIO:-}" ]]; then
+  case "${GROUP_JEPSEN_CAMPAIGN_SCENARIO}" in
+    mixed|permanent) scenarios=("${GROUP_JEPSEN_CAMPAIGN_SCENARIO}") ;;
+    *) echo "invalid campaign scenario" >&2; exit 1 ;;
+  esac
+fi
+
 cd "${repo_dir}"
 
 if [[ "${GROUP_JEPSEN_SKIP_CHECKER:-0}" != "1" ]]; then
@@ -30,8 +47,8 @@ fi
 
 echo "Jepsen campaign artifacts: ${artifact_dir}"
 
-for transport in distribution tcp chaos; do
-  for scenario in mixed permanent; do
+for transport in "${transports[@]}"; do
+  for scenario in "${scenarios[@]}"; do
     log="${artifact_dir}/${transport}-${scenario}.log"
     sender_buffer_size=1
     min_delta_run_records=1

@@ -61,7 +61,7 @@ defmodule Group.ReplicaModelPropertyTest do
           end)
           |> ReplicaModelScheduler.stabilize_and_assert!()
 
-        assert scheduler.model != nil
+        assert is_map(scheduler.model.owners)
       after
         ReplicaModelScheduler.cleanup(scheduler)
       end
@@ -118,7 +118,7 @@ defmodule Group.ReplicaModelPropertyTest do
           end)
           |> ReplicaModelScheduler.stabilize_and_assert!()
 
-        assert scheduler.model != nil
+        assert is_map(scheduler.model.owners)
       after
         ReplicaModelScheduler.cleanup(scheduler)
       end
@@ -164,7 +164,7 @@ defmodule Group.ReplicaModelPropertyTest do
           |> run_schedule(after_restart)
           |> ReplicaModelScheduler.stabilize_and_assert!()
 
-        assert scheduler.model != nil
+        assert is_map(scheduler.model.owners)
       after
         ReplicaModelScheduler.cleanup(scheduler)
       end
@@ -221,7 +221,7 @@ defmodule Group.ReplicaModelPropertyTest do
           |> run_schedule(schedule)
           |> ReplicaModelScheduler.stabilize_and_assert!()
 
-        assert scheduler.model != nil
+        assert is_map(scheduler.model.owners)
       after
         ReplicaModelScheduler.cleanup(scheduler)
       end
@@ -281,7 +281,7 @@ defmodule Group.ReplicaModelPropertyTest do
           |> run_schedule(after_reopen)
           |> ReplicaModelScheduler.stabilize_and_assert!()
 
-        assert scheduler.model != nil
+        assert is_map(scheduler.model.owners)
       after
         ReplicaModelScheduler.cleanup(scheduler)
       end

@@ -1,10 +1,16 @@
 defmodule Group.DistributedTest do
   use ExUnit.Case
 
+  @moduletag :distributed
   @moduletag :capture_log
   @moduletag timeout: 30_000
 
   alias Group.TestCluster
+
+  setup context do
+    Process.put(:group_test_context, Map.take(context, [:module, :test, :file, :line]))
+    :ok
+  end
 
   defp start_group_on_peers(peers, opts) do
     for {_pid, node} <- peers do
@@ -3304,8 +3310,23 @@ defmodule Group.DistributedTest do
 
       # Flap 3 times
       for _i <- 1..3 do
+        TestCluster.assert_group_nodes(node_a, name, [node_b])
+        TestCluster.assert_group_nodes(node_b, name, [node_a])
+        TestCluster.flush_shards(node_a, name)
+        TestCluster.flush_shards(node_b, name)
+
         TestCluster.disconnect_nodes(node_a, node_b)
         assert_receive {:nodedown_on_remote, ^node_b}, 5000
+
+        # A monitor notification can overtake shard cleanup. Do not let old
+        # replicated rows satisfy the re-sync assertion in the next cycle.
+        TestCluster.assert_group_nodes(node_a, name, [])
+        TestCluster.assert_group_nodes(node_b, name, [])
+
+        TestCluster.assert_eventually(fn ->
+          TestCluster.rpc!(node_b, Group, :lookup, [name, "stable/a"]) == nil and
+            TestCluster.rpc!(node_a, Group, :members, [name, "room/nil"]) == []
+        end)
 
         TestCluster.reconnect_nodes(node_a, node_b)
 

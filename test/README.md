@@ -5,7 +5,7 @@
 ```bash
 mix test                           # every-PR ExUnit/property/chaos/checker gate
 mix test.soak                      # nightly six-profile Jepsen campaign
-mix test test/group_test.exs       # local only
+mix test --only local              # all local examples, histories and regressions
 mix test test/distributed_test.exs # distributed only
 mix test test/replica_adversarial_test.exs # seeded transport chaos
 mix test test/replica_model_property_test.exs # shrinkable model-based histories
@@ -13,18 +13,74 @@ test/jepsen/run.sh                 # one OS-partition/restart Jepsen model test
 ```
 
 `mix test` preserves normal Mix test arguments while always running the pure
-Jepsen lifecycle-checker qualification after ExUnit. It does not require
-Docker. `mix test.soak` first runs that complete PR gate, kills every defined
+Jepsen lifecycle-checker qualification after ExUnit. It requires Java 21 or newer
+but not Docker. `mix test.soak` first runs that complete PR gate, kills every defined
 protocol mutant, runs live positive/negative checker qualification, and then
 runs the distribution/TCP/chaos × mixed/permanent Jepsen campaign. The soak
 defaults to 20 five-minute fault histories per combination and is intended for
 nightly and release qualification rather than individual edits.
+
+## CI lanes
+
+| Lane | Scope and budget |
+|------|------------------|
+| PR / `main` | Latest-stable formatting, compiler checks and local tests first (5-minute cap), then the six supported-runtime jobs with the full suite and fresh peers (15-minute cap each). |
+| Nightly, 03:23 UTC / on demand | Five seeds per job across three starting seeds and 1/2/4 peer schedulers; 2,000-operation histories on 1/4/8 shards, plus existing partitions, churn, restart and race scenarios (30-minute cap per job). |
+| Nightly / release qualification | Upstream protocol mutation and live checker qualification (90-minute cap), followed by six independent transport/scenario jobs, each running 20 five-minute Jepsen histories (180-minute cap per job). |
+| Dedicated performance | Manually selected baseline versus candidate on one runner: pinned Benchee harness and existing distributed load/recovery benchmarks. Reports retained for 30 days; no noisy hosted-runner threshold gates (60-minute cap). |
+| Release | Publishing reruns the runtime matrix, fault campaigns and performance comparison against the previous tag. **Before publishing**, manually run these workflows on the candidate ref and review the performance report. Publication is not blocked automatically. |
+
+Nightly and release workflows become available after merging onto the default
+branch. PR checks do not run benchmarks or mutation campaigns. Branch pushes do
+not duplicate the PR's runtime matrix.
+
+The histories check a sequential reference model for registry/PG metadata and
+named-cluster disconnects. They complement, rather than replace, the concurrent
+and real-peer tests. The upstream mutation and soak gates remain the source of
+truth for protocol qualification. Mixed Group-version wire
+compatibility is not established by this runtime matrix; add a dedicated
+mixed-version scenario before promising rolling upgrades across library versions.
+
+### Replay and diagnostics
+
+```bash
+GROUP_PEER_SCHEDULERS=1 GROUP_HISTORY_STEPS=2000 \
+  GROUP_TEST_DIAGNOSTICS=_build/test-diagnostics \
+  mix test --seed 104729 --warnings-as-errors
+
+# Protocol mutations run in isolated copies under tmp/mutation.
+mix run test/mutation/run.exs
+```
+
+CI failure artifacts retain output, seeds, generated histories, runtime/config
+details, peer/test identities, and snapshots taken **before peer teardown**:
+topology, ETS sizes, bounded shard state (including pending buffer counts) and
+process queue sizes. Unreachable peers and timed-out state calls are recorded as
+unavailable, rather than delaying cleanup indefinitely. PR artifacts are kept
+for 14 days on failure; campaign reports are kept on success too.
+
+### Local concurrency and synchronization
+
+`group_test.exs` contains separate subsystem modules using `Group.LocalCase`.
+Keeping the existing file entry point preserves focused commands and avoids a
+large file-movement diff; ExUnit schedules the modules independently. The
+process-group ingress, clusters, counts and event-batching modules remain serial because they change
+VM-global trace patterns. Diagnostics tests also remain serial because they
+change an environment variable. Other local tests use uniquely named Group
+instances and run asynchronously.
+
+Fairness regressions wait until requests appear in the suspended shard's mailbox
+instead of sleeping for a presumed delivery delay. Keep deliberate timeout and
+negative-event assertions distinct from synchronization waits. Destructive
+distributed scenarios always get fresh peers; there is no shared peer pool.
 
 ## Test files
 
 | File | What it tests |
 |------|---------------|
 | `group_test.exs` | Single-node: register/unregister, join/leave, materialized exact/prefix counts, restart rebuild and journal-replay crash boundaries, monitors, named clusters, and concurrent operations |
+| `history_test.exs` | Seeded local registry/PG/cluster histories against a reference model |
+| `diagnostics_test.exs` | Failure output, shard snapshots and unreachable-peer diagnostics |
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts, and adversarial replica-transport loss/busy/snapshot recovery |
 | `anti_entropy_fault_regression_test.exs` | Three-node regressions for hidden-winner projection, receiver restart eviction, nodedown/lease lane retirement, authority gaps and cross-lane races, in-flight conflict fencing, crash-journal replay, cursorless/interrupted snapshot repair, malformed ingress, and sideband rediscovery |
 | `replica_adversarial_test.exs` | Reproducible three-node mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
@@ -75,18 +131,26 @@ live checker rejects injected faults. Chaos/mixed uses a larger repair window
 and is invalid unless it observes a multi-record delta run; the other profiles
 retain the one-record stress configuration.
 
+CI splits the soak matrix with `GROUP_JEPSEN_CAMPAIGN_TRANSPORT` and
+`GROUP_JEPSEN_CAMPAIGN_SCENARIO`. Omit these filters to run all six profiles;
+the history count and duration defaults are unchanged. This keeps each job
+within GitHub's runtime limit without reducing qualification coverage.
+
 ## How distribution works
 
-The test node starts as a named Erlang node in `test_helper.exs`:
-
-```elixir
-Node.start(:"test_12345@127.0.0.1", :longnames)
-Node.set_cookie(:group_test)
-```
+`test_helper.exs` starts ExUnit only. `Group.TestCluster.start_peers/2` starts
+EPMD/distribution lazily, so `mix test --only local` does not start distribution.
+The test node and peers include the OS pid in their names to avoid cross-VM
+collisions. Peers use the test node's cookie.
 
 Peer nodes are real BEAM VMs started via OTP's `:peer` module (not
 `Node.spawn`). Each peer has its own schedulers, memory, and GC — they
 communicate over Erlang distribution just like production nodes.
+
+Correctness peers default to two schedulers, independently of the parent VM's
+`ERL_FLAGS`. Override with `GROUP_PEER_SCHEDULERS=1` (1–64) or
+`TestCluster.start_peers(3, schedulers: 1)`. Performance runs have separate
+scheduler settings.
 
 `:prevent_overlapping_partitions` is set to `false` on all nodes (test node
 and peers). Without this, disconnecting two peers from each other would also
