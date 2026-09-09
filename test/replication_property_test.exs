@@ -45,6 +45,91 @@ defmodule Group.ReplicationPropertyTest do
         end
       end
     end
+
+    property "#{kind} buffers and snapshots cannot repopulate a cluster after disconnect" do
+      check all(
+              shards <- member_of([1, 2, 4]),
+              buffer <- member_of([2, 4, 8]),
+              count <- integer(1..(buffer - 1)),
+              value <- integer(0..10),
+              cycles <- integer(1..3),
+              max_runs: 50
+            ) do
+        with_group(@name, options(shards, buffer), fn actors ->
+          cluster = "shared"
+          assert :ok = Group.connect(@name, [cluster, "other"])
+
+          # Surviving entries use the same key in two other clusters.
+          for c <- [nil, "other"] do
+            in_process(actors[0], fn ->
+              :ok = Group.register(@name, "hot/a", %{survivor: true}, cluster: c)
+              :ok = Group.join(@name, "hot/a", %{survivor: true}, cluster: c)
+            end)
+          end
+
+          survivors = Enum.sort(Group.local_entries(@name))
+          subscribe(actors.observer, cluster)
+          commands = for i <- 0..(count - 1), do: {:put, rem(i, 4), rem(i, 2), value + i}
+
+          {ops, entries, _events} =
+            compile_history(unquote(kind), cluster, commands, actors)
+
+          deliver(unquote(kind), ops, 1, shards)
+
+          # System messages inspect without flushing the normal mailbox lane.
+          # Prove the operations really are buffered before membership is removed.
+          pending =
+            for shard <- 0..(shards - 1) do
+              state = :sys.get_state(Replica.shard_name(@name, shard))
+
+              case unquote(kind) do
+                :registry -> state.pending_replicated_registry_len
+                :pg -> state.pending_replicated_pg_len
+              end
+            end
+
+          assert Enum.sum(pending) == length(ops)
+          assert :ok = Group.disconnect(@name, cluster)
+          # Checking events catches an incorrect apply-then-purge, even if both
+          # indexes end up empty and therefore appear consistent.
+          assert events_after_barrier(@name, actors.observer) == []
+          assert Enum.sort(Group.local_entries(@name)) == survivors
+
+          for _cycle <- 1..cycles do
+            deliver(unquote(kind), ops, buffer + 1, shards)
+            snapshot(unquote(kind), cluster, entries, shards)
+            assert events_after_barrier(@name, actors.observer) == []
+            assert Enum.sort(Group.local_entries(@name)) == survivors
+            refute Group.connected?(@name, cluster)
+
+            assert :ok = Group.connect(@name, cluster)
+            snapshot(unquote(kind), cluster, entries, shards)
+            actual_events = events_after_barrier(@name, actors.observer)
+
+            # Snapshots contain only the final entry for each key/owner.
+            snapshot_events =
+              entries
+              |> Enum.map(fn {{key, pid}, meta} ->
+                event(unquote(kind), cluster, key, pid, meta, nil, nil)
+              end)
+
+            assert_per_key_events(actual_events, snapshot_events)
+            assert_entries(entries, unquote(kind), cluster, survivors)
+
+            assert :ok = Group.disconnect(@name, cluster)
+
+            removals =
+              Enum.map(snapshot_events, fn e ->
+                %{e | type: removal_type(unquote(kind)), reason: :cluster_disconnect}
+              end)
+
+            assert_per_key_events(events_after_barrier(@name, actors.observer), removals)
+            assert Enum.sort(Group.local_entries(@name)) == survivors
+            assert :ok = TestCluster.assert_ets_consistent(@name)
+          end
+        end)
+      end
+    end
   end
 
   defp options(shards, buffer) do
@@ -143,16 +228,26 @@ defmodule Group.ReplicationPropertyTest do
     end)
   end
 
+  defp snapshot(kind, cluster, entries, shards) do
+    data = Enum.map(entries, fn {{key, pid}, meta} -> {key, pid, meta, 1_000} end)
+    {reg, pg} = if kind == :registry, do: {data, []}, else: {[], data}
+
+    for shard <- 0..(shards - 1) do
+      send(Replica.shard_name(@name, shard), {:cluster_state, cluster, reg, pg})
+      :sys.get_state(Replica.shard_name(@name, shard))
+    end
+  end
+
   defp assert_per_key_events(actual, expected) do
     group = fn events -> Enum.group_by(events, &{&1.cluster, &1.key}) end
     assert group.(actual) == group.(expected)
   end
 
-  defp assert_entries(entries, kind, cluster) do
+  defp assert_entries(entries, kind, cluster, survivors \\ []) do
     expected =
       Enum.map(entries, fn {{key, pid}, meta} -> {kind, cluster, key, pid, meta} end)
 
-    assert Enum.sort(Group.local_entries(@name)) == Enum.sort(expected)
+    assert Enum.sort(Group.local_entries(@name)) == Enum.sort(survivors ++ expected)
 
     for key <- @keys do
       members = for {{^key, pid}, meta} <- entries, do: {pid, meta}
