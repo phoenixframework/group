@@ -1,5 +1,7 @@
 defmodule Group.TestCluster do
   @moduledoc false
+  # Mix loads OTP's optional :tools application when --cover is requested.
+  @compile {:no_warn_undefined, :cover}
 
   @doc "Start N peer nodes with Group app loaded and ready"
   def start_peers(count, opts \\ []) do
@@ -36,6 +38,13 @@ defmodule Group.TestCluster do
           env: [{~c"ERL_AFLAGS", ~c""}]
         })
 
+      # Load the same instrumented BEAMs before any Group or helper code runs.
+      # Besides collecting remote execution, this keeps anonymous RPC functions
+      # compatible with the coordinator's cover-compiled helper module.
+      if Process.whereis(:cover_server) do
+        {:ok, [^node]} = :cover.start([node])
+      end
+
       {:ok, _} = :rpc.call(node, :application, :ensure_all_started, [:elixir])
       {:ok, _} = :rpc.call(node, :application, :ensure_all_started, [:group])
       {pid, node}
@@ -43,15 +52,22 @@ defmodule Group.TestCluster do
   end
 
   def stop_peers(peers) do
-    Enum.each(peers, fn {pid, _node} ->
-      if pid do
-        try do
-          :peer.stop(pid)
-        catch
-          :exit, _ -> :ok
-        end
-      end
-    end)
+    Enum.each(peers, &stop_peer/1)
+  end
+
+  @doc "Collects remote coverage before stopping a peer, including deliberate node failures."
+  def stop_peer({pid, node}) do
+    if Process.whereis(:cover_server) && node in :cover.which_nodes() do
+      # Collect without unloading instrumented code in a still-running Group.
+      # Reloading here can interfere with code-version and restart scenarios.
+      :ok = :cover.flush([node])
+    end
+
+    if pid && Process.alive?(pid) do
+      :peer.stop(pid)
+    end
+
+    :ok
   end
 
   @doc false

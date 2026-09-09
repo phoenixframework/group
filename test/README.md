@@ -20,6 +20,22 @@ runs the distribution/TCP/chaos × mixed/permanent Jepsen campaign. The soak
 defaults to 20 five-minute fault histories per combination and is intended for
 nightly and release qualification rather than individual edits.
 
+### Distributed coverage
+
+`mix test --cover` includes execution on the peer nodes. Mix coverage runs with
+`local_only: false`; `TestCluster.start_peers/2` loads the coordinator's
+instrumented modules on each peer before starting Group. This also keeps
+anonymous functions in the compiled support module compatible across nodes.
+Support modules are excluded from the coverage score.
+
+Always stop peers through `TestCluster.stop_peer({pid, node})` or
+`TestCluster.stop_peers(peers)`, including node-failure scenarios. These helpers
+collect remote coverage before shutting down the VM. An abrupt VM crash can
+still lose counters that have not been collected.
+
+`coverage_test.exs` checks that a peer-only call remains in the coordinator's
+coverage results after the peer stops. It is skipped without `--cover`.
+
 ## Test files
 
 | File | What it tests |

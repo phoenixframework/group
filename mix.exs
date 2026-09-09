@@ -12,6 +12,22 @@ defmodule Group.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       test_ignore_filters: [~r"^test/jepsen/", ~r"^test/mutation/"],
       start_permanent: Mix.env() == :prod,
+      test_coverage: [
+        local_only: false,
+        ignore_modules: [
+          Group.TestCluster,
+          Group.TestConflictResolver,
+          Group.TestReplicaTransport,
+          Group.TestTCPTransport,
+          Group.TestTCPTransport.Supervisor,
+          Group.ControlledReplicaTransport,
+          Group.CyclicConflictResolver,
+          Group.ModelConflictResolver,
+          Group.PausingConflictResolver,
+          Group.ReplicaLifecycleModel,
+          Group.ReplicaModelScheduler
+        ]
+      ],
       deps: deps(),
       aliases: aliases(),
       package: package(),

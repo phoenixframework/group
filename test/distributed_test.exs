@@ -234,7 +234,7 @@ defmodule Group.DistributedTest do
       end)
 
       # Stop node B
-      :peer.stop(peer_b_pid)
+      TestCluster.stop_peer({peer_b_pid, node_b})
 
       # Node A should clean up B's entries
       TestCluster.assert_eventually(
@@ -248,7 +248,7 @@ defmodule Group.DistributedTest do
 
       # Clean up remaining peer
       [{peer_a_pid, _}] = Enum.filter(peers, fn {_, n} -> n == node_a end)
-      on_exit(fn -> :peer.stop(peer_a_pid) end)
+      on_exit(fn -> TestCluster.stop_peer({peer_a_pid, node_a}) end)
     end
 
     test "process DOWN cleanup arrives as one remote batch per dead pid" do
@@ -789,8 +789,8 @@ defmodule Group.DistributedTest do
       end)
 
       # Stop B and C simultaneously
-      :peer.stop(peer_b_pid)
-      :peer.stop(peer_c_pid)
+      TestCluster.stop_peer({peer_b_pid, node_b})
+      TestCluster.stop_peer({peer_c_pid, node_c})
 
       # A should clean up all of B's and C's entries
       TestCluster.assert_eventually(
@@ -805,7 +805,7 @@ defmodule Group.DistributedTest do
       # A's own data should be intact
       assert TestCluster.rpc!(node_a, Group, :lookup, [name, "user/a"]) != nil
 
-      on_exit(fn -> :peer.stop(peer_a_pid) end)
+      on_exit(fn -> TestCluster.stop_peer({peer_a_pid, node_a}) end)
     end
   end
 
@@ -1373,7 +1373,7 @@ defmodule Group.DistributedTest do
       assert TestCluster.rpc!(node_a, Group, :lookup, [name, "nil_key"]) != nil
 
       # Now B crashes
-      :peer.stop(peer_b_pid)
+      TestCluster.stop_peer({peer_b_pid, node_b})
 
       # A should clean up nil_key too
       TestCluster.assert_eventually(
@@ -1384,7 +1384,7 @@ defmodule Group.DistributedTest do
       )
 
       [{peer_a_pid, _}] = Enum.filter(peers, fn {_, n} -> n == node_a end)
-      on_exit(fn -> :peer.stop(peer_a_pid) end)
+      on_exit(fn -> TestCluster.stop_peer({peer_a_pid, node_a}) end)
     end
 
     test "empty cluster removed on last disconnect" do
@@ -1597,7 +1597,7 @@ defmodule Group.DistributedTest do
       end)
 
       # Stop B
-      :peer.stop(peer_b_pid)
+      TestCluster.stop_peer({peer_b_pid, node_b})
 
       # A should no longer see B
       TestCluster.assert_eventually(
@@ -1609,7 +1609,7 @@ defmodule Group.DistributedTest do
       )
 
       [{peer_a_pid, _}] = Enum.filter(peers, fn {_, n} -> n == node_a end)
-      on_exit(fn -> :peer.stop(peer_a_pid) end)
+      on_exit(fn -> TestCluster.stop_peer({peer_a_pid, node_a}) end)
     end
   end
 
@@ -2140,7 +2140,7 @@ defmodule Group.DistributedTest do
       end)
 
       # Stop node A
-      :peer.stop(peer_a_pid)
+      TestCluster.stop_peer({peer_a_pid, node_a})
 
       # B should have cleaned up A's entries
       TestCluster.assert_eventually(fn ->
@@ -2163,7 +2163,7 @@ defmodule Group.DistributedTest do
         TestCluster.stop_peers([{new_a_pid, new_node_a}])
         # Stop remaining original peer B
         [{peer_b_pid, _}] = Enum.filter(peers, fn {_, n} -> n == node_b end)
-        :peer.stop(peer_b_pid)
+        TestCluster.stop_peer({peer_b_pid, node_b})
       end)
     end
   end
@@ -3105,7 +3105,7 @@ defmodule Group.DistributedTest do
       )
 
       # Kill node B
-      :peer.stop(peer_b_pid)
+      TestCluster.stop_peer({peer_b_pid, node_b})
 
       # Wait for nodedown cleanup
       TestCluster.assert_eventually(
@@ -3161,7 +3161,7 @@ defmodule Group.DistributedTest do
         end
       end
 
-      on_exit(fn -> :peer.stop(peer_a_pid) end)
+      on_exit(fn -> TestCluster.stop_peer({peer_a_pid, node_a}) end)
     end
 
     @tag timeout: 60_000
@@ -3370,7 +3370,7 @@ defmodule Group.DistributedTest do
       end)
 
       # Then B dies entirely
-      :peer.stop(peer_b_pid)
+      TestCluster.stop_peer({peer_b_pid, node_b})
 
       # A should clean up everything — both the cluster disconnect and nodedown
       TestCluster.assert_eventually(
@@ -3408,7 +3408,7 @@ defmodule Group.DistributedTest do
         end
       end
 
-      on_exit(fn -> :peer.stop(peer_a_pid) end)
+      on_exit(fn -> TestCluster.stop_peer({peer_a_pid, node_a}) end)
     end
   end
 
@@ -3514,7 +3514,7 @@ defmodule Group.DistributedTest do
       end)
 
       # Kill B
-      :peer.stop(peer_b_pid)
+      TestCluster.stop_peer({peer_b_pid, node_b})
 
       # A should not have B in any cluster_nodes — nil or named
       TestCluster.assert_eventually(
@@ -3547,7 +3547,7 @@ defmodule Group.DistributedTest do
       TestCluster.flush_shards(node_a, name)
       assert :ok = TestCluster.rpc!(node_a, Group.TestCluster, :assert_ets_consistent, [name])
 
-      on_exit(fn -> :peer.stop(peer_a_pid) end)
+      on_exit(fn -> TestCluster.stop_peer({peer_a_pid, node_a}) end)
     end
   end
 
@@ -3669,7 +3669,7 @@ defmodule Group.DistributedTest do
       assert_receive {:monitor_ready, ^forwarder}, 1000
 
       # Kill node_b — nodedown triggers bulk purge
-      :peer.stop(peer_b)
+      TestCluster.stop_peer({peer_b, node_b})
 
       # All 3 :unregistered events should arrive in a single batch
       # (they're on the same shard, processed in one nodedown handler turn)
