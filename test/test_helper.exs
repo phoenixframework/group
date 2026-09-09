@@ -14,7 +14,9 @@ unless epmd_running?.() do
 end
 
 unless Node.alive?() do
-  {:ok, _} = Node.start(:"test_#{System.unique_integer([:positive])}@127.0.0.1", :longnames)
+  # unique_integer is VM-local; include the OS pid to allow concurrent test runs.
+  name = :"test_#{System.pid()}_#{System.unique_integer([:positive])}@127.0.0.1"
+  {:ok, _} = Node.start(name, :longnames)
   Node.set_cookie(:group_test)
 end
 

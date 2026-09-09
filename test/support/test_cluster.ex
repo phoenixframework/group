@@ -22,7 +22,7 @@ defmodule Group.TestCluster do
         Enum.flat_map(code_paths, fn p -> [~c"-pa", p] end)
 
     for _i <- 1..count do
-      name = :"peer#{System.unique_integer([:positive])}"
+      name = :"peer_#{System.pid()}_#{System.unique_integer([:positive])}"
 
       # A fixed inet_dist_listen_min/max inherited through ERL_AFLAGS makes
       # every child contend for the parent VM's distribution port. Peer args
@@ -496,10 +496,20 @@ defmodule Group.TestCluster do
   @doc "Monitor nodedown events from a remote node, forwarding to caller"
   def monitor_nodes_on(node, target_pid) do
     :erpc.call(node, fn ->
-      spawn(fn ->
-        :net_kernel.monitor_nodes(true)
-        forward_nodedown(target_pid)
-      end)
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :net_kernel.monitor_nodes(true)
+          send(parent, {:monitor_ready, self()})
+          forward_nodedown(target_pid)
+        end)
+
+      receive do
+        {:monitor_ready, ^pid} -> pid
+      after
+        5000 -> raise "monitor_nodes_on timed out"
+      end
     end)
   end
 
@@ -625,6 +635,23 @@ defmodule Group.TestCluster do
     )
 
     :ok
+  end
+
+  @doc "Wait for every shard and the shared peer table to agree on the expected Group peers."
+  def assert_group_nodes(node, name, expected_nodes) do
+    expected_nodes = Enum.sort(expected_nodes)
+
+    assert_eventually(fn ->
+      :erpc.call(node, fn ->
+        num_shards = Group.get_config(name).num_shards
+
+        Enum.sort(Group.nodes(name)) == expected_nodes and
+          Enum.all?(0..(num_shards - 1), fn shard ->
+            state = :sys.get_state(:"#{name}_replica_#{shard}")
+            Enum.sort(Map.keys(state.remote_shards)) == expected_nodes
+          end)
+      end)
+    end)
   end
 
   @doc "Returns the current message_queue_len for a shard on a remote node."

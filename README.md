@@ -619,6 +619,24 @@ See [`test/README.md`](test/README.md) for the every-PR gate, shrinkable
 StreamData lifecycle-model tests, bounded TLA+ models, and the nightly
 three-node Jepsen transport/lifecycle campaign.
 
+GitHub Actions runs the full local and distributed suite on pushes and pull
+requests using Elixir 1.19 / OTP 26–28, Elixir 1.20 / OTP 27–28, and the latest
+stable Elixir / OTP pair. Version ranges pick up new patch releases automatically;
+the latest-stable job also picks up new minor and major releases, excluding
+prereleases. Every job treats compilation and test warnings as errors, and the
+latest-stable job checks formatting.
+
+To run the same checks locally:
+
+```bash
+export MIX_ENV=test
+export ERL_FLAGS="+S 4:4"
+mix deps.get
+mix format --check-formatted
+mix compile --warnings-as-errors
+mix test --warnings-as-errors
+```
+
 ## Benchmarks
 
 ```bash

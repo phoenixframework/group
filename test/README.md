@@ -164,8 +164,10 @@ TestCluster.spawn_register_update_unregister(node_a, :test, "user/1", %{v: 1}, %
 
 `spawn_register` accepts `flush_shards: num_shards` which calls
 `:sys.get_state` on the target shard's GenServer after registration. This
-blocks until all pending messages (nodedown, replicate, etc.) are processed
-on that shard — useful in partition tests where you need to guarantee ordering.
+synchronizes with that shard after the write; it is not a pre-write barrier
+and does not flush buffered replication. Use `TestCluster.flush_shards/2` to
+flush replication and `TestCluster.assert_group_nodes/3` to wait for peer
+discovery or nodedown cleanup on every shard.
 
 ```elixir
 TestCluster.spawn_register(node_a, :test, "key", %{}, flush_shards: 4)
@@ -196,6 +198,9 @@ TestCluster.monitor_nodes_on(node_a, self())
 assert_receive {:nodedown_on_remote, ^node_b}, 5000
 ```
 
+`monitor_nodes_on/2` returns only after the remote monitor is installed.
+Receiving its notification does not mean Group's shards have processed nodedown.
+
 #### Network partitions
 
 ```elixir
@@ -207,6 +212,24 @@ Partition tests use **3 nodes** and isolate one from the other two. Two-node
 partitions don't work reliably because the test node bridges them — Erlang
 distribution is fully meshed, so if the test node can reach both peers, they
 can reach each other through it.
+
+Before disconnecting, wait for discovery on **every shard**, not just
+`Node.list/0` connectivity. In-flight discovery sends can otherwise trigger
+reconnect retries. After disconnecting, wait for every shard's peer state
+before writing partition-local data:
+
+```elixir
+TestCluster.assert_group_nodes(node_a, :test, [node_b, node_c])
+TestCluster.assert_group_nodes(node_b, :test, [node_a, node_c])
+TestCluster.assert_group_nodes(node_c, :test, [node_a, node_b])
+
+TestCluster.disconnect_nodes(node_c, node_a)
+TestCluster.disconnect_nodes(node_c, node_b)
+
+TestCluster.assert_group_nodes(node_a, :test, [node_b])
+TestCluster.assert_group_nodes(node_b, :test, [node_a])
+TestCluster.assert_group_nodes(node_c, :test, [])
+```
 
 #### Polling for eventual consistency
 

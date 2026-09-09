@@ -590,14 +590,11 @@ defmodule Group.DistributedTest do
 
       start_group_on_peers(peers, opts)
 
-      # Wait for Erlang-level connectivity so disconnect_nodes actually works
-      TestCluster.assert_eventually(
-        fn ->
-          c_nodes = TestCluster.rpc!(node_c, Node, :list, [])
-          node_a in c_nodes and node_b in c_nodes
-        end,
-        timeout: 5000
-      )
+      # Finish discovery on every shard before cutting links. Erlang connectivity
+      # alone can leave handshake sends in flight that trigger reconnect retries.
+      TestCluster.assert_group_nodes(node_a, name, [node_b, node_c])
+      TestCluster.assert_group_nodes(node_b, name, [node_a, node_c])
+      TestCluster.assert_group_nodes(node_c, name, [node_a, node_b])
 
       # Set up nodedown monitor on A
       TestCluster.monitor_nodes_on(node_a, self())
@@ -609,8 +606,12 @@ defmodule Group.DistributedTest do
       # Wait for A to confirm it saw C go down
       assert_receive {:nodedown_on_remote, ^node_c}, 5000
 
+      # A separate node monitor does not establish that every shard handled DOWN.
+      TestCluster.assert_group_nodes(node_a, name, [node_b])
+      TestCluster.assert_group_nodes(node_b, name, [node_a])
+      TestCluster.assert_group_nodes(node_c, name, [])
+
       # While partitioned: register keys on A, join groups on C
-      # flush_shards ensures nodedown is processed before registering
       TestCluster.spawn_register(node_a, name, "user/from_a", %{origin: :a}, flush_shards: 2)
       TestCluster.spawn_join(node_c, name, "room/from_c", %{origin: :c})
 
@@ -2050,14 +2051,10 @@ defmodule Group.DistributedTest do
         length(nodes) >= 1
       end)
 
-      # Wait for Erlang-level connectivity so disconnect_nodes actually works
-      TestCluster.assert_eventually(
-        fn ->
-          c_nodes = TestCluster.rpc!(node_c, Node, :list, [])
-          node_a in c_nodes and node_b in c_nodes
-        end,
-        timeout: 5000
-      )
+      # Wait for Group discovery, not just Erlang connectivity, before partitioning.
+      TestCluster.assert_group_nodes(node_a, name, [node_b, node_c])
+      TestCluster.assert_group_nodes(node_b, name, [node_a, node_c])
+      TestCluster.assert_group_nodes(node_c, name, [node_a, node_b])
 
       # Set up nodedown monitors on A before partitioning
       TestCluster.monitor_nodes_on(node_a, self())
@@ -2070,9 +2067,12 @@ defmodule Group.DistributedTest do
       assert_receive {:nodedown_on_remote, ^node_c}, 5000
 
       # Wait for Group's own peer tables to reflect the partition before writing.
+      TestCluster.assert_group_nodes(node_a, name, [node_b])
+      TestCluster.assert_group_nodes(node_b, name, [node_a])
+      TestCluster.assert_group_nodes(node_c, name, [])
+
       TestCluster.assert_eventually(fn ->
-        node_c not in TestCluster.rpc!(node_a, Group, :nodes, [name]) and
-          node_c not in TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])
+        node_c not in TestCluster.rpc!(node_a, Group, :nodes, [name, "game"])
       end)
 
       # Register data during partition
