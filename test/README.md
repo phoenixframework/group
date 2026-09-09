@@ -16,7 +16,7 @@ mix test test/distributed_test.exs # distributed only
 |------|---------------|
 | `group_test.exs` | Single-node: register/unregister, join/leave, members, monitor/demonitor, named clusters, concurrent operations |
 | `group_property_test.exs` | StreamData local command histories checked against an independent map/set model |
-| `replication_property_test.exs` | Generated receiver batch boundaries and buffered/snapshot cluster isolation |
+| `replication_property_test.exs` | Generated receiver batch boundaries, buffered/snapshot cluster isolation, and local-write fairness |
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts |
 
 ## Local model properties
@@ -59,9 +59,9 @@ mix test test/group_property_test.exs --seed 12345
 
 StreamData reports the shrunk command sequence. Promote discovered failures to
 focused regression tests. A seed reproduces generation, not BEAM scheduling.
-The local model deliberately settles between commands. Receiver buffering is
-covered separately below, without growing the command model into a scheduler
-or transport simulator.
+The local model deliberately settles between commands. Receiver buffering and
+fairness are covered separately below, without growing the command model into a
+scheduler or transport simulator.
 If the model grows into a substantial state-machine framework, evaluate
 PropCheck/PropEr rather than implementing that framework here.
 
@@ -79,6 +79,11 @@ PropCheck/PropEr rather than implementing that framework here.
   may repopulate the disconnected cluster or emit transient apply-then-purge
   events. Reconnect cycles must accept fresh snapshots while preserving entries
   in the default and another named cluster. Runs 50 examples per lane.
+- **Fairness:** suspend one shard, enqueue a finite receiver backlog, and wait
+  until a public local register/join request is also queued. On resume, the local
+  event must appear at the first receiver flush, before the backlog finishes.
+  The assertion uses the shard's event timeline rather than a wall-clock
+  latency threshold or queue-length observation. Runs 50 examples per lane.
 
 These are controlled receiver-protocol scenarios using real local owner PIDs;
 they do not traverse Erlang distribution or exercise sender batching. Registry

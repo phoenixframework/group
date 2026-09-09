@@ -130,6 +130,73 @@ defmodule Group.ReplicationPropertyTest do
         end)
       end
     end
+
+    property "#{kind} backlog yields to a queued local write at the first receiver flush" do
+      check all(
+              buffer <- member_of([1, 2, 4, 8]),
+              chunk_size <- member_of(Enum.uniq([1, max(buffer - 1, 1), buffer, buffer + 1])),
+              count <- member_of([2 * buffer + chunk_size, 4 * buffer + chunk_size]),
+              local_operation <- member_of([:register, :join]),
+              max_runs: 50
+            ) do
+        # One shard gives a single event timeline. Assert the position of local
+        # work in that timeline, not the scheduler-sensitive queue length when
+        # the caller happens to wake up.
+        with_group(@name, options(1, buffer), fn actors ->
+          subscribe(actors.observer, nil)
+          commands = for i <- 1..count, do: {:put, 0, 0, i}
+          {ops, entries, remote_events} = compile_history(unquote(kind), nil, commands, actors)
+
+          tag =
+            if unquote(kind) == :registry,
+              do: :replicate_registry_batch,
+              else: :replicate_pg_batch
+
+          shard = Process.whereis(Replica.shard_name(@name, 0))
+          :ok = :sys.suspend(shard)
+
+          try do
+            for chunk <- Enum.chunk_every(ops, chunk_size), do: send(shard, {tag, chunk})
+
+            caller =
+              Task.async(fn ->
+                in_process(actors[1], fn ->
+                  apply(Group, local_operation, [@name, "local/a", %{local: true}])
+                end)
+              end)
+
+            try do
+              TestCluster.assert_eventually(
+                fn ->
+                  {:messages, messages} = Process.info(shard, :messages)
+                  Enum.any?(messages, &(is_tuple(&1) and elem(&1, 0) == :group_local_request))
+                end,
+                interval: 1
+              )
+
+              :ok = :sys.resume(shard)
+              assert :ok = Task.await(caller, 5_000)
+              events = events_after_barrier(@name, actors.observer)
+              first_flush = div(buffer + chunk_size - 1, chunk_size) * chunk_size
+              assert Enum.find_index(events, &(&1.key == "local/a")) == first_flush
+              assert first_flush < count
+              assert Enum.reject(events, &(&1.key == "local/a")) == remote_events
+
+              local_kind = if local_operation == :register, do: :registry, else: :pg
+              local_event = event(local_kind, nil, "local/a", actors[1], %{local: true}, nil, nil)
+              assert Enum.filter(events, &(&1.key == "local/a")) == [local_event]
+              local_entry = {local_kind, nil, "local/a", actors[1], %{local: true}}
+              assert_entries(entries, unquote(kind), nil, [local_entry])
+              assert :ok = TestCluster.assert_ets_consistent(@name)
+            after
+              Task.shutdown(caller, :brutal_kill)
+            end
+          after
+            :sys.resume(shard)
+          end
+        end)
+      end
+    end
   end
 
   defp options(shards, buffer) do
