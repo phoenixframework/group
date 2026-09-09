@@ -3282,12 +3282,11 @@ defmodule Group.DistributedTest do
     end
   end
 
-  describe "Jepsen-style: deterministic conflict tiebreaker" do
+  describe "conflict convergence after partition" do
     @tag timeout: 60_000
     test "conflict resolution converges even with near-simultaneous registrations" do
-      # Verifies that both nodes agree on the same winner after partition heal.
-      # With the old broken `>=` tiebreaker, equal timestamps would cause mutual
-      # kill (both processes die). The deterministic pid-based tiebreaker prevents this.
+      # End-to-end partition-heal coverage. Equal timestamps and both PID
+      # orderings are forced separately in protocol_regression_test.exs.
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
@@ -3358,9 +3357,8 @@ defmodule Group.DistributedTest do
   describe "Jepsen-style: nodedown cleans cluster_nodes on all shards" do
     @tag timeout: 60_000
     test "dead node removed from cluster_nodes even with many shards" do
-      # Exercises the race where a non-zero shard processes a late peer_connect
-      # from a dead node after shard 0 already cleaned cluster_nodes. With many
-      # shards, the window for this race is wider.
+      # End-to-end node-death coverage. The late-discovery ordering is forced
+      # separately for nodedown and monitor DOWN in protocol_regression_test.exs.
       peers = TestCluster.start_peers(2)
 
       [{peer_a_pid, node_a}, {peer_b_pid, node_b}] = peers
