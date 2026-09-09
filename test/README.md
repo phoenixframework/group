@@ -6,7 +6,7 @@
 mix test                           # all tests
 mix test test/group_test.exs       # local only
 mix test test/group_property_test.exs # local model properties
-mix test test/replication_property_test.exs # receiver protocol properties
+mix test test/replication_property_test.exs test/cluster_lease_property_test.exs
 mix test test/distributed_test.exs # distributed only
 ```
 
@@ -17,6 +17,7 @@ mix test test/distributed_test.exs # distributed only
 | `group_test.exs` | Single-node: register/unregister, join/leave, members, monitor/demonitor, named clusters, concurrent operations |
 | `group_property_test.exs` | StreamData local command histories checked against an independent map/set model |
 | `replication_property_test.exs` | Generated receiver batch boundaries, buffered/snapshot cluster isolation, and local-write fairness |
+| `cluster_lease_property_test.exs` | Generated TTL interest combinations, removal order, no-refresh connects, and reconnects |
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts |
 
 ## Local model properties
@@ -59,13 +60,13 @@ mix test test/group_property_test.exs --seed 12345
 
 StreamData reports the shrunk command sequence. Promote discovered failures to
 focused regression tests. A seed reproduces generation, not BEAM scheduling.
-The local model deliberately settles between commands. Receiver buffering and
-fairness are covered separately below, without growing the command model into a
-scheduler or transport simulator.
+The local model deliberately settles between commands. Receiver buffering, TTL,
+and fairness are covered separately below, without growing the command model
+into a scheduler or transport simulator.
 If the model grows into a substantial state-machine framework, evaluate
 PropCheck/PropEr rather than implementing that framework here.
 
-## Targeted protocol properties
+## Targeted protocol and lease properties
 
 `replication_property_test.exs` exercises both registry and PG receiver lanes:
 
@@ -91,6 +92,20 @@ keys retain one owner, leaving owner-conflict resolution to separate scenarios.
 The distributed suite remains necessary for real peer lifecycle and transport
 behavior. These properties do not claim reproducible network races or fairness
 under an infinite stream of control messages.
+
+`cluster_lease_property_test.exs` generates registry, PG, and monitor interest
+combinations across the leased, default, and another named cluster, then varies
+the removal order. Each forced expiry must extend exactly one TTL interval while
+cluster-local interest remains and disconnect once it is gone. Other clusters'
+interest must survive without keeping the leased cluster alive. It also checks
+that repeated connected calls cannot refresh an existing lease or add a lease
+to a plain connection, while a disconnected cluster can acquire a new lease.
+Runs 100 examples with varied shard counts.
+
+Lease deadlines are deliberately moved in ETS and the real lease manager is
+forced to sweep via the existing helper. Long TTLs prevent ordinary timer expiry
+from racing the scenario; a distinct future deadline makes accidental refreshes
+visible even within one clock tick. This checks expiry policy, not timer accuracy.
 
 `Group.PropertyFixture` owns the Group supervisor, owners, and a mailbox-preserving
 observer per example/shrink attempt. It tears them down in `after`, stops
