@@ -12,11 +12,13 @@ defmodule GroupBench.Helpers do
 
   @doc """
   Collects N timing samples by calling `fun` repeatedly.
+  Validates each result outside its measured interval.
   Returns a sorted list of microsecond timings.
   """
-  def collect_samples(n, fun) do
+  def collect_samples(n, fun, validate \\ fn _ -> :ok end) do
     Enum.map(1..n, fn _ ->
-      {us, _} = :timer.tc(fun)
+      {us, result} = :timer.tc(fun)
+      :ok = validate.(result)
       us
     end)
     |> Enum.sort()
@@ -131,56 +133,180 @@ defmodule GroupBench.Helpers do
   end
 
   @doc """
-  Starts a fresh Group instance with the given options, runs `fun`, then stops it.
+  Runs `fun` with a scenario-owned worker supervisor and a fresh Group instance.
+  Both supervisors are stopped synchronously, even when the scenario raises.
   """
   def with_group(opts, fun) do
     opts = Keyword.put_new(opts, :name, :bench)
-    old_trap = Process.flag(:trap_exit, true)
-    {:ok, sup} = Group.start_link(opts)
+    opts = Keyword.put_new(opts, :log, false)
+    {:ok, workers} = Task.Supervisor.start_link()
 
     try do
-      fun.()
-    after
-      Process.unlink(sup)
+      {:ok, sup} = Group.start_link(opts)
 
       try do
-        Supervisor.stop(sup, :shutdown, 5_000)
-      catch
-        :exit, _ -> :ok
+        fun.(workers)
+      after
+        # Registry links subscribers to its partition. Remove this scenario's
+        # subscriptions before shutdown instead of trapping and discarding exits.
+        registry = Group.registry_name(Keyword.fetch!(opts, :name))
+        Enum.each(Registry.keys(registry, self()), &Registry.unregister(registry, &1))
+        Supervisor.stop(sup)
       end
-
-      # Drain any EXIT messages from the stopped supervisor / children
-      drain_exits()
-
-      Process.flag(:trap_exit, old_trap)
-      Process.sleep(50)
-    end
-  end
-
-  defp drain_exits do
-    receive do
-      {:EXIT, _, _} -> drain_exits()
     after
-      0 -> :ok
+      Supervisor.stop(workers)
     end
   end
 
   @doc """
-  Spawns N long-lived processes that stay alive until the caller exits.
-  Returns a list of pids.
+  Provisions N workers, then times releasing them and waiting for successful ops.
+
+  Workers stay alive until the scenario supervisor stops. Provisioning is outside
+  the timed interval, so the worker supervisor is not a throughput bottleneck.
+  `after_ready` optionally waits for event delivery within the same interval.
+  Returns `{microseconds, pids}`.
   """
-  def spawn_processes(n) do
+  def run_workers(supervisor, n, operation, after_ready \\ fn _ -> :ok end, timeout \\ 10_000)
+      when n > 0 do
     parent = self()
+    ref = make_ref()
 
-    Enum.map(1..n, fn _ ->
-      spawn(fn ->
-        ref = Process.monitor(parent)
+    workers =
+      for i <- 1..n do
+        {:ok, pid} =
+          Task.Supervisor.start_child(supervisor, fn ->
+            receive do
+              {:run, ^ref} ->
+                result = operation.(i)
+                send(parent, {ref, self(), result})
+                Process.sleep(:infinity)
+            end
+          end)
 
-        receive do
-          {:DOWN, ^ref, _, _, _} -> :ok
+        {pid, Process.monitor(pid)}
+      end
+
+    pids = Enum.map(workers, &elem(&1, 0))
+    monitors = Map.new(workers)
+
+    try do
+      {us, _} =
+        time_us(fn ->
+          deadline = System.monotonic_time(:millisecond) + timeout
+          Enum.each(pids, &send(&1, {:run, ref}))
+          await_workers(monitors, monitors, ref, deadline)
+          :ok = after_ready.(pids)
+        end)
+
+      {us, pids}
+    after
+      Enum.each(workers, fn {_pid, monitor} -> Process.demonitor(monitor, [:flush]) end)
+    end
+  end
+
+  defp await_workers(pending, _monitors, _ref, _deadline) when map_size(pending) == 0, do: :ok
+
+  defp await_workers(pending, monitors, ref, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^ref, pid, :ok} when is_map_key(pending, pid) ->
+        await_workers(Map.delete(pending, pid), monitors, ref, deadline)
+
+      {^ref, pid, result} when is_map_key(pending, pid) ->
+        raise "benchmark worker #{inspect(pid)} returned #{inspect(result)}, expected :ok"
+
+      {:DOWN, monitor, :process, pid, reason}
+      when is_map_key(monitors, pid) and :erlang.map_get(pid, monitors) == monitor ->
+        raise "benchmark worker #{inspect(pid)} exited: #{inspect(reason)}"
+    after
+      remaining -> raise "timed out waiting for #{map_size(pending)} benchmark workers"
+    end
+  end
+
+  @doc "Checks the exact registry dataset before reporting a benchmark result."
+  def verify_registry(name, entries, opts \\ []) do
+    count = Group.local_registry_count(name, opts)
+
+    if count != length(entries) do
+      raise "unexpected registry count: expected #{length(entries)}, got #{count}"
+    end
+
+    for {key, pid, meta} <- entries do
+      unless Group.lookup(name, key, opts) == {pid, meta} do
+        raise "unexpected registration for #{inspect(key)}"
+      end
+    end
+
+    :ok
+  end
+
+  @doc "Checks exact group membership, including metadata and duplicate entries."
+  def verify_members(name, entries, opts \\ []) do
+    for {key, expected} <-
+          Enum.group_by(entries, &elem(&1, 0), fn {_, pid, meta} -> {pid, meta} end) do
+      unless Enum.sort(Group.members(name, key, opts)) == Enum.sort(expected) do
+        raise "unexpected memberships for #{inspect(key)}"
+      end
+    end
+
+    :ok
+  end
+
+  @doc "Requires exactly the expected registration events, with a bounded total wait."
+  def await_registered_events(name, cluster, entries, timeout \\ 5_000) do
+    pending = MapSet.new(entries)
+
+    if MapSet.size(pending) != length(entries) do
+      raise "duplicate expected registration events"
+    end
+
+    deadline = System.monotonic_time(:millisecond) + timeout
+    receive_registered_events(name, cluster, pending, deadline)
+  end
+
+  defp receive_registered_events(name, cluster, pending, deadline) do
+    timeout =
+      if MapSet.size(pending) == 0,
+        do: 0,
+        else: max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {:group, events, %{name: ^name}} ->
+        pending =
+          Enum.reduce(events, pending, fn
+            %Group.Event{
+              supervisor: ^name,
+              cluster: ^cluster,
+              type: :registered,
+              previous_meta: nil,
+              reason: nil,
+              key: key,
+              pid: pid,
+              meta: meta
+            } = event,
+            pending ->
+              entry = {key, pid, meta}
+
+              unless MapSet.member?(pending, entry) do
+                raise "unexpected or duplicate registration event: #{inspect(event)}"
+              end
+
+              MapSet.delete(pending, entry)
+
+            event, _pending ->
+              raise "unexpected registration event: #{inspect(event)}"
+          end)
+
+        receive_registered_events(name, cluster, pending, deadline)
+    after
+      timeout ->
+        if MapSet.size(pending) != 0 do
+          raise "timed out waiting for #{MapSet.size(pending)} registration events"
         end
-      end)
-    end)
+
+        :ok
+    end
   end
 
   @doc """

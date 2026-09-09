@@ -36,7 +36,7 @@ defmodule GroupBench.Local do
     IO.puts("  samples/query:     #{format_number(samples)}")
 
     Enum.each([1_000, 100_000, 1_000_000], fn cardinality ->
-      with_group([name: @name, shards: shards], fn ->
+      with_group([name: @name, shards: shards], fn _workers ->
         subheader("#{format_number(cardinality)} distinct membership keys")
         {seed_us, :ok} = time_us(fn -> seed_member_count_index(cardinality, shards) end)
 
@@ -57,11 +57,19 @@ defmodule GroupBench.Local do
         IO.puts("  count-index memory: #{Float.round(memory_bytes / 1_048_576, 1)} MiB")
 
         warmup(1_000, fn -> Group.member_count(@name, exact_key) end)
-        exact_samples = collect_samples(samples, fn -> Group.member_count(@name, exact_key) end)
+
+        exact_samples =
+          collect_samples(samples, fn -> Group.member_count(@name, exact_key) end, fn 1 -> :ok end)
+
         report_latency("exact Group.member_count/3", exact_samples)
 
         warmup(1_000, fn -> Group.member_count(@name, prefix) end)
-        prefix_samples = collect_samples(samples, fn -> Group.member_count(@name, prefix) end)
+
+        prefix_samples =
+          collect_samples(samples, fn -> Group.member_count(@name, prefix) end, fn ^cardinality ->
+            :ok
+          end)
+
         report_latency("prefix Group.member_count/3", prefix_samples)
       end)
     end)
@@ -77,32 +85,42 @@ defmodule GroupBench.Local do
     for {cluster_label, cluster_opt} <- clusters() do
       subheader("cluster: #{cluster_label}")
 
-      with_group([name: @name, shards: @default_shards], fn ->
+      with_group([name: @name, shards: @default_shards], fn workers ->
         maybe_connect_cluster(cluster_opt)
         key_count = 10_000
         measure_count = 100_000
 
         # Each process registers itself
-        pids =
-          register_from_spawned_processes(key_count, fn i ->
+        {_, pids} =
+          run_workers(workers, key_count, fn i ->
             Group.register(@name, "key-#{i}", %{i: i}, cluster_opts(cluster_opt))
           end)
 
-        try do
-          # warmup
-          warmup(1_000, fn -> Group.lookup(@name, "key-1", cluster_opts(cluster_opt)) end)
+        entries = indexed_entries(pids, &"key-#{&1}", &%{i: &1})
+        verify_registry(@name, entries, cluster_opts(cluster_opt))
+        expected = entries |> Enum.map(fn {_, pid, meta} -> {pid, meta} end) |> List.to_tuple()
 
-          # measure
-          samples =
-            collect_samples(measure_count, fn ->
+        # warmup
+        warmup(1_000, fn -> Group.lookup(@name, "key-1", cluster_opts(cluster_opt)) end)
+
+        # measure
+        samples =
+          collect_samples(
+            measure_count,
+            fn ->
               i = :rand.uniform(key_count)
-              Group.lookup(@name, "key-#{i}", cluster_opts(cluster_opt))
-            end)
+              {i, Group.lookup(@name, "key-#{i}", cluster_opts(cluster_opt))}
+            end,
+            fn {i, actual} ->
+              if actual != elem(expected, i - 1),
+                do: raise("incorrect lookup sample for key-#{i}")
 
-          report_latency("Group.lookup/3", samples)
-        after
-          stop_spawned_processes(pids)
-        end
+              :ok
+            end
+          )
+
+        verify_registry(@name, entries, cluster_opts(cluster_opt))
+        report_latency("Group.lookup/3", samples)
       end)
     end
   end
@@ -115,7 +133,7 @@ defmodule GroupBench.Local do
     for {cluster_label, cluster_opt} <- clusters() do
       subheader("cluster: #{cluster_label}")
 
-      with_group([name: @name, shards: @default_shards], fn ->
+      with_group([name: @name, shards: @default_shards], fn workers ->
         maybe_connect_cluster(cluster_opt)
         group_count = 100
         members_per_group = 100
@@ -124,25 +142,40 @@ defmodule GroupBench.Local do
         total = group_count * members_per_group
 
         # Each process joins a group
-        pids =
-          register_from_spawned_processes(total, fn i ->
-            gi = rem(i - 1, group_count) + 1
-            Group.join(@name, "group-#{gi}", %{}, cluster_opts(cluster_opt))
+        group_key = fn i -> "group-#{rem(i - 1, group_count) + 1}" end
+
+        {_, pids} =
+          run_workers(workers, total, fn i ->
+            Group.join(@name, group_key.(i), %{}, cluster_opts(cluster_opt))
           end)
 
-        try do
-          warmup(1_000, fn -> Group.members(@name, "group-1", cluster_opts(cluster_opt)) end)
+        entries = indexed_entries(pids, group_key, fn _ -> %{} end)
+        verify_members(@name, entries, cluster_opts(cluster_opt))
 
-          samples =
-            collect_samples(measure_count, fn ->
-              gi = :rand.uniform(group_count)
-              Group.members(@name, "group-#{gi}", cluster_opts(cluster_opt))
-            end)
+        expected =
+          entries
+          |> Enum.group_by(&elem(&1, 0), fn {_, pid, meta} -> {pid, meta} end)
+          |> Map.new(fn {key, members} -> {key, Enum.sort(members)} end)
 
-          report_latency("Group.members/3", samples)
-        after
-          stop_spawned_processes(pids)
-        end
+        warmup(1_000, fn -> Group.members(@name, "group-1", cluster_opts(cluster_opt)) end)
+
+        samples =
+          collect_samples(
+            measure_count,
+            fn ->
+              key = "group-#{:rand.uniform(group_count)}"
+              {key, Group.members(@name, key, cluster_opts(cluster_opt))}
+            end,
+            fn {key, actual} ->
+              if Enum.sort(actual) != Map.fetch!(expected, key),
+                do: raise("incorrect members sample for #{key}")
+
+              :ok
+            end
+          )
+
+        verify_members(@name, entries, cluster_opts(cluster_opt))
+        report_latency("Group.members/3", samples)
       end)
     end
   end
@@ -158,21 +191,17 @@ defmodule GroupBench.Local do
       subheader("cluster: #{cluster_label}")
 
       for shards <- @shard_counts do
-        with_group([name: @name, shards: shards], fn ->
+        with_group([name: @name, shards: shards], fn workers ->
           maybe_connect_cluster(cluster_opt)
 
           {wall_us, pids} =
-            time_us(fn ->
-              register_from_spawned_processes(n, fn i ->
-                Group.register(@name, "reg-#{i}", %{}, cluster_opts(cluster_opt))
-              end)
+            run_workers(workers, n, fn i ->
+              Group.register(@name, "reg-#{i}", %{}, cluster_opts(cluster_opt))
             end)
 
-          try do
-            report_throughput("shards=#{shards}", n, wall_us)
-          after
-            stop_spawned_processes(pids)
-          end
+          entries = indexed_entries(pids, &"reg-#{&1}", fn _ -> %{} end)
+          verify_registry(@name, entries, cluster_opts(cluster_opt))
+          report_throughput("shards=#{shards}", n, wall_us)
         end)
       end
     end
@@ -188,7 +217,7 @@ defmodule GroupBench.Local do
     for {cluster_label, cluster_opt} <- clusters() do
       subheader("cluster: #{cluster_label}")
 
-      with_group([name: @name, shards: @default_shards], fn ->
+      with_group([name: @name, shards: @default_shards], fn _workers ->
         maybe_connect_cluster(cluster_opt)
         opts = cluster_opts(cluster_opt)
 
@@ -200,6 +229,7 @@ defmodule GroupBench.Local do
             :ok = Group.unregister(@name, key, opts)
           end)
 
+        verify_registry(@name, [], opts)
         report_latency("register+unregister", samples)
       end)
     end
@@ -216,21 +246,18 @@ defmodule GroupBench.Local do
       subheader("cluster: #{cluster_label}")
 
       for shards <- @shard_counts do
-        with_group([name: @name, shards: shards], fn ->
+        with_group([name: @name, shards: shards], fn workers ->
           maybe_connect_cluster(cluster_opt)
+          group_key = fn i -> "join-group-#{rem(i, 100)}" end
 
           {wall_us, pids} =
-            time_us(fn ->
-              register_from_spawned_processes(n, fn i ->
-                Group.join(@name, "join-group-#{rem(i, 100)}", %{}, cluster_opts(cluster_opt))
-              end)
+            run_workers(workers, n, fn i ->
+              Group.join(@name, group_key.(i), %{}, cluster_opts(cluster_opt))
             end)
 
-          try do
-            report_throughput("shards=#{shards}", n, wall_us)
-          after
-            stop_spawned_processes(pids)
-          end
+          entries = indexed_entries(pids, group_key, fn _ -> %{} end)
+          verify_members(@name, entries, cluster_opts(cluster_opt))
+          report_throughput("shards=#{shards}", n, wall_us)
         end)
       end
     end
@@ -246,7 +273,7 @@ defmodule GroupBench.Local do
     for {cluster_label, cluster_opt} <- clusters() do
       subheader("cluster: #{cluster_label}")
 
-      with_group([name: @name, shards: @default_shards], fn ->
+      with_group([name: @name, shards: @default_shards], fn _workers ->
         maybe_connect_cluster(cluster_opt)
         opts = cluster_opts(cluster_opt)
 
@@ -257,6 +284,7 @@ defmodule GroupBench.Local do
             :ok = Group.leave(@name, key, opts)
           end)
 
+        0 = Group.member_count(@name, "cycle/group/", opts)
         report_latency("join+leave (two slash-prefixes)", samples)
       end)
     end
@@ -272,28 +300,27 @@ defmodule GroupBench.Local do
     for {cluster_label, cluster_opt} <- clusters() do
       subheader("cluster: #{cluster_label}")
 
-      with_group([name: @name, shards: @default_shards], fn ->
+      with_group([name: @name, shards: @default_shards], fn workers ->
         maybe_connect_cluster(cluster_opt)
         :ok = Group.monitor(@name, :all, cluster_opts(cluster_opt))
         drain_stale_group_events()
 
         {wall_us, pids} =
-          time_us(fn ->
-            pids =
-              register_from_spawned_processes(n, fn i ->
-                Group.register(@name, "mon-#{i}", %{}, cluster_opts(cluster_opt))
-              end)
+          run_workers(
+            workers,
+            n,
+            fn i ->
+              Group.register(@name, "mon-#{i}", %{}, cluster_opts(cluster_opt))
+            end,
+            fn pids ->
+              entries = indexed_entries(pids, &"mon-#{&1}", fn _ -> %{} end)
+              await_registered_events(@name, cluster_opt, entries)
+            end
+          )
 
-            # drain all N events
-            drain_events(n)
-            pids
-          end)
-
-        try do
-          report_throughput("events (register → receive)", n, wall_us)
-        after
-          stop_spawned_processes(pids)
-        end
+        entries = indexed_entries(pids, &"mon-#{&1}", fn _ -> %{} end)
+        verify_registry(@name, entries, cluster_opts(cluster_opt))
+        report_throughput("events (register → validated receipt)", n, wall_us)
       end)
     end
   end
@@ -310,45 +337,11 @@ defmodule GroupBench.Local do
   defp cluster_opts(nil), do: []
   defp cluster_opts(cluster), do: [cluster: cluster]
 
-  @doc false
-  # Spawns N processes, each of which calls `fun.(index)` where index is 1..n.
-  # Processes stay alive after the call. Waits for all to complete.
-  defp register_from_spawned_processes(n, fun) do
-    parent = self()
-
-    pids =
-      Enum.map(1..n, fn i ->
-        spawn(fn ->
-          result = fun.(i)
-          send(parent, {:done, self(), result})
-
-          # Stay alive so the registration/membership persists
-          Process.sleep(:infinity)
-        end)
-      end)
-
-    # Wait for all to complete
-    Enum.each(pids, fn pid ->
-      receive do
-        {:done, ^pid, _result} -> :ok
-      after
-        10_000 -> raise "Timed out waiting for #{inspect(pid)}"
-      end
-    end)
-
+  defp indexed_entries(pids, key, meta) do
     pids
-  end
-
-  defp stop_spawned_processes(pids) do
-    refs = Enum.map(pids, &{&1, Process.monitor(&1)})
-    Enum.each(pids, &Process.exit(&1, :kill))
-
-    Enum.each(refs, fn {pid, ref} ->
-      receive do
-        {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
-      after
-        5_000 -> raise "Timed out stopping #{inspect(pid)}"
-      end
+    |> Enum.with_index(1)
+    |> Enum.map(fn {pid, i} ->
+      {key.(i), pid, meta.(i)}
     end)
   end
 
@@ -391,18 +384,6 @@ defmodule GroupBench.Local do
     end)
 
     :ok
-  end
-
-  defp drain_events(0), do: :ok
-
-  defp drain_events(remaining) do
-    receive do
-      {:group, events, _info} ->
-        count = Enum.count(events, &match?(%Group.Event{type: :registered}, &1))
-        drain_events(remaining - count)
-    after
-      5_000 -> IO.puts("    WARNING: timed out waiting for events, #{remaining} remaining")
-    end
   end
 
   defp drain_stale_group_events do

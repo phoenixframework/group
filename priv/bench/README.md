@@ -34,6 +34,28 @@ lookup behavior as that dynamic ETS table grows without requiring one million
 live BEAM processes. The normal join/leave and recovery scenarios measure the
 write and rebuild costs through real Group paths.
 
+Each local scenario owns a worker supervisor and stops every worker before the
+next scenario starts, including on failure. Operations must return `:ok`;
+worker exits and timeouts abort the run. Registry and membership datasets are
+checked before results are reported, and each read sample is validated outside
+its measured interval.
+
+Write workers are provisioned before timing begins. The write interval covers
+releasing the workers and waiting for successful operations, not process or
+worker-supervisor startup. Event delivery additionally includes validating the
+exact registration events (key, PID, metadata, cluster, and type); missing,
+unexpected, or duplicate events invalidate the result.
+
+These timing boundaries and scenario isolation differ from earlier versions.
+Establish a fresh baseline rather than comparing directly to old throughput
+numbers.
+
+The local harness has its own regression suite. From `priv/bench`, run:
+
+```bash
+mix test
+```
+
 ### Distributed benchmarks
 
 Uses 3 separate BEAM VMs (coordinator + 2 replicas) as OS processes:
@@ -109,8 +131,8 @@ Slower than lookup because each call copies a 100-element list out of ETS.
 
 ### 3. Register throughput (shard scaling)
 
-Measures concurrent `Group.register/4` calls — each of 10K spawned processes
-registers itself in parallel. Uses the library default of 8 shards for the
+Measures concurrent `Group.register/4` calls — each of 10K pre-provisioned
+workers registers itself. Uses the library default of 8 shards for the
 non-scaling scenarios and a fixed 1, 2, 4, 8, 16, 32, 64 shard sweep. The
 fixed sweep keeps results comparable across machines and avoids treating BEAM
 scheduler count as a shard-count recommendation.
@@ -124,8 +146,8 @@ Reports per-cycle latency percentiles.
 
 ### 5. Join throughput (shard scaling)
 
-Same shape as register throughput but with `Group.join/4`. 10K processes each
-join a group concurrently, varying shard count.
+Same shape as register throughput but with `Group.join/4`. 10K pre-provisioned
+workers each join a group concurrently, varying shard count.
 
 ### 6. Join/leave cycle
 
@@ -135,7 +157,8 @@ quantifies the materialized counter write amplification on the public API path.
 ### 7. Monitor event delivery
 
 Calls `Group.monitor(:bench, :all)`, then registers 5K keys and measures the
-time until all 5K `:registered` events are received by the monitoring process.
+time until all 5K `:registered` events are received and validated by the
+monitoring process.
 
 ## Distributed Scenarios
 
