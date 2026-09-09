@@ -5,6 +5,7 @@
 ```bash
 mix test                           # all tests
 mix test test/group_test.exs       # local only
+mix test test/group_property_test.exs # local model properties
 mix test test/distributed_test.exs # distributed only
 ```
 
@@ -13,7 +14,55 @@ mix test test/distributed_test.exs # distributed only
 | File | What it tests |
 |------|---------------|
 | `group_test.exs` | Single-node: register/unregister, join/leave, members, monitor/demonitor, named clusters, concurrent operations |
+| `group_property_test.exs` | StreamData local command histories checked against an independent map/set model |
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts |
+
+## Local model properties
+
+`group_property_test.exs` runs 100 generated histories of up to 60 commands,
+with 1, 2, or 4 shards. Three symbolic actor IDs, five shared keys, small metadata
+values, and two named clusters keep collisions, repeated operations, and updates
+likely. Commands cover register/re-register, unregister (including another local
+owner's registration), join/re-join, leave, owner death, connect/disconnect, and
+exact/prefix/all monitor subscriptions. A killed actor is replaced with a fresh
+process in the same symbolic slot so later commands remain executable.
+
+After **every** command, the suite compares:
+
+- Return values, including errors and rejected writes to disconnected clusters.
+- All local entries against an independent map of registry owners and PG members.
+- Lookup, exact/prefix members, local members, and registry/member counts in every
+  cluster, including clusters the node has left.
+- Monitor events, including metadata, previous metadata, reasons, duplicate
+  delivery, and overlapping subscriptions.
+- ETS dual-index consistency using the existing `TestCluster` checker.
+
+Reads are assertions after every command rather than generated read commands.
+Death cleanup explicitly waits for each shard to release the owner's monitor.
+Mailbox barriers then settle event delivery to a dedicated observer. Events are
+compared as multisets within a command because cleanup across shards has no
+global ordering guarantee; successive commands are checked separately.
+
+The Group supervisor, owners, observer, subscriptions, ETS tables, and model are
+fresh for **each generated example and each shrink attempt**. Teardown runs in
+`after`, and a fixed Group name avoids allocating atoms per generated example.
+A hand-written history also exercises model branches that random short histories
+can miss.
+
+To reproduce a failure, use the seed printed by ExUnit:
+
+```bash
+mix test test/group_property_test.exs --seed 12345
+```
+
+StreamData reports the shrunk command sequence. Promote discovered failures to
+focused regression tests. A seed reproduces generation, not BEAM scheduling.
+This suite deliberately settles between commands: it does **not** test remote
+batch boundaries, equal-timestamp conflicts, stale replication after disconnect,
+TTL, or fairness under remote load. Those need separate targeted properties on
+top of the existing distributed tests, not more machinery in this local model.
+If the model grows into a substantial state-machine framework, evaluate
+PropCheck/PropEr rather than implementing that framework here.
 
 ## How distribution works
 
