@@ -92,18 +92,34 @@ defmodule Group.DistributedTest do
         members = TestCluster.rpc!(node_b, Group, :members, [name, "room/1"])
 
         case members do
-          [{pid, %{role: :player}}] when is_pid(pid) -> true
-          _ -> false
+          [{pid, %{role: :player}}] when is_pid(pid) ->
+            TestCluster.rpc!(node_a, Group, :member_count, [name, "room/1"]) == 1 and
+              TestCluster.rpc!(node_a, Group, :local_member_count, [name, "room/1"]) == 1 and
+              TestCluster.rpc!(node_b, Group, :member_count, [name, "room/1"]) == 1 and
+              TestCluster.rpc!(node_b, Group, :local_member_count, [name, "room/1"]) == 0 and
+              TestCluster.rpc!(node_b, Group, :member_count, [name, "room/"]) == 1
+
+          _ ->
+            false
         end
       end)
+
+      assert :ok = TestCluster.rpc!(node_a, TestCluster, :assert_ets_consistent, [name])
+      assert :ok = TestCluster.rpc!(node_b, TestCluster, :assert_ets_consistent, [name])
 
       # Kill process on A
       Process.exit(remote_pid, :kill)
 
       # Should be gone from node B
       TestCluster.assert_eventually(fn ->
-        TestCluster.rpc!(node_b, Group, :members, [name, "room/1"]) == []
+        TestCluster.rpc!(node_b, Group, :members, [name, "room/1"]) == [] and
+          TestCluster.rpc!(node_a, Group, :member_count, [name, "room/1"]) == 0 and
+          TestCluster.rpc!(node_b, Group, :member_count, [name, "room/1"]) == 0 and
+          TestCluster.rpc!(node_b, Group, :member_count, [name, "room/"]) == 0
       end)
+
+      assert :ok = TestCluster.rpc!(node_a, TestCluster, :assert_ets_consistent, [name])
+      assert :ok = TestCluster.rpc!(node_b, TestCluster, :assert_ets_consistent, [name])
     end
   end
 
@@ -555,10 +571,10 @@ defmodule Group.DistributedTest do
         timeout: 10_000
       )
 
-      # Custom resolvers own process lifecycle decisions. This resolver only
-      # picks a registry winner, so neither owner is terminated by Group.
-      assert TestCluster.rpc!(node_a, Process, :alive?, [pid_a])
+      # The resolver selects the winner; each origin is responsible for
+      # retiring (and terminating) only its own losing owner.
       assert TestCluster.rpc!(node_b, Process, :alive?, [pid_b])
+      refute TestCluster.rpc!(node_a, Process, :alive?, [pid_a])
     end
   end
 
@@ -1025,6 +1041,8 @@ defmodule Group.DistributedTest do
       cluster = "game"
       registry_key = "remote/registry"
       pg_key = "remote/pg"
+      retained_registry_key = "remote/registry/retained"
+      retained_pg_key = "remote/pg/retained"
 
       start_group_on_peers(peers, name: name, shards: 2)
 
@@ -1045,13 +1063,47 @@ defmodule Group.DistributedTest do
 
       pg_pid = TestCluster.spawn_join(node_b, name, pg_key, %{from: :b}, cluster: cluster)
 
+      retained_registry_pid =
+        TestCluster.spawn_register_in_cluster(
+          node_b,
+          name,
+          retained_registry_key,
+          %{from: :b, retained: true},
+          cluster
+        )
+
+      retained_pg_pid =
+        TestCluster.spawn_join(
+          node_b,
+          name,
+          retained_pg_key,
+          %{from: :b, retained: true},
+          cluster: cluster
+        )
+
       TestCluster.assert_eventually(fn ->
         TestCluster.rpc!(node_a, Group, :lookup, [
           name,
           registry_key,
           [cluster: cluster]
         ]) != nil and
-          TestCluster.rpc!(node_a, Group, :members, [name, pg_key, [cluster: cluster]]) != []
+          TestCluster.rpc!(node_a, Group, :members, [name, pg_key, [cluster: cluster]]) != [] and
+          match?(
+            {^retained_registry_pid, _},
+            TestCluster.rpc!(node_a, Group, :lookup, [
+              name,
+              retained_registry_key,
+              [cluster: cluster]
+            ])
+          ) and
+          match?(
+            [{^retained_pg_pid, _}],
+            TestCluster.rpc!(node_a, Group, :members, [
+              name,
+              retained_pg_key,
+              [cluster: cluster]
+            ])
+          )
       end)
 
       assert :ok = TestCluster.rpc!(node_a, Group, :disconnect, [name, cluster])
@@ -1088,6 +1140,25 @@ defmodule Group.DistributedTest do
              ]) == nil
 
       assert TestCluster.rpc!(node_a, Group, :members, [name, pg_key, [cluster: cluster]]) == []
+
+      TestCluster.assert_eventually(fn ->
+        match?(
+          {^retained_registry_pid, %{from: :b, retained: true}},
+          TestCluster.rpc!(node_a, Group, :lookup, [
+            name,
+            retained_registry_key,
+            [cluster: cluster]
+          ])
+        ) and
+          match?(
+            [{^retained_pg_pid, %{from: :b, retained: true}}],
+            TestCluster.rpc!(node_a, Group, :members, [
+              name,
+              retained_pg_key,
+              [cluster: cluster]
+            ])
+          )
+      end)
     end
 
     test "local join does not overtake an earlier remote cluster_disconnect after replicated PG flush" do
@@ -1778,21 +1849,30 @@ defmodule Group.DistributedTest do
         messages = TestCluster.shard_messages(node_b, name, 0)
 
         case Enum.filter(messages, fn
-               {:replicate_registry_batch, _ops} -> true
-               {:cluster_disconnect, ["game"], _remote_pid} -> true
-               _ -> false
+               {:group_replica_frame, _source, {:delta_batch, _version, _runs}} ->
+                 true
+
+               {:replica_cluster_close, _remote_pid, _generation, _revision, [{"game", _epoch}]} ->
+                 true
+
+               _ ->
+                 false
              end) do
           [
-            {:replicate_registry_batch, ops},
-            {:cluster_disconnect, ["game"], _remote_pid}
+            {:group_replica_frame, _source, {:delta_batch, _version, runs}},
+            {:replica_cluster_close, _remote_pid, _generation, _revision, [{"game", _epoch}]}
           ] ->
-            Enum.any?(ops, fn
-              {:register, "game", ^key, reg_pid, %{v: 1}, _time, _entry_node}
-              when reg_pid == pid ->
-                true
+            Enum.any?(runs, fn {_stream_id, _first_seq, records, _head} ->
+              Enum.any?(records, fn {_seq, mutations} ->
+                Enum.any?(mutations, fn
+                  {:register, "game", ^key, reg_pid, %{v: 1}, _time, _entry_node}
+                  when reg_pid == pid ->
+                    true
 
-              _ ->
-                false
+                  _ ->
+                    false
+                end)
+              end)
             end)
 
           _ ->
@@ -2290,14 +2370,27 @@ defmodule Group.DistributedTest do
 
       # --- Phase 4: verify all data converged on all nodes ---
       # Check registrations: every node should see every registration
-      for {_reg_node, cluster, key} <- reg_pids do
+      for {reg_node, cluster, key} <- reg_pids do
         TestCluster.assert_eventually(
           fn ->
             Enum.all?(nodes, fn check_node ->
               TestCluster.rpc!(check_node, Group, :lookup, [name, key, [cluster: cluster]]) != nil
             end)
           end,
-          timeout: 10_000
+          timeout: 10_000,
+          diagnostic: fn ->
+            Map.new(nodes, fn check_node ->
+              state =
+                TestCluster.rpc!(
+                  check_node,
+                  Group.TestCluster,
+                  :replica_registry_replication_state,
+                  [name, cluster, key, reg_node]
+                )
+
+              {check_node, state}
+            end)
+          end
         )
       end
 
@@ -2354,18 +2447,55 @@ defmodule Group.DistributedTest do
       TestCluster.rpc!(node_a, Group, :disconnect, [name, dropped_cluster])
 
       # A's registrations in org/10 should be gone everywhere
-      TestCluster.assert_eventually(
-        fn ->
-          Enum.all?(nodes, fn check_node ->
-            TestCluster.rpc!(check_node, Group, :lookup, [
-              name,
-              "user/0_1",
-              [cluster: dropped_cluster]
-            ]) == nil
-          end)
-        end,
-        timeout: 10_000
-      )
+      try do
+        TestCluster.assert_eventually(
+          fn ->
+            Enum.all?(nodes, fn check_node ->
+              TestCluster.rpc!(check_node, Group, :lookup, [
+                name,
+                "user/0_1",
+                [cluster: dropped_cluster]
+              ]) == nil
+            end)
+          end,
+          timeout: 10_000
+        )
+      rescue
+        error ->
+          diagnostics =
+            for check_node <- nodes do
+              lookup =
+                TestCluster.rpc!(check_node, Group, :lookup, [
+                  name,
+                  "user/0_1",
+                  [cluster: dropped_cluster]
+                ])
+
+              protocol =
+                TestCluster.rpc!(
+                  check_node,
+                  Group.TestCluster,
+                  :replica_protocol_state,
+                  [name]
+                )
+                |> Enum.map(fn %{shard: shard, cursors: cursors} ->
+                  relevant =
+                    Enum.filter(cursors, fn {stream_id, _seq} ->
+                      Group.Replica.WireProtocol.stream_origin(stream_id) == node_a and
+                        Group.Replica.WireProtocol.stream_cluster(stream_id) == dropped_cluster
+                    end)
+
+                  {shard, relevant}
+                end)
+
+              {check_node, lookup, protocol}
+            end
+
+          flunk(
+            "cluster disconnect convergence failed: #{Exception.message(error)} " <>
+              "diagnostics=#{inspect(diagnostics, limit: :infinity)}"
+          )
+      end
 
       # B and C still see each other's org/10 data
       TestCluster.assert_eventually(fn ->
@@ -3601,11 +3731,11 @@ defmodule Group.DistributedTest do
       assert Enum.map(left_events, & &1.key) |> Enum.sort() == Enum.sort(keys)
     end
 
-    test "partition heal (cluster_state merge) batches new entries into one message" do
-      peers = TestCluster.start_peers(2)
+    test "partition-heal delta catch-up batches same-stream entries into one message" do
+      peers = TestCluster.start_peers(3)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
 
-      [{_, node_a}, {_, node_b}] = peers
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
       num_shards = 4
       name = :"batch_heal_#{System.unique_integer([:positive])}"
       opts = [name: name, shards: num_shards]
@@ -3613,7 +3743,18 @@ defmodule Group.DistributedTest do
       start_group_on_peers(peers, opts)
 
       TestCluster.assert_eventually(fn ->
-        TestCluster.rpc!(node_a, Group, :nodes, [name]) == [node_b]
+        Enum.sort(TestCluster.rpc!(node_a, Group, :nodes, [name])) ==
+          Enum.sort([node_b, node_c])
+      end)
+
+      survivor_key = "heal_batch/survivor"
+      survivor = TestCluster.spawn_register(node_c, name, survivor_key, %{owner: :c})
+
+      TestCluster.assert_eventually(fn ->
+        match?(
+          {^survivor, %{owner: :c}},
+          TestCluster.rpc!(node_b, Group, :lookup, [name, survivor_key])
+        )
       end)
 
       # Partition
@@ -3639,7 +3780,7 @@ defmodule Group.DistributedTest do
       forwarder = TestCluster.spawn_batch_forwarder(node_b, name, :all, self())
       assert_receive {:monitor_ready, ^forwarder}, 1000
 
-      # Reconnect — cluster_state exchange merges all 3 entries in one handler turn
+      # Reconnect — one contiguous delta run applies all 3 entries in one turn.
       TestCluster.reconnect_nodes(node_a, node_b)
 
       # All 3 :registered events should arrive in a single batch
@@ -3647,6 +3788,9 @@ defmodule Group.DistributedTest do
       reg_events = Enum.filter(events, &(&1.type == :registered))
       assert length(reg_events) == 3
       assert Enum.map(reg_events, & &1.key) |> Enum.sort() == Enum.sort(keys)
+
+      assert {^survivor, %{owner: :c}} =
+               TestCluster.rpc!(node_b, Group, :lookup, [name, survivor_key])
     end
 
     test "Group.connect on existing cluster batches incoming data" do
@@ -3683,7 +3827,7 @@ defmodule Group.DistributedTest do
 
       assert_receive {:monitor_ready, ^forwarder}, 1000
 
-      # A connects — receives cluster_state with all 3 entries from B
+      # A connects — stream heads trigger sequenced catch-up for all 3 entries.
       TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
 
       # All 3 :joined events should arrive in a single batch
@@ -3831,6 +3975,2004 @@ defmodule Group.DistributedTest do
       # Prefix query should find only the join
       members = TestCluster.rpc!(node_a, Group, :members, [name, "svc/"])
       assert [{_, %{type: :pg}}] = members
+    end
+  end
+
+  describe "replica transport anti-entropy" do
+    @tag timeout: 60_000
+    test "dropped tails and dropped deletes converge without orphaning registry or PG rows" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_drop_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 1_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+
+      reg_key = "anti-entropy/dropped-register"
+      pg_key = "anti-entropy/dropped-join"
+      reg_pid = TestCluster.spawn_register(node_a, name, reg_key, %{owner: :a})
+      pg_pid = TestCluster.spawn_join(node_a, name, pg_key, %{owner: :a})
+      Process.sleep(100)
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key]) == nil
+      assert TestCluster.rpc!(node_b, Group, :members, [name, pg_key]) == []
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :pass])
+
+      TestCluster.assert_eventually(fn ->
+        match?({^reg_pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key])) and
+          match?([{^pg_pid, _}], TestCluster.rpc!(node_b, Group, :members, [name, pg_key]))
+      end)
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+      TestCluster.rpc!(node_a, Process, :exit, [reg_pid, :kill])
+      TestCluster.rpc!(node_a, Process, :exit, [pg_pid, :kill])
+      TestCluster.flush_shards(node_a, name)
+
+      assert match?({^reg_pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key]))
+      assert match?([{^pg_pid, _}], TestCluster.rpc!(node_b, Group, :members, [name, pg_key]))
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :pass])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key]) == nil and
+          TestCluster.rpc!(node_b, Group, :members, [name, pg_key]) == []
+      end)
+    end
+
+    @tag timeout: 60_000
+    test "busy sends recover from the advertised stream head" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_busy_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 1_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :busy])
+      key = "anti-entropy/busy"
+      pid = TestCluster.spawn_register(node_a, name, key, %{})
+      Process.sleep(100)
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :pass])
+
+      TestCluster.assert_eventually(fn ->
+        match?({^pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, key]))
+      end)
+    end
+
+    @tag timeout: 60_000
+    test "a pruned gap falls back to an exact origin snapshot and removes stale rows" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_snapshot_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 1_000,
+        replicated_oplog_max_entries: 2
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      stale_reg_key = "anti-entropy/snapshot/stale-reg"
+      stale_pg_key = "anti-entropy/snapshot/stale-pg"
+      stale_reg_pid = TestCluster.spawn_register(node_a, name, stale_reg_key, %{})
+      stale_pg_pid = TestCluster.spawn_join(node_a, name, stale_pg_key, %{})
+
+      TestCluster.assert_eventually(fn ->
+        match?(
+          {^stale_reg_pid, _},
+          TestCluster.rpc!(node_b, Group, :lookup, [name, stale_reg_key])
+        ) and
+          match?(
+            [{^stale_pg_pid, _}],
+            TestCluster.rpc!(node_b, Group, :members, [name, stale_pg_key])
+          )
+      end)
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+      TestCluster.rpc!(node_a, Process, :exit, [stale_reg_pid, :kill])
+      TestCluster.rpc!(node_a, Process, :exit, [stale_pg_pid, :kill])
+
+      fresh_keys = for i <- 1..6, do: "anti-entropy/snapshot/fresh-#{i}"
+      fresh_pids = for key <- fresh_keys, do: TestCluster.spawn_register(node_a, name, key, %{})
+      TestCluster.flush_shards(node_a, name)
+
+      [{_stream_id, floor, head}] =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :replica_stream_heads, [name, 0])
+
+      assert floor > 3
+      assert head >= 10
+
+      assert match?(
+               {^stale_reg_pid, _},
+               TestCluster.rpc!(node_b, Group, :lookup, [name, stale_reg_key])
+             )
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :pass])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, stale_reg_key]) == nil and
+          TestCluster.rpc!(node_b, Group, :members, [name, stale_pg_key]) == [] and
+          Enum.zip(fresh_keys, fresh_pids)
+          |> Enum.all?(fn {key, pid} ->
+            match?({^pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, key]))
+          end)
+      end)
+    end
+
+    @tag timeout: 60_000
+    test "the control lease removes a stopped Group on a still-connected node and probes recovery" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_lease_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 150
+      ]
+
+      start_group_on_peers(peers, opts)
+      key = "anti-entropy/lease/stale"
+      stale_pid = TestCluster.spawn_register(node_a, name, key, %{})
+
+      TestCluster.assert_eventually(fn ->
+        match?({^stale_pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, key]))
+      end)
+
+      supervisor = TestCluster.rpc!(node_a, Process, :whereis, [:"#{name}_group_sup"])
+      :ok = TestCluster.rpc!(node_a, Supervisor, :stop, [supervisor, :normal, 5_000])
+      assert TestCluster.rpc!(node_b, Node, :ping, [node_a]) == :pong
+
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil and
+            node_a not in TestCluster.rpc!(node_b, Group, :nodes, [name])
+        end,
+        timeout: 5_000
+      )
+
+      {:ok, _pid} = TestCluster.start_group(node_a, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      recovered_key = "anti-entropy/lease/recovered"
+      recovered_pid = TestCluster.spawn_register(node_a, name, recovered_key, %{})
+
+      TestCluster.assert_eventually(fn ->
+        match?(
+          {^recovered_pid, _},
+          TestCluster.rpc!(node_b, Group, :lookup, [name, recovered_key])
+        )
+      end)
+    end
+
+    @tag timeout: 60_000
+    test "a restarted data lane sweeps a cluster close missed while it was down" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_lane_restart_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 2,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 1_000
+      ]
+
+      start_group_on_peers(peers, opts)
+      :ok = TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      :ok = TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      reg_key =
+        Enum.find(1..1_000, fn suffix ->
+          Group.Replica.shard_index_for("game", "lane-reg-#{suffix}", 2) == 1
+        end)
+        |> then(&"lane-reg-#{&1}")
+
+      pg_key =
+        Enum.find(1..1_000, fn suffix ->
+          Group.Replica.shard_index_for("game", "lane-pg-#{suffix}", 2) == 1
+        end)
+        |> then(&"lane-pg-#{&1}")
+
+      reg_pid = TestCluster.spawn_register_in_cluster(node_a, name, reg_key, %{}, "game")
+      pg_pid = TestCluster.spawn_join(node_a, name, pg_key, %{}, cluster: "game")
+
+      TestCluster.assert_eventually(fn ->
+        match?(
+          {^reg_pid, _},
+          TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key, [cluster: "game"]])
+        ) and
+          match?(
+            [{^pg_pid, _}],
+            TestCluster.rpc!(node_b, Group, :members, [name, pg_key, [cluster: "game"]])
+          )
+      end)
+
+      old_lane = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 1)])
+      :ok = TestCluster.rpc!(node_b, :sys, :suspend, [old_lane])
+
+      :ok = TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        is_nil(
+          TestCluster.rpc!(node_b, Group.Replica.Data, :remote_cluster_epoch, [
+            name,
+            node_a,
+            "game"
+          ])
+        )
+      end)
+
+      control = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 0)])
+      _state = TestCluster.rpc!(node_b, :sys, :get_state, [control])
+
+      messages = TestCluster.rpc!(node_b, Process, :info, [old_lane, :messages])
+
+      assert {:messages, queued} = messages
+
+      assert Enum.any?(queued, fn
+               {:replica_cluster_close_control_local, ^node_a, _generation, _revision,
+                [{"game", _epoch}]} ->
+                 true
+
+               _ ->
+                 false
+             end)
+
+      true = TestCluster.rpc!(node_b, Process, :exit, [old_lane, :kill])
+
+      TestCluster.assert_eventually(fn ->
+        case TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 1)]) do
+          lane when is_pid(lane) -> lane != old_lane
+          _ -> false
+        end
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key, [cluster: "game"]]) == nil and
+          TestCluster.rpc!(node_b, Group, :members, [name, pg_key, [cluster: "game"]]) == []
+      end)
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "full and incremental authority install once through shard zero" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_authority_topology_#{System.unique_integer([:positive])}"
+      shards = 3
+
+      opts = [
+        name: name,
+        shards: shards,
+        replicated_anti_entropy_interval: 600_000,
+        replicated_peer_lease_timeout: 1_200_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      b_lanes =
+        for shard <- 0..(shards - 1) do
+          {shard, TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, shard)])}
+        end
+
+      Enum.each(b_lanes, fn {_shard, pid} ->
+        :ok = TestCluster.rpc!(node_b, :sys, :suspend, [pid])
+      end)
+
+      installs_before =
+        TestCluster.rpc!(
+          node_b,
+          Group.Replica.Data,
+          :remote_authority_install_count,
+          [name, node_a]
+        )
+
+      [_authority_epoch] =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :activate_local_clusters, [
+          name,
+          ["authority-new"]
+        ])
+
+      remote_clusters = TestCluster.rpc!(node_b, Group.Replica.Data, :my_clusters, [name])
+
+      Enum.each(b_lanes, fn {shard, b_pid} ->
+        TestCluster.rpc!(node_a, :erlang, :send, [
+          shard_name(name, shard),
+          {:peer_connect_ack, b_pid, shard, shards, remote_clusters}
+        ])
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?(b_lanes, fn {shard, pid} ->
+          {:messages, messages} = TestCluster.rpc!(node_b, Process, :info, [pid, :messages])
+
+          if shard == 0 do
+            Enum.any?(messages, fn
+              {:replica_hello, remote_pid, _version, _generation, _revision, _epochs, _transport,
+               _descriptor} ->
+                node(remote_pid) == node_a
+
+              _ ->
+                false
+            end)
+          else
+            Enum.any?(messages, fn
+              {:replica_lane_hello, remote_pid, _version, _generation, _revision, _transport,
+               _descriptor} ->
+                node(remote_pid) == node_a
+
+              _ ->
+                false
+            end)
+          end
+        end)
+      end)
+
+      mailboxes =
+        Map.new(b_lanes, fn {shard, pid} ->
+          {:messages, messages} = TestCluster.rpc!(node_b, Process, :info, [pid, :messages])
+          {shard, messages}
+        end)
+
+      full_authority_lanes =
+        for {shard, messages} <- mailboxes,
+            Enum.any?(messages, fn
+              {:replica_hello, remote_pid, _version, _generation, _revision, _epochs, _transport,
+               _descriptor} ->
+                node(remote_pid) == node_a
+
+              _ ->
+                false
+            end),
+            do: shard
+
+      assert full_authority_lanes == [0]
+
+      assert Enum.any?(mailboxes[0], fn
+               {:replica_hello, remote_pid, _version, _generation, revision, epochs, _transport,
+                _descriptor} ->
+                 node(remote_pid) == node_a and
+                   revision == Enum.count(epochs, &(not is_nil(elem(&1, 0))))
+
+               _ ->
+                 false
+             end)
+
+      for shard <- 1..(shards - 1) do
+        assert Enum.any?(mailboxes[shard], fn
+                 {:replica_lane_hello, remote_pid, _version, _generation, _revision, _transport,
+                  _descriptor} ->
+                   node(remote_pid) == node_a
+
+                 _ ->
+                   false
+               end)
+      end
+
+      [epoch] =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :activate_local_clusters, [
+          name,
+          ["lane-open"]
+        ])
+
+      TestCluster.rpc!(node_a, Group.Replica.Data, :add_cluster_node, [
+        name,
+        ["lane-open"],
+        node_a
+      ])
+
+      assert :ok =
+               TestCluster.rpc!(node_a, Group.Replica, :local_request, [
+                 shard_name(name, 2),
+                 {:cluster_connect, ["lane-open"], [epoch]},
+                 5_000
+               ])
+
+      TestCluster.assert_eventually(fn ->
+        {:messages, messages} =
+          TestCluster.rpc!(node_b, Process, :info, [Map.fetch!(Map.new(b_lanes), 2), :messages])
+
+        Enum.any?(messages, fn
+          {:replica_cluster_open, remote_pid, _generation, _revision, [^epoch]} ->
+            node(remote_pid) == node_a
+
+          _ ->
+            false
+        end)
+      end)
+
+      {:messages, control_messages} =
+        TestCluster.rpc!(node_b, Process, :info, [Map.fetch!(Map.new(b_lanes), 0), :messages])
+
+      refute Enum.any?(control_messages, fn
+               {:replica_cluster_open, remote_pid, _generation, _revision, [^epoch]} ->
+                 node(remote_pid) == node_a
+
+               _ ->
+                 false
+             end)
+
+      {0, b_control} = List.keyfind!(b_lanes, 0, 0)
+      :ok = TestCluster.rpc!(node_b, :sys, :resume, [b_control])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(
+          node_b,
+          Group.Replica.Data,
+          :remote_authority_install_count,
+          [name, node_a]
+        ) == installs_before + 1
+      end)
+
+      duplicate_full =
+        Enum.find(mailboxes[0], fn
+          {:replica_hello, remote_pid, _version, _generation, _revision, _epochs, _transport,
+           _descriptor} ->
+            node(remote_pid) == node_a
+
+          _ ->
+            false
+        end)
+
+      {:replica_hello, _remote_pid, _version, _generation, full_revision, _epochs, _transport,
+       _descriptor} = duplicate_full
+
+      Enum.each(1..128, fn _ -> send(b_control, duplicate_full) end)
+      drain_ref = make_ref()
+      send(b_control, {:group_dispatch, [self()], {:authority_duplicates_drained, drain_ref}})
+      assert_receive {:authority_duplicates_drained, ^drain_ref}, 5_000
+
+      assert TestCluster.rpc!(
+               node_b,
+               Group.Replica.Data,
+               :remote_authority_install_count,
+               [name, node_a]
+             ) == installs_before + 1
+
+      Enum.each(b_lanes, fn
+        {0, _pid} -> :ok
+        {_shard, pid} -> :ok = TestCluster.rpc!(node_b, :sys, :resume, [pid])
+      end)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_cluster_epoch, [
+          name,
+          node_a,
+          "lane-open"
+        ]) == elem(epoch, 1)
+      end)
+
+      latest_revision =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :local_cluster_epoch_revision, [name])
+
+      a_lane = TestCluster.rpc!(node_a, Process, :whereis, [shard_name(name, 2)])
+
+      TestCluster.rpc!(node_b, :erlang, :send, [
+        shard_name(name, 2),
+        {:replica_heartbeat, a_lane, Group.Replica.WireProtocol.version(),
+         TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name]), latest_revision,
+         Group.Transport.DistErl.id(), Group.Transport.DistErl.descriptor(name, [])}
+      ])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_view_observed_revision, [
+          name,
+          2,
+          node_a
+        ]) == latest_revision
+      end)
+
+      assert TestCluster.rpc!(
+               node_b,
+               Group.Replica.Data,
+               :remote_cluster_epoch_exact_revision,
+               [name, node_a]
+             ) == full_revision
+
+      assert TestCluster.rpc!(
+               node_b,
+               Group.Replica.Data,
+               :remote_view_cluster_epoch_revision,
+               [name, 2, node_a]
+             ) == full_revision
+    end
+
+    @tag timeout: 60_000
+    test "a backlogged authority shard cannot block independent replica lanes" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_authority_backlog_#{System.unique_integer([:positive])}"
+      shards = 3
+
+      opts = [
+        name: name,
+        shards: shards,
+        replicated_anti_entropy_interval: 60_000,
+        replicated_peer_lease_timeout: 120_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      a_generation =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
+
+      Enum.each([1, 2], fn shard_index ->
+        b_lane = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, shard_index)])
+
+        TestCluster.assert_eventually(fn ->
+          b_lane_state = TestCluster.rpc!(node_b, :sys, :get_state, [b_lane])
+
+          Map.has_key?(b_lane_state.peer_last_seen, node_a) and
+            TestCluster.rpc!(
+              node_b,
+              Group.Replica.Data,
+              :remote_view_generation,
+              [name, shard_index, node_a]
+            ) == a_generation
+        end)
+      end)
+
+      b_control = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 0)])
+      a_control = TestCluster.rpc!(node_a, Process, :whereis, [shard_name(name, 0)])
+      :ok = TestCluster.rpc!(node_b, :sys, :suspend, [b_control])
+
+      TestCluster.rpc!(node_a, :erlang, :send, [
+        shard_name(name, 0),
+        {:peer_connect_ack, b_control, 0, shards, [nil]}
+      ])
+
+      TestCluster.assert_eventually(fn ->
+        {:messages, messages} =
+          TestCluster.rpc!(node_b, Process, :info, [b_control, :messages])
+
+        Enum.any?(messages, fn
+          {:replica_hello, ^a_control, _version, _generation, _revision, _epochs, _transport,
+           _descriptor} ->
+            true
+
+          _ ->
+            false
+        end)
+      end)
+
+      [reg_key] = keys_for_shard(nil, "authority-backlog/reg", shards, 1, 1)
+      [pg_key] = keys_for_shard(nil, "authority-backlog/pg", shards, 2, 1)
+      reg_pid = TestCluster.spawn_register(node_a, name, reg_key, %{lane: 1})
+      pg_pid = TestCluster.spawn_join(node_a, name, pg_key, %{lane: 2})
+
+      TestCluster.assert_eventually(fn ->
+        match?({^reg_pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key])) and
+          match?([{^pg_pid, _}], TestCluster.rpc!(node_b, Group, :members, [name, pg_key]))
+      end)
+
+      :ok = TestCluster.rpc!(node_b, :sys, :resume, [b_control])
+    end
+
+    @tag timeout: 60_000
+    test "data arriving without authority is rejected without cursor advance and repairs later" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_authority_before_data_#{System.unique_integer([:positive])}"
+      shards = 2
+
+      opts = [
+        name: name,
+        shards: shards,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_sender_buffer_size: 1,
+        replicated_anti_entropy_interval: 60_000,
+        replicated_peer_lease_timeout: 120_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      a_lane = TestCluster.rpc!(node_a, Process, :whereis, [shard_name(name, 1)])
+
+      TestCluster.assert_eventually(fn ->
+        lane_state = TestCluster.rpc!(node_a, :sys, :get_state, [a_lane])
+
+        Map.has_key?(lane_state.peer_last_seen, node_b) and
+          not is_nil(
+            TestCluster.rpc!(node_a, Group.Replica.Data, :remote_view_generation, [
+              name,
+              1,
+              node_b
+            ])
+          )
+      end)
+
+      :ok =
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
+          name,
+          {:capture_drop, [:delta_batch]}
+        ])
+
+      [key] = keys_for_shard(nil, "authority-before-data", shards, 1, 1)
+      pid = TestCluster.spawn_register(node_a, name, key, %{valid: true})
+      TestCluster.flush_shards(node_a, name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name]) != []
+      end)
+
+      {_target, 1, frame} =
+        node_a
+        |> TestCluster.rpc!(Group.TestReplicaTransport, :captured, [name])
+        |> Enum.find(fn {_target, shard, _frame} -> shard == 1 end)
+
+      stream_id = TestCluster.rpc!(node_a, Group.Replica.Data, :local_stream_id, [name, 1, nil])
+      generation = TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
+
+      revision =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :local_cluster_epoch_revision, [name])
+
+      :ok =
+        TestCluster.rpc!(node_b, Group.Replica.Data, :delete_remote_replica_info, [
+          name,
+          0,
+          node_a
+        ])
+
+      :ok =
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+          name,
+          node_a,
+          1,
+          frame
+        ])
+
+      TestCluster.flush_shards(node_b, name)
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+
+      assert TestCluster.rpc!(node_b, Group.Replica.Data, :replica_cursor, [
+               name,
+               1,
+               stream_id
+             ]) == 0
+
+      TestCluster.rpc!(node_b, :erlang, :send, [
+        shard_name(name, 1),
+        {:replica_heartbeat, a_lane, Group.Replica.WireProtocol.version(), generation, revision,
+         Group.TestReplicaTransport.id(), Group.TestReplicaTransport.descriptor(name, [])}
+      ])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_generation, [name, node_a]) ==
+          generation
+      end)
+
+      :ok =
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+          name,
+          node_a,
+          1,
+          frame
+        ])
+
+      TestCluster.assert_eventually(fn ->
+        match?({^pid, %{valid: true}}, TestCluster.rpc!(node_b, Group, :lookup, [name, key]))
+      end)
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "a delayed cluster close from an older epoch revision cannot undo a reconnect" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_epoch_fence_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replicated_anti_entropy_interval: 60_000,
+        replicated_peer_lease_timeout: 120_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        not is_nil(
+          TestCluster.rpc!(node_a, Group.Replica.Data, :remote_view_generation, [
+            name,
+            0,
+            node_b
+          ])
+        ) and
+          not is_nil(
+            TestCluster.rpc!(node_b, Group.Replica.Data, :remote_view_generation, [
+              name,
+              0,
+              node_a
+            ])
+          )
+      end)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+      end)
+
+      generation = TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
+
+      old_revision =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :local_cluster_epoch_revision, [name])
+
+      old_epoch =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :local_cluster_epoch, [name, "game"])
+
+      TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+      end)
+
+      current_revision =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :local_cluster_epoch_revision, [name])
+
+      assert current_revision > old_revision
+
+      key = "anti-entropy/epoch-fence/current"
+      pid = TestCluster.spawn_register_in_cluster(node_a, name, key, %{}, "game")
+
+      TestCluster.assert_eventually(fn ->
+        match?(
+          {^pid, _},
+          TestCluster.rpc!(node_b, Group, :lookup, [name, key, [cluster: "game"]])
+        )
+      end)
+
+      remote_pid = TestCluster.rpc!(node_a, Process, :whereis, [shard_name(name, 0)])
+
+      TestCluster.rpc!(node_a, :erlang, :send, [
+        {shard_name(name, 0), node_b},
+        {:replica_cluster_close, remote_pid, generation, old_revision, [{"game", old_epoch}]}
+      ])
+
+      Process.sleep(100)
+      TestCluster.flush_shards(node_b, name)
+
+      assert node_a in TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+
+      assert match?(
+               {^pid, _},
+               TestCluster.rpc!(node_b, Group, :lookup, [name, key, [cluster: "game"]])
+             )
+    end
+
+    @tag timeout: 60_000
+    test "duplicate and reordered replica messages are idempotent and emit one lifecycle event" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_duplicate_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_sender_buffer_size: 1,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 1_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      forwarder = TestCluster.spawn_monitor_forwarder(node_b, name, :all, self())
+      assert_receive {:monitor_ready, ^forwarder}, 5_000
+
+      :ok =
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
+          name,
+          {:chaos, [drop_every: 0, duplicate_every: 2, max_delay: 75]}
+        ])
+
+      key = "anti-entropy/duplicate"
+      pid = TestCluster.spawn_register(node_a, name, key, %{version: 1})
+
+      assert_receive {:got_event, %Group.Event{type: :registered, key: ^key, pid: ^pid}}, 5_000
+
+      TestCluster.assert_eventually(fn ->
+        match?({^pid, %{version: 1}}, TestCluster.rpc!(node_b, Group, :lookup, [name, key]))
+      end)
+
+      Process.sleep(250)
+
+      refute_received {:got_event, %Group.Event{type: :registered, key: ^key, pid: ^pid}}
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "captured data from old origin generations and cluster epochs cannot resurrect rows" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_stale_frames_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_sender_buffer_size: 1,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 150
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      :ok =
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
+          name,
+          {:capture_drop, [:delta_batch]}
+        ])
+
+      generation_key = "anti-entropy/stale-generation"
+      old_generation_pid = TestCluster.spawn_register(node_a, name, generation_key, %{old: true})
+      TestCluster.flush_shards(node_a, name)
+
+      generation_frames =
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name])
+
+      assert generation_frames != []
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, generation_key]) == nil
+
+      supervisor = TestCluster.rpc!(node_a, Process, :whereis, [:"#{name}_group_sup"])
+      :ok = TestCluster.rpc!(node_a, Supervisor, :stop, [supervisor, :normal, 5_000])
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :pass])
+
+      TestCluster.assert_eventually(
+        fn -> node_a not in TestCluster.rpc!(node_b, Group, :nodes, [name]) end,
+        timeout: 5_000
+      )
+
+      {:ok, _pid} = TestCluster.start_group(node_a, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      Enum.each(generation_frames, fn {_target, shard, frame} ->
+        :ok =
+          TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+            name,
+            node_a,
+            shard,
+            frame
+          ])
+      end)
+
+      TestCluster.flush_shards(node_b, name)
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, generation_key]) == nil
+
+      # The global stream epoch normally equals its generation, so a replayed
+      # old frame is rejected by both guards. Rewrite only the epoch to the
+      # current one to prove that the generation fence independently rejects a
+      # semantically impossible mixed-generation stream instead of advancing
+      # its cursor or materializing its rows.
+      current_generation =
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_generation, [name, node_a])
+
+      mixed_generation_frames =
+        Enum.map(generation_frames, fn {target, shard, {:delta_batch, version, runs}} ->
+          runs =
+            Enum.map(runs, fn
+              {{stream_name, origin, old_generation, stream_shard, nil, _old_epoch}, first_seq,
+               records, advertised_head} ->
+                stream_id =
+                  {stream_name, origin, old_generation, stream_shard, nil, current_generation}
+
+                {stream_id, first_seq, records, advertised_head}
+            end)
+
+          {target, shard, {:delta_batch, version, runs}}
+        end)
+
+      Enum.each(mixed_generation_frames, fn {_target, shard, frame} ->
+        :ok =
+          TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+            name,
+            node_a,
+            shard,
+            frame
+          ])
+      end)
+
+      TestCluster.flush_shards(node_b, name)
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, generation_key]) == nil
+
+      new_generation_pid =
+        TestCluster.spawn_register(node_a, name, generation_key, %{old: false})
+
+      TestCluster.assert_eventually(fn ->
+        match?(
+          {^new_generation_pid, %{old: false}},
+          TestCluster.rpc!(node_b, Group, :lookup, [name, generation_key])
+        )
+      end)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+      end)
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :clear_captured, [name])
+
+      :ok =
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
+          name,
+          {:capture_drop, [:delta_batch]}
+        ])
+
+      epoch_key = "anti-entropy/stale-epoch"
+
+      old_epoch_pid =
+        TestCluster.spawn_register_in_cluster(node_a, name, epoch_key, %{old: true}, "game")
+
+      TestCluster.flush_shards(node_a, name)
+      epoch_frames = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name])
+      assert epoch_frames != []
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :pass])
+      TestCluster.rpc!(node_a, Group, :disconnect, [name, "game"])
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+      end)
+
+      Enum.each(epoch_frames, fn {_target, shard, frame} ->
+        :ok =
+          TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+            name,
+            node_a,
+            shard,
+            frame
+          ])
+      end)
+
+      TestCluster.flush_shards(node_b, name)
+
+      assert TestCluster.rpc!(node_b, Group, :lookup, [
+               name,
+               epoch_key,
+               [cluster: "game"]
+             ]) == nil
+
+      new_epoch_pid =
+        TestCluster.spawn_register_in_cluster(node_a, name, epoch_key, %{old: false}, "game")
+
+      TestCluster.assert_eventually(fn ->
+        match?(
+          {^new_epoch_pid, %{old: false}},
+          TestCluster.rpc!(node_b, Group, :lookup, [
+            name,
+            epoch_key,
+            [cluster: "game"]
+          ])
+        )
+      end)
+
+      TestCluster.rpc!(node_a, Process, :exit, [old_generation_pid, :kill])
+      TestCluster.rpc!(node_a, Process, :exit, [old_epoch_pid, :kill])
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "global shard pruning repairs a cold stream without sending or deleting other origins" do
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      name = :"anti_entropy_multistream_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_sender_buffer_size: 1,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 1_000,
+        replicated_oplog_max_entries: 4
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      for target <- [node_a, node_b, node_c] do
+        TestCluster.assert_eventually(fn ->
+          length(TestCluster.rpc!(target, Group, :nodes, [name])) == 2
+        end)
+
+        TestCluster.rpc!(target, Group, :connect, [name, ["cold", "hot"]])
+      end
+
+      TestCluster.assert_eventually(
+        fn ->
+          length(TestCluster.rpc!(node_c, Group, :nodes, [name, "cold"])) == 3 and
+            length(TestCluster.rpc!(node_c, Group, :nodes, [name, "hot"])) == 3
+        end,
+        timeout: 10_000
+      )
+
+      b_key = "anti-entropy/other-origin"
+      b_group = "anti-entropy/other-origin-pg"
+      b_pid = TestCluster.spawn_register(node_b, name, b_key, %{origin: :b})
+      b_pg_pid = TestCluster.spawn_join(node_b, name, b_group, %{origin: :b})
+
+      stale_key = "anti-entropy/cold/stale"
+      stale_group = "anti-entropy/cold/stale-pg"
+
+      stale_pid =
+        TestCluster.spawn_register_in_cluster(node_a, name, stale_key, %{origin: :a}, "cold")
+
+      stale_pg_pid =
+        TestCluster.spawn_join_in_cluster(node_a, name, stale_group, %{origin: :a}, "cold")
+
+      TestCluster.assert_eventually(fn ->
+        match?({^b_pid, _}, TestCluster.rpc!(node_c, Group, :lookup, [name, b_key])) and
+          match?([{^b_pg_pid, _}], TestCluster.rpc!(node_c, Group, :members, [name, b_group])) and
+          match?(
+            {^stale_pid, _},
+            TestCluster.rpc!(node_c, Group, :lookup, [name, stale_key, [cluster: "cold"]])
+          ) and
+          match?(
+            [{^stale_pg_pid, _}],
+            TestCluster.rpc!(node_c, Group, :members, [name, stale_group, [cluster: "cold"]])
+          )
+      end)
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+      TestCluster.rpc!(node_a, Process, :exit, [stale_pid, :kill])
+      TestCluster.rpc!(node_a, Process, :exit, [stale_pg_pid, :kill])
+
+      fresh =
+        for i <- 1..12 do
+          key = "anti-entropy/hot/#{i}"
+
+          {key, TestCluster.spawn_register_in_cluster(node_a, name, key, %{i: i}, "hot")}
+        end
+
+      TestCluster.flush_shards(node_a, name)
+
+      {_stream_id, floor, _head} =
+        node_a
+        |> TestCluster.rpc!(Group.Replica.Data, :replica_stream_heads, [name, 0])
+        |> Enum.find(fn {stream_id, _floor, _head} ->
+          Group.Replica.WireProtocol.stream_cluster(stream_id) == "cold"
+        end)
+
+      assert floor > 2
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :pass])
+
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(node_c, Group, :lookup, [name, stale_key, [cluster: "cold"]]) ==
+            nil and
+            TestCluster.rpc!(node_c, Group, :members, [
+              name,
+              stale_group,
+              [cluster: "cold"]
+            ]) == [] and
+            match?({^b_pid, _}, TestCluster.rpc!(node_c, Group, :lookup, [name, b_key])) and
+            match?(
+              [{^b_pg_pid, _}],
+              TestCluster.rpc!(node_c, Group, :members, [name, b_group])
+            ) and
+            Enum.all?(fresh, fn {key, pid} ->
+              match?(
+                {^pid, _},
+                TestCluster.rpc!(node_c, Group, :lookup, [name, key, [cluster: "hot"]])
+              )
+            end)
+        end,
+        timeout: 10_000
+      )
+
+      assert :ok =
+               TestCluster.rpc!(node_c, Group.TestCluster, :assert_replica_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "invalid authority and a misattributed frame cannot poison a stream cursor" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_authority_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_sender_buffer_size: 1,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 1_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      stream_id =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :local_stream_id, [name, 0, nil])
+
+      foreign_pid =
+        TestCluster.spawn_register(node_b, name, "anti-entropy/authority/foreign-owner", %{})
+
+      :ok =
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
+          name,
+          {:capture_drop, [:delta_batch]}
+        ])
+
+      key = "anti-entropy/authority/legitimate"
+      legitimate_pid = TestCluster.spawn_register(node_a, name, key, %{valid: true})
+      TestCluster.flush_shards(node_a, name)
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name]) != []
+      end)
+
+      [{_target, 0, legitimate_frame} | _] =
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name])
+
+      invalid_key = "anti-entropy/authority/forged"
+
+      invalid_frame =
+        {:delta_batch, Group.Replica.WireProtocol.version(),
+         [
+           {stream_id, 1,
+            [
+              {1,
+               [
+                 {:register, nil, invalid_key, foreign_pid, %{forged: true}, System.system_time(),
+                  node_b}
+               ]}
+            ], 1}
+         ]}
+
+      :ok =
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+          name,
+          node_a,
+          0,
+          invalid_frame
+        ])
+
+      TestCluster.flush_shards(node_b, name)
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, invalid_key]) == nil
+
+      assert TestCluster.rpc!(node_b, Group.Replica.Data, :replica_cursor, [
+               name,
+               0,
+               stream_id
+             ]) == 0
+
+      :ok =
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+          name,
+          node_b,
+          0,
+          legitimate_frame
+        ])
+
+      TestCluster.flush_shards(node_b, name)
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+
+      assert TestCluster.rpc!(node_b, Group.Replica.Data, :replica_cursor, [
+               name,
+               0,
+               stream_id
+             ]) == 0
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :pass])
+
+      TestCluster.assert_eventually(fn ->
+        match?(
+          {^legitimate_pid, %{valid: true}},
+          TestCluster.rpc!(node_b, Group, :lookup, [name, key])
+        )
+      end)
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "lease expiry purges every shard before accepting a fresh generation" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_multishard_lease_#{System.unique_integer([:positive])}"
+      shards = 3
+
+      opts = [
+        name: name,
+        shards: shards,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_sender_buffer_size: 2,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 150
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      stale =
+        for shard <- 0..(shards - 1) do
+          [reg_key] = keys_for_shard(nil, "anti-entropy/lease/reg/s#{shard}", shards, shard, 1)
+          [pg_key] = keys_for_shard(nil, "anti-entropy/lease/pg/s#{shard}", shards, shard, 1)
+
+          {
+            reg_key,
+            TestCluster.spawn_register(node_a, name, reg_key, %{generation: :old, shard: shard}),
+            pg_key,
+            TestCluster.spawn_join(node_a, name, pg_key, %{generation: :old, shard: shard})
+          }
+        end
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(stale, fn {reg_key, reg_pid, pg_key, pg_pid} ->
+            match?({^reg_pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key])) and
+              match?([{^pg_pid, _}], TestCluster.rpc!(node_b, Group, :members, [name, pg_key]))
+          end)
+        end,
+        timeout: 10_000
+      )
+
+      old_generation = TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
+      supervisor = TestCluster.rpc!(node_a, Process, :whereis, [:"#{name}_group_sup"])
+      :ok = TestCluster.rpc!(node_a, Supervisor, :stop, [supervisor, :normal, 5_000])
+      assert TestCluster.rpc!(node_b, Node, :ping, [node_a]) == :pong
+
+      TestCluster.assert_eventually(
+        fn ->
+          node_a not in TestCluster.rpc!(node_b, Group, :nodes, [name]) and
+            Enum.all?(stale, fn {reg_key, _reg_pid, pg_key, _pg_pid} ->
+              TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key]) == nil and
+                TestCluster.rpc!(node_b, Group, :members, [name, pg_key]) == []
+            end)
+        end,
+        timeout: 5_000
+      )
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+
+      assert :ok =
+               TestCluster.rpc!(
+                 node_b,
+                 Group.TestCluster,
+                 :assert_replica_origin_purged,
+                 [name, node_a]
+               )
+
+      {:ok, _pid} = TestCluster.start_group(node_a, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      new_generation = TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
+      refute new_generation == old_generation
+
+      fresh =
+        for shard <- 0..(shards - 1) do
+          [reg_key] = keys_for_shard(nil, "anti-entropy/fresh/reg/s#{shard}", shards, shard, 1)
+          [pg_key] = keys_for_shard(nil, "anti-entropy/fresh/pg/s#{shard}", shards, shard, 1)
+
+          {
+            reg_key,
+            TestCluster.spawn_register(node_a, name, reg_key, %{generation: :new, shard: shard}),
+            pg_key,
+            TestCluster.spawn_join(node_a, name, pg_key, %{generation: :new, shard: shard})
+          }
+        end
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(fresh, fn {reg_key, reg_pid, pg_key, pg_pid} ->
+            match?({^reg_pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key])) and
+              match?([{^pg_pid, _}], TestCluster.rpc!(node_b, Group, :members, [name, pg_key]))
+          end)
+        end,
+        timeout: 10_000
+      )
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+    end
+
+    @tag timeout: 120_000
+    test "concurrent many-cluster controls converge every revision before replica writes" do
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      nodes = [node_a, node_b, node_c]
+      name = :"anti_entropy_many_controls_#{System.unique_integer([:positive])}"
+      clusters = for i <- 1..512, do: "tenant/#{i}"
+
+      opts = [
+        name: name,
+        shards: 4,
+        replicated_sender_buffer_size: 8,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 2_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      tasks =
+        for node <- nodes do
+          Task.async(fn -> TestCluster.connect_many_concurrently(node, name, clusters) end)
+        end
+
+      assert [:ok, :ok, :ok] = Task.await_many(tasks, 60_000)
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(nodes, fn node ->
+            expected = MapSet.new([nil | clusters])
+
+            actual =
+              TestCluster.rpc!(node, Group.Replica.Data, :my_clusters, [name])
+              |> MapSet.new()
+
+            MapSet.subset?(expected, actual)
+          end) and
+            Enum.all?(clusters, fn cluster ->
+              Enum.all?(nodes, fn node ->
+                length(TestCluster.rpc!(node, Group, :nodes, [name, cluster])) == 3
+              end)
+            end)
+        end,
+        timeout: 30_000,
+        interval: 100
+      )
+
+      entries =
+        TestCluster.spawn_register_many_clusters(
+          node_a,
+          name,
+          clusters,
+          "anti-entropy/many-controls"
+        )
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?([node_b, node_c], fn node ->
+            TestCluster.rpc!(node, Group.TestCluster, :registry_entries_present?, [
+              name,
+              entries
+            ])
+          end)
+        end,
+        timeout: 30_000,
+        interval: 100
+      )
+
+      for node <- [node_a, node_b] do
+        assert :ok =
+                 TestCluster.rpc!(node, Group.TestCluster, :assert_replica_consistent, [name])
+      end
+    end
+
+    @tag timeout: 60_000
+    test "mixed-generation data is rejected even when its epoch matches current authority" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_generation_guard_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_anti_entropy_interval: 60_000,
+        replicated_peer_lease_timeout: 120_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      TestCluster.rpc!(node_a, Group, :connect, [name, "game"])
+      TestCluster.rpc!(node_b, Group, :connect, [name, "game"])
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name, "game"])
+      end)
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+      key = "anti-entropy/mixed-generation"
+      meta = %{forged: true}
+      pid = TestCluster.spawn_register_in_cluster(node_a, name, key, meta, "game")
+      TestCluster.flush_shards(node_a, name)
+
+      current_generation =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
+
+      current_epoch =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :local_cluster_epoch, [name, "game"])
+
+      forged_generation =
+        current_generation
+        |> elem(0)
+        |> Kernel.-(1)
+        |> max(1)
+        |> then(&{&1, make_ref()})
+
+      stream_id =
+        Group.Replica.WireProtocol.stream_id(
+          name,
+          node_a,
+          forged_generation,
+          0,
+          "game",
+          current_epoch
+        )
+
+      mutation = {:register, "game", key, pid, meta, System.monotonic_time(), node_a}
+
+      :ok =
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+          name,
+          node_a,
+          0,
+          {:delta_batch, Group.Replica.WireProtocol.version(),
+           [{stream_id, 1, [{1, [mutation]}], 1}]}
+        ])
+
+      TestCluster.flush_shards(node_b, name)
+
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, key, [cluster: "game"]]) == nil
+
+      assert TestCluster.rpc!(node_b, Group.Replica.Data, :replica_cursor, [name, 0, stream_id]) ==
+               0
+    end
+
+    @tag timeout: 60_000
+    test "an out-of-order delta cannot advance the cursor across a missing sequence" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_gap_guard_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_sender_buffer_size: 1,
+        replicated_anti_entropy_interval: 60_000,
+        replicated_peer_lease_timeout: 120_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      :ok =
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
+          name,
+          {:capture_drop, [:delta_batch]}
+        ])
+
+      first_key = "anti-entropy/gap/first"
+      second_key = "anti-entropy/gap/second"
+      group_key = "anti-entropy/gap/group"
+      first_pid = TestCluster.spawn_register(node_a, name, first_key, %{seq: 1})
+      second_pid = TestCluster.spawn_register(node_a, name, second_key, %{seq: 2})
+      member_pid = TestCluster.spawn_join(node_a, name, group_key, %{seq: 3})
+      TestCluster.flush_shards(node_a, name)
+
+      captured = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :captured, [name])
+
+      frames_by_first_seq =
+        Map.new(captured, fn
+          {_target, shard,
+           {:delta_batch, _version, [{_stream_id, first_seq, _records, _head}]} = frame} ->
+            {first_seq, {shard, frame}}
+        end)
+
+      {shard, {:delta_batch, _version, [{stream_id, 2, _records, _head}]} = second_frame} =
+        Map.fetch!(frames_by_first_seq, 2)
+
+      :ok =
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+          name,
+          node_a,
+          shard,
+          second_frame
+        ])
+
+      TestCluster.flush_shards(node_b, name)
+
+      assert TestCluster.rpc!(node_b, Group.Replica.Data, :replica_cursor, [
+               name,
+               shard,
+               stream_id
+             ]) == 0
+
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, second_key]) == nil
+
+      {^shard, first_frame} = Map.fetch!(frames_by_first_seq, 1)
+      {^shard, third_frame} = Map.fetch!(frames_by_first_seq, 3)
+
+      for frame <- [first_frame, second_frame, third_frame] do
+        :ok =
+          TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+            name,
+            node_a,
+            shard,
+            frame
+          ])
+      end
+
+      TestCluster.flush_shards(node_b, name)
+
+      assert match?(
+               {^first_pid, %{seq: 1}},
+               TestCluster.rpc!(node_b, Group, :lookup, [name, first_key])
+             )
+
+      assert match?(
+               {^second_pid, %{seq: 2}},
+               TestCluster.rpc!(node_b, Group, :lookup, [name, second_key])
+             )
+
+      assert match?(
+               [{^member_pid, %{seq: 3}}],
+               TestCluster.rpc!(node_b, Group, :members, [name, group_key])
+             )
+
+      # Model a receiver crash after all materialized ETS writes but before
+      # its cursor write. Replaying the accepted prefix must be exactly
+      # idempotent for both registry claims and PG membership.
+      :ok =
+        TestCluster.rpc!(node_b, Group.Replica.Data, :put_replica_cursor, [
+          name,
+          shard,
+          stream_id,
+          0
+        ])
+
+      for frame <- [first_frame, second_frame, third_frame] do
+        :ok =
+          TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+            name,
+            node_a,
+            shard,
+            frame
+          ])
+      end
+
+      TestCluster.flush_shards(node_b, name)
+
+      assert TestCluster.rpc!(node_b, Group.Replica.Data, :replica_cursor, [
+               name,
+               shard,
+               stream_id
+             ]) == 3
+
+      assert match?(
+               {^first_pid, %{seq: 1}},
+               TestCluster.rpc!(node_b, Group, :lookup, [name, first_key])
+             )
+
+      assert match?(
+               {^second_pid, %{seq: 2}},
+               TestCluster.rpc!(node_b, Group, :lookup, [name, second_key])
+             )
+
+      assert match?(
+               [{^member_pid, %{seq: 3}}],
+               TestCluster.rpc!(node_b, Group, :members, [name, group_key])
+             )
+
+      assert :ok =
+               TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "a new full authority generation purges nonzero shards before any lane-down signal" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_authority_fanout_#{System.unique_integer([:positive])}"
+      shards = 2
+
+      opts = [
+        name: name,
+        shards: shards,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_anti_entropy_interval: 60_000,
+        replicated_peer_lease_timeout: 120_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      key =
+        Enum.find(Stream.iterate(0, &(&1 + 1)), fn suffix ->
+          :erlang.phash2({nil, "anti-entropy/authority-fanout/#{suffix}"}, shards) == 1
+        end)
+        |> then(&"anti-entropy/authority-fanout/#{&1}")
+
+      pid = TestCluster.spawn_register(node_a, name, key, %{generation: :old})
+
+      TestCluster.assert_eventually(fn ->
+        match?({^pid, _}, TestCluster.rpc!(node_b, Group, :lookup, [name, key]))
+      end)
+
+      forwarder = TestCluster.spawn_monitor_forwarder(node_b, name, :all, self())
+      assert_receive {:monitor_ready, ^forwarder}, 5_000
+
+      a_control = TestCluster.rpc!(node_a, Process, :whereis, [shard_name(name, 0)])
+      b_control = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 0)])
+      b_lane = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 1)])
+
+      {old_generation_counter, _old_generation_identity} =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :generation, [name])
+
+      # Generation counters are ordered only within the origin BEAM. Construct
+      # the injected restart generation relative to node A's actual authority;
+      # using this test runner's independent counter makes the test flaky.
+      new_generation = {old_generation_counter + 1, make_ref()}
+
+      new_key =
+        Enum.find(Stream.iterate(0, &(&1 + 1)), fn suffix ->
+          :erlang.phash2({nil, "anti-entropy/authority-fanout/new/#{suffix}"}, shards) == 1
+        end)
+        |> then(&"anti-entropy/authority-fanout/new/#{&1}")
+
+      stream_id =
+        Group.Replica.WireProtocol.stream_id(
+          name,
+          node_a,
+          new_generation,
+          1,
+          nil,
+          new_generation
+        )
+
+      new_mutation =
+        {:register, nil, new_key, pid, %{generation: :new}, System.system_time(), node_a}
+
+      new_frame =
+        {:delta_batch, Group.Replica.WireProtocol.version(),
+         [{stream_id, 1, [{1, [new_mutation]}], 1}]}
+
+      :ok = TestCluster.rpc!(node_b, :sys, :suspend, [b_lane])
+
+      # Queue new-generation lane data before the control shard can enqueue
+      # its local authority marker. Shared authority will be current by the
+      # time this frame runs, but shard 1 must still reject it until its own
+      # old-generation purge has completed.
+      :ok =
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+          name,
+          node_a,
+          1,
+          new_frame
+        ])
+
+      send(
+        b_control,
+        {:replica_hello, a_control, Group.Replica.WireProtocol.version(), new_generation, 0,
+         [{nil, new_generation}], Group.TestReplicaTransport.id(),
+         Group.TestReplicaTransport.descriptor(name, [])}
+      )
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_generation, [name, node_a]) ==
+          new_generation
+      end)
+
+      :ok = TestCluster.rpc!(node_b, :sys, :resume, [b_lane])
+      TestCluster.flush_shards(node_b, name)
+
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, new_key]) == nil
+      refute_receive {:got_event, %Group.Event{key: ^new_key}}, 100
+
+      assert TestCluster.rpc!(node_b, Group.Replica.Data, :replica_cursor, [
+               name,
+               1,
+               stream_id
+             ]) == 0
+
+      :ok =
+        TestCluster.rpc!(node_b, Group.Transport, :incoming, [
+          name,
+          node_a,
+          1,
+          new_frame
+        ])
+
+      TestCluster.flush_shards(node_b, name)
+
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, new_key]) ==
+               {pid, %{generation: :new}}
+
+      assert :ok = TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "three nodes recover a pruned origin over sideband TCP without disturbing another origin" do
+      peers = TestCluster.start_peers(3)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}, {_, node_c}] = peers
+      name = :"anti_entropy_sideband_tcp_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 2,
+        replica_transport:
+          {Group.TestTCPTransport,
+           [
+             max_queue: 16,
+             connect_timeout: 250,
+             send_timeout: 250,
+             reconnect_interval: 10
+           ]},
+        replicated_sender_buffer_size: 1,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 1_000,
+        replicated_oplog_max_entries: 2
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      nodes = [node_a, node_b, node_c]
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(nodes, fn source ->
+            Enum.all?(nodes -- [source], fn target ->
+              TestCluster.rpc!(
+                source,
+                Group.TestTCPTransport,
+                :connected?,
+                [name, target]
+              )
+            end)
+          end)
+        end,
+        timeout: 10_000
+      )
+
+      stale_key = "sideband/a/stale"
+      fresh_key = "sideband/a/fresh"
+      c_key = "sideband/c/independent"
+      c_group = "sideband/c/group"
+
+      stale_pid = TestCluster.spawn_register(node_a, name, stale_key, %{origin: :a})
+
+      c_pid =
+        TestCluster.spawn_register_and_join(
+          node_c,
+          name,
+          c_key,
+          %{origin: :c},
+          c_group,
+          %{origin: :c}
+        )
+
+      TestCluster.assert_eventually(fn ->
+        Enum.all?(nodes, fn receiver ->
+          match?(
+            {^stale_pid, %{origin: :a}},
+            TestCluster.rpc!(receiver, Group, :lookup, [name, stale_key])
+          ) and
+            match?(
+              {^c_pid, %{origin: :c}},
+              TestCluster.rpc!(receiver, Group, :lookup, [name, c_key])
+            ) and
+            match?(
+              [{^c_pid, %{origin: :c}}],
+              TestCluster.rpc!(receiver, Group, :members, [name, c_group])
+            )
+        end)
+      end)
+
+      :ok =
+        TestCluster.rpc!(node_a, Group.TestTCPTransport, :disconnect_peer, [name, node_b])
+
+      old_reader =
+        TestCluster.rpc!(node_b, Group.TestTCPTransport, :status, [name])
+        |> get_in([:inbound, node_a])
+
+      refute TestCluster.rpc!(
+               node_a,
+               Group.TestTCPTransport,
+               :connected?,
+               [name, node_b]
+             )
+
+      true = TestCluster.rpc!(node_a, Process, :exit, [stale_pid, :kill])
+
+      for i <- 1..6 do
+        churn_key = "sideband/a/churn/#{i}"
+        churn_pid = TestCluster.spawn_register(node_a, name, churn_key, %{i: i})
+        true = TestCluster.rpc!(node_a, Process, :exit, [churn_pid, :kill])
+      end
+
+      fresh_pid = TestCluster.spawn_register(node_a, name, fresh_key, %{origin: :a, fresh: true})
+      TestCluster.flush_shards(node_a, name)
+
+      assert match?(
+               {^stale_pid, %{origin: :a}},
+               TestCluster.rpc!(node_b, Group, :lookup, [name, stale_key])
+             )
+
+      assert TestCluster.rpc!(node_b, Group, :lookup, [name, fresh_key]) == nil
+
+      assert match?(
+               {^c_pid, %{origin: :c}},
+               TestCluster.rpc!(node_b, Group, :lookup, [name, c_key])
+             )
+
+      :ok =
+        TestCluster.rpc!(node_a, Group.TestTCPTransport, :reconnect_peer, [name, node_b])
+
+      TestCluster.assert_eventually(fn ->
+        new_reader =
+          TestCluster.rpc!(node_b, Group.TestTCPTransport, :status, [name])
+          |> get_in([:inbound, node_a])
+
+        is_pid(new_reader) and new_reader != old_reader
+      end)
+
+      TestCluster.assert_eventually(
+        fn ->
+          TestCluster.rpc!(
+            node_a,
+            Group.TestTCPTransport,
+            :connected?,
+            [name, node_b]
+          ) and
+            TestCluster.rpc!(node_b, Group, :lookup, [name, stale_key]) == nil and
+            match?(
+              {^fresh_pid, %{origin: :a, fresh: true}},
+              TestCluster.rpc!(node_b, Group, :lookup, [name, fresh_key])
+            ) and
+            match?(
+              {^c_pid, %{origin: :c}},
+              TestCluster.rpc!(node_b, Group, :lookup, [name, c_key])
+            ) and
+            match?(
+              [{^c_pid, %{origin: :c}}],
+              TestCluster.rpc!(node_b, Group, :members, [name, c_group])
+            )
+        end,
+        timeout: 10_000
+      )
+
+      for receiver <- nodes do
+        assert :ok =
+                 TestCluster.rpc!(
+                   receiver,
+                   Group.TestCluster,
+                   :assert_replica_consistent,
+                   [name]
+                 )
+      end
     end
   end
 

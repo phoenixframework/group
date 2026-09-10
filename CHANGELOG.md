@@ -1,17 +1,72 @@
 ## Unreleased
+
+- Materialize per-shard exact and slash-prefix process-group cardinalities so
+  `Group.member_count/3` and `Group.local_member_count/3` no longer scan
+  memberships. Counts follow resident-row diffs across local writes,
+  replication, snapshots, and peer eviction, and rebuild from primary ETS rows
+  after a shard restart.
+- Add layered anti-entropy qualification: three-node StreamData lifecycle
+  models, seeded adversarial transport histories, TLA+ models for convergence,
+  chunk assembly, and permanent peer eviction, plus a Docker-backed Jepsen
+  oracle across distribution, a test-only sideband TCP lane, and
+  lossy/reordering transports.
+  `mix test` is the every-PR ExUnit/property/checker gate and `mix test.soak`
+  runs the six-profile nightly/release campaign.
+- **Breaking**: move the replica transport API from
+  `Group.Replica.Transport.*` to `Group.Transport.*`; the default adapter is
+  now `Group.Transport.DistErl`. The boundary also names logical direction
+  rather than implementation mechanics: adapters implement `outgoing/5`,
+  sideband adapters use `Group.Transport.Outbox.push/5`, and receiving adapters
+  call `Group.Transport.incoming/4` or `incoming_batch/4`. No compatibility
+  aliases are provided.
+- Rename the internal replica wire helper from `Group.Replica.Protocol` to
+  `Group.Replica.WireProtocol` to avoid overloading Elixir protocol terminology.
+  The standalone TCP adapter is retained only as hidden test infrastructure;
+  Group ships the transport contract, dist-Erlang adapter, and outbox helper.
+- **Breaking**: replica protocol v3 streams exact snapshots as provisional,
+  transport-neutral byte-targeted chunks (`1 MiB` by default) followed by an
+  independently retryable terminal manifest. The sender scans once and retains
+  only its current chunk; a concurrent mutation suppresses commit. Receivers
+  stage in reusable shard-owned private ETS and advance the cursor only after
+  one exact, authority-fenced assembly is complete. Chunk/commit loss,
+  duplication, reordering, conflicting retransmission, supersession, expiry,
+  and shard crashes remain repairable by anti-entropy. Sideband transports can
+  use per-shard local outboxes for bounded batching without adding a hop to the
+  default dist-Erlang adapter. Late-starting replica lanes now rebuild their
+  view from shared exact authority when startup fanout races registration.
+- Replace replica state sends/snapshots with per-origin, generation- and
+  cluster-epoch-fenced streams: sequenced deltas repair gaps from a bounded
+  oplog and fall back to exact origin snapshots after pruning. Replica data now
+  uses a pluggable nonblocking transport (dist Erlang by default via
+  `send_nosuspend`), while dist Erlang remains the control plane. Nonblocking
+  control heartbeats lease peer state, requesting a fresh authoritative hello
+  on generation or epoch-revision changes, so a stopped Group on a connected
+  VM cannot leave permanent registry or membership rows. Reconnects also sweep
+  superseded per-shard receive cursors and reconstruct epochless PG rows, so
+  reordered cluster controls cannot strand live rows from an older epoch. Full
+  epoch authority is installed once by shard 0; matching data shards exchange
+  constant-size lane hellos and retain shard-to-shard transport ordering.
+  Authority capture is serialized with epoch activation, and exact versus
+  incrementally observed revisions are tracked separately so a concurrent
+  partial snapshot cannot be mistaken for complete authority.
+- Registry authority is retained per origin separately from the visible
+  winner. Conflict callbacks select the winner; Group now records and
+  propagates an authoritative loser delete, and each owner node terminates only
+  its own losing process. This also applies to custom conflict callbacks.
+- Add `Group.monitor_generation/1` so long-lived registration owners can
+  terminate and re-register when the local membership ETS generation is lost.
 - **Breaking**: `Group.disconnect/3` now discards the complete local view of each departed
   cluster — remote entries included, and monitors receive `:unregistered`/`:left` events for
   them — instead of removing only locally owned rows. Reconnecting resyncs through the normal
   snapshot exchange. `connect`/`disconnect` also raise `ArgumentError` for non-binary cluster
   names instead of silently tolerating them.
-- The built-in registry conflict resolver now consistently includes the winner's metadata in
-  the losing process's `{:group_registry_conflict, key, winner_meta}` exit reason. Custom
-  `resolve_registry_conflict` callbacks remain responsible for any process exits they require.
+- The registry conflict resolver now consistently includes the winner's metadata in
+  the losing process's `{:group_registry_conflict, key, winner_meta}` exit reason.
 - **Breaking**: `Group.dispatch/4` remote sends and process-DOWN replication are now
-  non-suspending and never auto-connect — on a busy or disconnected distribution link the
-  message is dropped, the link is force-disconnected, and bounded reconnect retries begin (the
-  same policy replication lanes have used since 0.1.8). Previously dispatch could block the
-  caller and initiate new connections.
+  non-suspending and never auto-connect. Busy dispatch drops still force a disconnect and
+  bounded reconnect retry; replica messages are dropped and repaired by anti-entropy without
+  disturbing the dist-Erlang control connection. Previously dispatch could block the caller
+  and initiate new connections.
 - Configured function-form `extract_meta` callbacks are now applied on reads and lifecycle
   events (previously they were silently ignored and full metadata was exposed), and invalid
   `:extract_meta` values raise `ArgumentError` at startup.

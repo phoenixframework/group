@@ -15,6 +15,9 @@ doc/
 # Temporary files, for example, from tests.
 tmp/
 
+# TLC's default state directory when the formal model is run by hand.
+/states/
+
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
 

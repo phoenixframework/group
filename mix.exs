@@ -10,8 +10,10 @@ defmodule Group.MixProject do
       version: @version,
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
+      test_ignore_filters: [~r"^test/jepsen/", ~r"^test/mutation/"],
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      aliases: aliases(),
       package: package(),
       docs: docs(),
       name: "Group",
@@ -32,9 +34,14 @@ defmodule Group.MixProject do
     ]
   end
 
+  def cli do
+    [preferred_envs: ["test.soak": :test]]
+  end
+
   defp deps do
     [
-      {:ex_doc, "~> 0.30", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.30", only: :dev, runtime: false},
+      {:stream_data, "~> 1.4", only: :test}
     ]
   end
 
@@ -52,6 +59,21 @@ defmodule Group.MixProject do
       main: "Group",
       source_url: @source_url,
       source_ref: "v#{@version}"
+    ]
+  end
+
+  defp aliases do
+    [
+      test: ["test", "cmd test/jepsen/checker.sh"],
+      "test.soak": [
+        # Run the PR gate in a child VM. test_helper starts distribution, and
+        # keeping that VM alive for the following `cmd` phases can retain a
+        # fixed ERL_AFLAGS distribution port and make qualification fail with
+        # eaddrinuse.
+        "cmd mix test",
+        "cmd env GROUP_JEPSEN_SKIP_CHECKER=1 test/jepsen/qualify.sh",
+        "cmd env GROUP_JEPSEN_SKIP_CHECKER=1 test/jepsen/campaign.sh"
+      ]
     ]
   end
 end

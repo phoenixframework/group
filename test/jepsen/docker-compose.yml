@@ -1,0 +1,52 @@
+services:
+  n1:
+    build:
+      context: ../..
+      dockerfile: test/jepsen/Dockerfile.node
+    container_name: group-jepsen-n1
+    hostname: n1
+    cap_add: [NET_ADMIN]
+    environment:
+      GROUP_JEPSEN_NODE: n1
+      GROUP_JEPSEN_PORT: 9080
+      GROUP_JEPSEN_PEERS: group@n1,group@n2,group@n3
+      GROUP_JEPSEN_TRANSPORT: ${GROUP_JEPSEN_TRANSPORT:-distribution}
+      GROUP_JEPSEN_SENDER_BUFFER_SIZE: ${GROUP_JEPSEN_SENDER_BUFFER_SIZE:-1}
+    ports: ["19081:9080"]
+    networks: [group]
+
+  n2:
+    build:
+      context: ../..
+      dockerfile: test/jepsen/Dockerfile.node
+    container_name: group-jepsen-n2
+    hostname: n2
+    cap_add: [NET_ADMIN]
+    environment:
+      GROUP_JEPSEN_NODE: n2
+      GROUP_JEPSEN_PORT: 9080
+      GROUP_JEPSEN_PEERS: group@n1,group@n2,group@n3
+      GROUP_JEPSEN_TRANSPORT: ${GROUP_JEPSEN_TRANSPORT:-distribution}
+      GROUP_JEPSEN_SENDER_BUFFER_SIZE: ${GROUP_JEPSEN_SENDER_BUFFER_SIZE:-1}
+    ports: ["19082:9080"]
+    networks: [group]
+
+  n3:
+    build:
+      context: ../..
+      dockerfile: test/jepsen/Dockerfile.node
+    container_name: group-jepsen-n3
+    hostname: n3
+    cap_add: [NET_ADMIN]
+    environment:
+      GROUP_JEPSEN_NODE: n3
+      GROUP_JEPSEN_PORT: 9080
+      GROUP_JEPSEN_PEERS: group@n1,group@n2,group@n3
+      GROUP_JEPSEN_TRANSPORT: ${GROUP_JEPSEN_TRANSPORT:-distribution}
+      GROUP_JEPSEN_SENDER_BUFFER_SIZE: ${GROUP_JEPSEN_SENDER_BUFFER_SIZE:-1}
+    ports: ["19083:9080"]
+    networks: [group]
+
+networks:
+  group:
+    name: group-jepsen-net

@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 COOKIE=bench
 SHARDS=8
 COORDINATOR_EXPR=
+BENCH_ERL_AFLAGS="${GROUP_BENCH_ERL_AFLAGS:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -24,12 +25,12 @@ mix deps.get --check 2>/dev/null || mix deps.get
 mix compile
 
 echo "==> Starting replica1..."
-elixir --name replica1@127.0.0.1 --cookie "$COOKIE" \
+ERL_AFLAGS="$BENCH_ERL_AFLAGS" elixir --name replica1@127.0.0.1 --cookie "$COOKIE" \
   -S mix run --no-halt -e "GroupBench.Replica.start()" &
 REPLICA1_PID=$!
 
 echo "==> Starting replica2..."
-elixir --name replica2@127.0.0.1 --cookie "$COOKIE" \
+ERL_AFLAGS="$BENCH_ERL_AFLAGS" elixir --name replica2@127.0.0.1 --cookie "$COOKIE" \
   -S mix run --no-halt -e "GroupBench.Replica.start()" &
 REPLICA2_PID=$!
 
@@ -44,5 +45,5 @@ trap cleanup EXIT
 sleep 2
 
 echo "==> Starting coordinator (shards=$SHARDS)..."
-elixir --name coordinator@127.0.0.1 --cookie "$COOKIE" \
+ERL_AFLAGS="$BENCH_ERL_AFLAGS" elixir --name coordinator@127.0.0.1 --cookie "$COOKIE" \
   -S mix run -e "$COORDINATOR_EXPR"

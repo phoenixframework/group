@@ -15,14 +15,18 @@ defmodule GroupBench do
       ["local"] ->
         GroupBench.Local.run()
 
+      ["member_counts"] ->
+        GroupBench.Local.run_member_counts()
+
       ["distributed"] ->
         GroupBench.Distributed.run()
 
       _ ->
         IO.puts("""
-        Usage: GroupBench.main(["local" | "distributed"])
+        Usage: GroupBench.main(["local" | "member_counts" | "distributed"])
 
           local        — Run single-node benchmarks
+          member_counts — Run 1K/100K/1M materialized count read benchmarks
           distributed  — Coordinator: connects to replicas, drives benchmarks
         """)
     end
