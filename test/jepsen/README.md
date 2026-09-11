@@ -32,7 +32,8 @@ The replica lane is selectable without changing the workload or checker:
 After faults stop, every surviving node reconnects and the harness takes two
 terminal snapshots. The independent checker requires:
 
-- exact, identical public registry and PG views on every survivor;
+- exact, identical public registry and PG metadata on every survivor, including
+  each revision acknowledged by its owner;
 - every live owner claim to be visible, and no dead owner token to remain;
 - deterministic resolution of registry conflicts with no unexpected owner
   deaths;
@@ -135,7 +136,16 @@ test/jepsen/checker.sh
 ```
 
 At the repository root, `mix test` runs this pure checker after the complete
-ExUnit, StreamData, and deterministic-chaos suite. `mix test.soak` runs that
+ExUnit, StreamData, and deterministic-chaos suite, followed by executable
+capture qualification (`test/jepsen/lein.sh test :capture`, requiring Elixir).
+The capture qualification mutates real owners repeatedly, corrupts materialized
+metadata while preserving internal index consistency, and passes the real
+snapshot EDN to the independent checker. Public values retain metadata maps
+rather than only tokens; node/boot/owner/incarnation tokens still identify owner
+lifetimes without exporting raw PIDs. Old token-only histories are intentionally
+not accepted as exact metadata evidence.
+
+`mix test.soak` runs that
 same PR gate, the complete mutation/live-checker qualification, and then
 `campaign.sh`. Chaos/mixed uses a sender/repair buffer of 32 and requires
 evidence that one repaired delta run contained at least two records; all other
