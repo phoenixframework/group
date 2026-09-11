@@ -1,20 +1,19 @@
 defmodule Group.JepsenCleanupDeathsTest do
   use ExUnit.Case, async: false
+  @moduletag :local
+  @moduletag :tmp_dir
+  Code.require_file("jepsen/harness_modules.exs", __DIR__)
 
-  @path Path.expand("jepsen/node.exs", __DIR__)
-  @logs Path.expand("../tmp/jepsen-cleanup", __DIR__)
-  File.mkdir_p!(@logs)
+  setup %{tmp_dir: tmp_dir} do
+    for variable <- ["GROUP_JEPSEN_UNEXPECTED_DEATH_LOG", "GROUP_JEPSEN_PERSISTENT_EVENT_LOG"] do
+      previous = System.get_env(variable)
+      System.put_env(variable, Path.join(tmp_dir, variable))
 
-  unless Code.ensure_loaded?(Group.Jepsen.Owner) do
-    @path
-    |> File.read!()
-    |> String.replace("Group.Jepsen.Main.run(System.argv())", "")
-    # Isolate the executable's durable log paths, not its Owner/Driver code.
-    |> String.replace("/tmp/group-jepsen-", @logs <> "/group-jepsen-")
-    |> Code.compile_string(@path)
-  end
+      on_exit(fn ->
+        if previous, do: System.put_env(variable, previous), else: System.delete_env(variable)
+      end)
+    end
 
-  setup do
     start_supervised!({Group, name: :jepsen_group, shards: 1, log: false})
 
     driver =

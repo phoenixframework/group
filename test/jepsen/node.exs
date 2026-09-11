@@ -19,7 +19,7 @@ defmodule Group.Jepsen.Transport.Stats do
 
   def increment_persistent(event, amount \\ 1) do
     increment(event, amount)
-    File.write!(@persistent_event_log, "#{event}\t#{amount}\n", [:append])
+    File.write!(persistent_event_log(), "#{event}\t#{amount}\n", [:append])
     :ok
   end
 
@@ -52,8 +52,11 @@ defmodule Group.Jepsen.Transport.Stats do
     {:ok, %{}}
   end
 
+  defp persistent_event_log,
+    do: System.get_env("GROUP_JEPSEN_PERSISTENT_EVENT_LOG", @persistent_event_log)
+
   defp persistent_events do
-    case File.read(@persistent_event_log) do
+    case File.read(persistent_event_log()) do
       {:ok, contents} ->
         contents
         |> String.split("\n", trim: true)
@@ -680,6 +683,10 @@ defmodule Group.Jepsen.Driver do
     end
   end
 
+  def handle_call(:unexpected_deaths, _from, state) do
+    {:reply, state.unexpected_deaths, state}
+  end
+
   # Cleanup returns its snapshot in the same Owner turn. There is no second
   # unguarded call, and every confirmed death uses the normal monitor path.
   defp refresh_owners(state, request) do
@@ -702,10 +709,6 @@ defmodule Group.Jepsen.Driver do
             end
         end
     end)
-  end
-
-  def handle_call(:unexpected_deaths, _from, state) do
-    {:reply, state.unexpected_deaths, state}
   end
 
   @impl true
@@ -781,11 +784,14 @@ defmodule Group.Jepsen.Driver do
   defp name(index), do: :"group_jepsen_driver_#{index}"
 
   defp persist_unexpected_death(%{token: token, reason: reason}) do
-    File.write(@unexpected_death_log, token <> "\t" <> reason <> "\n", [:append])
+    File.write(unexpected_death_log(), token <> "\t" <> reason <> "\n", [:append])
   end
 
+  defp unexpected_death_log,
+    do: System.get_env("GROUP_JEPSEN_UNEXPECTED_DEATH_LOG", @unexpected_death_log)
+
   defp persisted_unexpected_deaths do
-    case File.read(@unexpected_death_log) do
+    case File.read(unexpected_death_log()) do
       {:ok, contents} ->
         contents
         |> String.split("\n", trim: true)
