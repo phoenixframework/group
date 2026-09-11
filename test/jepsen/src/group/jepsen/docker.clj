@@ -1,6 +1,7 @@
 (ns group.jepsen.docker
-  (:require [clojure.java.shell :as shell]
-            [clojure.string :as str]))
+  (:require [clojure.string :as str])
+  (:import (java.io File)
+           (java.util.concurrent TimeUnit)))
 
 (def containers
   {"n1" "group-jepsen-n1"
@@ -16,6 +17,8 @@
 (def replica-chain "GROUP_JEPSEN_REPLICA")
 (def replica-port 10000)
 
+(def ^:dynamic *command-timeout-ms* 30000)
+
 (defn container [node]
   (or (get containers (name node))
       (throw (ex-info "unknown Jepsen node" {:node node}))))
@@ -26,11 +29,30 @@
 
 (defn shell!
   [& args]
-  (let [{:keys [exit out err]} (apply shell/sh args)]
-    (when-not (zero? exit)
-      (throw (ex-info "command failed"
-                      {:command args, :exit exit, :out out, :err err})))
-    (str/trim out)))
+  (let [output (File/createTempFile "group-jepsen-command-" ".log")
+        errors (File/createTempFile "group-jepsen-command-" ".err")]
+    (try
+      (let [process (-> (ProcessBuilder. ^java.util.List (vec args))
+                        (.redirectError errors)
+                        (.redirectOutput output)
+                        .start)]
+        (try
+          (when-not (.waitFor process *command-timeout-ms* TimeUnit/MILLISECONDS)
+            (throw (ex-info "command timed out"
+                            {:command args :timeout-ms *command-timeout-ms*})))
+          (let [out (slurp output)
+                exit (.exitValue process)]
+            (when-not (zero? exit)
+              (throw (ex-info "command failed"
+                              {:command args :exit exit :out out :err (slurp errors)})))
+            (str/trim out))
+          (finally
+            (when (.isAlive process)
+              (.destroyForcibly process)
+              (.waitFor process 1000 TimeUnit/MILLISECONDS)))))
+      (finally
+        (.delete output)
+        (.delete errors)))))
 
 (defn docker!
   [& args]
@@ -64,9 +86,35 @@
 
 (defn reset-oracle! [node]
   (exec-sh! node
-            (str "rm -f /tmp/group-jepsen-unexpected-deaths "
-                 "/tmp/group-jepsen-persistent-events "
-                 "/tmp/group-jepsen-cursor-marker-corruption")))
+            (str "rm -f /tmp/group-jepsen-persistent-events "
+                 "/tmp/group-jepsen-cursor-marker-corruption && "
+                 ": > /tmp/group-jepsen-unexpected-deaths")))
+
+(defn parse-unexpected-deaths [contents]
+  (mapv (fn [line]
+          (let [[token reason :as fields] (str/split line #"\t" 2)]
+            (when (or (not= 2 (count fields)) (str/blank? token) (str/blank? reason))
+              (throw (ex-info "malformed lifecycle evidence" {:line line})))
+            {:token token :reason reason}))
+        (remove str/blank? (str/split-lines contents))))
+
+(defn retired-evidence!
+  "Reads the stopped container's durable oracle, without depending on its VM or socket.
+  Missing, truncated, unreadable, or oversized evidence is a qualification failure."
+  [node]
+  (let [file (File/createTempFile "group-jepsen-retired-" ".log")]
+    (try
+      (binding [*command-timeout-ms* 10000]
+        (docker! "cp"
+                 (str (container node) ":/tmp/group-jepsen-unexpected-deaths")
+                 (.getAbsolutePath file)))
+      (when (> (.length file) (* 8 1024 1024))
+        (throw (ex-info "lifecycle evidence exceeds collection bound" {:node node})))
+      (let [contents (slurp file)]
+        (when (and (seq contents) (not (str/ends-with? contents "\n")))
+          (throw (ex-info "truncated lifecycle evidence" {:node node})))
+        {:node (name node) :unexpected-deaths (parse-unexpected-deaths contents)})
+      (finally (.delete file)))))
 
 (defn ensure-firewall-chain! [node chain]
   (exec-sh!

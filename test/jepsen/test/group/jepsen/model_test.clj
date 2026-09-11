@@ -165,9 +165,31 @@
 (deftest accepts-a-permanently-retired-node-and-requires-its-absence
   (let [survivors ["n2" "n3"]
         permanent-test (assoc test-map :terminal-nodes survivors)
-        history [(snapshot-op 1 "n2" survivors [] (empty-registry) (empty-pg))
+        history [{:index 0 :process :nemesis :type :info :f :retire-node
+                  :value {:retired "n1" :lifecycle-evidence {:node "n1" :unexpected-deaths []}}}
+                 (snapshot-op 1 "n2" survivors [] (empty-registry) (empty-pg))
                  (snapshot-op 2 "n3" survivors [] (empty-registry) (empty-pg))]]
     (is (:valid? (model/analyze permanent-test history)))))
+
+(deftest retirement-cannot-discard-earlier-invalid-lifecycle-evidence
+  (let [survivors ["n2" "n3"]
+        test (assoc test-map :terminal-nodes survivors)
+        retirement {:index 2 :process :nemesis :type :info :f :retire-node
+                    :value {:retired "n1"
+                            :lifecycle-evidence {:node "n1" :unexpected-deaths []}}}
+        terminal [(snapshot-op 3 "n2" survivors [] (empty-registry) (empty-pg))
+                  (snapshot-op 4 "n3" survivors [] (empty-registry) (empty-pg))]
+        prior (with-unexpected-death
+                (snapshot-op 1 "n1" [] (empty-registry) (empty-pg)) "lost-owner")]
+    (is (false? (:valid? (model/analyze test (concat [prior retirement] terminal)))))
+    (is (false? (:valid? (model/analyze test terminal))))
+    (is (false? (:valid? (model/analyze test
+                          (cons (assoc-in retirement [:value :lifecycle-evidence :unexpected-deaths]
+                                          [{:token "lost-owner" :reason ":boom"}])
+                                terminal)))))
+    (is (false? (:valid? (model/analyze test
+                          (cons (assoc-in retirement [:value :evidence-error] {:message "timeout"})
+                                terminal)))))))
 
 (deftest rejects-zombies-missing-live-owners-and-divergence
   (let [live (owner "live" [(registration nil 0 1)] [])
