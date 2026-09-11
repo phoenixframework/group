@@ -41,6 +41,12 @@
             :unexpected-deaths []
             :transport-events {}
             :transport-profile :distribution
+            :streams {:origin (str "group@" node) :generation node :shards 1
+                      :epochs {"root" node}
+                      :heads [{:stream {:group "jepsen_group" :origin (str "group@" node)
+                                        :generation node :shard 0 :cluster "root" :epoch node}
+                               :head 0 :applied 0}]
+                      :cursors []}
             :internal (healthy-internal)
             :registry registry
             :pg pg}}))

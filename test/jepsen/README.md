@@ -40,6 +40,8 @@ terminal snapshots. The independent checker requires:
   node;
 - consistent registry, PG, cluster, claim, cursor, oplog, and remote-authority
   indexes inside every shard;
+- every admitted receiver stream at its independently captured origin head,
+  including streams with no writes;
 - no staged partial snapshot and no retained data for a retired origin;
 - coverage of delta batches, snapshot fallback, multi-chunk assembly, and
   registry conflict termination;
@@ -135,7 +137,25 @@ test/jepsen/checker.sh
 ```
 
 At the repository root, `mix test` runs this pure checker after the complete
-ExUnit, StreamData, and deterministic-chaos suite. `mix test.soak` runs that
+ExUnit, StreamData, and deterministic-chaos suite, followed by executable
+capture qualification (`test/jepsen/lein.sh test :capture`, requiring Elixir).
+The cursor capture qualification uses three real Group nodes (two small peer
+VMs), passes their snapshot EDN to the checker, and covers pristine streams,
+explicit zero markers, ahead/missing cursors, cluster closure, instance restart
+and retirement.
+
+Terminal evidence now includes each origin's generation, active epochs and
+per-shard heads, plus every receiver cursor and its actual lane. The checker
+derives admission from both sides' active clusters rather than from the set of
+already-present cursors. A missing cursor is legal only at head zero; an extra
+cursor is illegal even at zero. Source heads must be fully applied, and stream
+evidence must remain unchanged across terminal observations. Generation and
+epoch identities are opaque external-term encodings so reference identity
+survives EDN transport. Old captures without stream evidence cannot qualify.
+All evidence is collected by snapshot clients; no Group shard makes a blocking
+cross-node call.
+
+`mix test.soak` runs that
 same PR gate, the complete mutation/live-checker qualification, and then
 `campaign.sh`. Chaos/mixed uses a sender/repair buffer of 32 and requires
 evidence that one repaired delta run contained at least two records; all other

@@ -4,5 +4,7 @@
   :license {:name "MIT"}
   :dependencies [[org.clojure/clojure "1.12.4"]
                  [jepsen "0.3.13"]]
+  :test-selectors {:default (complement :capture)
+                   :capture :capture}
   :main group.jepsen.core
   :jvm-opts ["-Xmx4g" "-Djava.awt.headless=true" "-server"])

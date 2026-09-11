@@ -1230,6 +1230,57 @@ end
 defmodule Group.Jepsen.Snapshot do
   @moduledoc false
 
+  alias Group.Replica.{Data, WireProtocol}
+
+  # Read each origin independently from the snapshot client, never by calling
+  # another node from a Group shard. Include pristine streams explicitly: an
+  # absent stream-meta row means head zero, not missing terminal evidence.
+  def stream_positions do
+    group = :jepsen_group
+    generation = Data.generation(group)
+    epochs = Data.local_cluster_epochs(group)
+    num_shards = Group.get_config(group).num_shards
+
+    heads =
+      for shard <- 0..(num_shards - 1), {cluster, epoch} <- epochs do
+        stream = WireProtocol.stream_id(group, node(), generation, shard, cluster, epoch)
+        {_floor, head, applied} = Data.replica_stream_head(group, shard, stream)
+        %{stream: stream_identity(stream), head: head, applied: applied}
+      end
+
+    cursors =
+      for shard <- 0..(num_shards - 1),
+          {stream, position} <- :ets.tab2list(Data.replica_cursor_table(group, shard)) do
+        %{stream: stream_identity(stream), position: position_value(position), lane: shard}
+      end
+
+    %{
+      origin: Atom.to_string(node()),
+      generation: identity(generation),
+      shards: num_shards,
+      epochs:
+        Map.new(epochs, fn {cluster, epoch} -> {cluster_name(cluster), identity(epoch)} end),
+      heads: Enum.sort(heads),
+      cursors: Enum.sort(cursors)
+    }
+  end
+
+  defp stream_identity(stream) do
+    %{
+      group: Atom.to_string(WireProtocol.stream_name(stream)),
+      origin: Atom.to_string(WireProtocol.stream_origin(stream)),
+      generation: identity(WireProtocol.stream_generation(stream)),
+      shard: WireProtocol.stream_shard(stream),
+      cluster: cluster_name(WireProtocol.stream_cluster(stream)),
+      epoch: identity(WireProtocol.stream_epoch(stream))
+    }
+  end
+
+  # References must retain their originating-node identity across EDN captures.
+  defp identity(term), do: term |> :erlang.term_to_binary() |> Base.encode64()
+  defp position_value(value) when is_integer(value), do: value
+  defp position_value(value), do: inspect(value)
+
   def capture(node_id, boot_id, key_count, clusters, retired_nodes) do
     owners = Group.Jepsen.Driver.owner_snapshots()
 
@@ -1280,6 +1331,7 @@ defmodule Group.Jepsen.Snapshot do
         transport_events: Group.Jepsen.Transport.Stats.snapshot(),
         transport_profile: Group.Jepsen.Transport.Control.profile(),
         internal: Group.Jepsen.Invariant.snapshot(retired_nodes),
+        streams: stream_positions(),
         registry: registry,
         pg: pg
       }
@@ -1565,4 +1617,6 @@ defmodule Group.Jepsen.Main do
   end
 end
 
-Group.Jepsen.Main.run(System.argv())
+unless System.get_env("GROUP_JEPSEN_LIBRARY") == "1" do
+  Group.Jepsen.Main.run(System.argv())
+end
