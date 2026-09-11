@@ -1,28 +1,49 @@
 defmodule Group.TestCluster do
   @moduledoc false
 
+  @doc "Start distribution only when a test actually needs real peers."
+  def ensure_distribution do
+    unless Node.alive?() do
+      epmd = System.find_executable("epmd") || raise "epmd executable not found"
+
+      case System.cmd(epmd, ["-daemon"], stderr_to_stdout: true) do
+        {_, 0} -> :ok
+        {output, status} -> raise "failed to start epmd (status #{status}): #{output}"
+      end
+
+      name = :"test_#{System.pid()}_#{System.unique_integer([:positive])}@127.0.0.1"
+      {:ok, _} = Node.start(name, :longnames)
+      Node.set_cookie(:group_test)
+    end
+
+    # Partition tests must keep their control connection to the test node.
+    :application.set_env(:kernel, :prevent_overlapping_partitions, false)
+    :ok
+  end
+
   @doc "Start N peer nodes with Group app loaded and ready"
   def start_peers(count, opts \\ []) do
+    ensure_distribution()
     cookie = Keyword.get(opts, :cookie, Node.get_cookie())
     code_paths = :code.get_path()
-    schedulers = Keyword.get(opts, :schedulers)
-
-    scheduler_args =
-      if schedulers, do: [~c"+S", ~c"#{schedulers}:#{schedulers}"], else: []
+    schedulers = Keyword.get(opts, :schedulers, System.get_env("GROUP_PEER_SCHEDULERS", "2"))
+    schedulers = String.to_integer(to_string(schedulers))
+    unless schedulers in 1..64, do: raise(ArgumentError, "peer schedulers must be in 1..64")
 
     args =
-      scheduler_args ++
-        [
-          ~c"-setcookie",
-          ~c"#{cookie}",
-          ~c"-kernel",
-          ~c"prevent_overlapping_partitions",
-          ~c"false"
-        ] ++
+      [
+        ~c"+S",
+        ~c"#{schedulers}:#{schedulers}",
+        ~c"-setcookie",
+        ~c"#{cookie}",
+        ~c"-kernel",
+        ~c"prevent_overlapping_partitions",
+        ~c"false"
+      ] ++
         Enum.flat_map(code_paths, fn p -> [~c"-pa", p] end)
 
     for _i <- 1..count do
-      name = :"peer#{System.unique_integer([:positive])}"
+      name = :"peer_#{System.pid()}_#{System.unique_integer([:positive])}"
 
       # A fixed inet_dist_listen_min/max inherited through ERL_AFLAGS makes
       # every child contend for the parent VM's distribution port. Peer args
@@ -38,11 +59,26 @@ defmodule Group.TestCluster do
 
       {:ok, _} = :rpc.call(node, :application, :ensure_all_started, [:elixir])
       {:ok, _} = :rpc.call(node, :application, :ensure_all_started, [:group])
+
+      Group.TestDiagnostics.record(:peer_started, %{
+        test: Process.get(:group_test_context),
+        node: node,
+        schedulers: schedulers
+      })
+
       {pid, node}
     end
   end
 
   def stop_peers(peers) do
+    try do
+      Group.TestDiagnostics.capture_peers(peers)
+    after
+      do_stop_peers(peers)
+    end
+  end
+
+  defp do_stop_peers(peers) do
     Enum.each(peers, fn {pid, _node} ->
       if pid do
         try do
@@ -496,10 +532,20 @@ defmodule Group.TestCluster do
   @doc "Monitor nodedown events from a remote node, forwarding to caller"
   def monitor_nodes_on(node, target_pid) do
     :erpc.call(node, fn ->
-      spawn(fn ->
-        :net_kernel.monitor_nodes(true)
-        forward_nodedown(target_pid)
-      end)
+      parent = self()
+
+      pid =
+        spawn(fn ->
+          :net_kernel.monitor_nodes(true)
+          send(parent, {:monitor_ready, self()})
+          forward_nodedown(target_pid)
+        end)
+
+      receive do
+        {:monitor_ready, ^pid} -> pid
+      after
+        5000 -> raise "monitor_nodes_on timed out"
+      end
     end)
   end
 
@@ -625,6 +671,23 @@ defmodule Group.TestCluster do
     )
 
     :ok
+  end
+
+  @doc "Wait for every shard and the shared peer table to agree on the expected Group peers."
+  def assert_group_nodes(node, name, expected_nodes) do
+    expected_nodes = Enum.sort(expected_nodes)
+
+    assert_eventually(fn ->
+      :erpc.call(node, fn ->
+        num_shards = Group.get_config(name).num_shards
+
+        Enum.sort(Group.nodes(name)) == expected_nodes and
+          Enum.all?(0..(num_shards - 1), fn shard ->
+            state = :sys.get_state(:"#{name}_replica_#{shard}")
+            Enum.sort(Map.keys(state.remote_shards)) == expected_nodes
+          end)
+      end)
+    end)
   end
 
   @doc "Returns the current message_queue_len for a shard on a remote node."

@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  MIX_ENV: test
+  ERL_FLAGS: "+S 4:4"
+  GROUP_PEER_SCHEDULERS: "2"
+  GROUP_TEST_DIAGNOSTICS: ${{ github.workspace }}/_build/test-diagnostics
+  ERL_CRASH_DUMP: ${{ github.workspace }}/_build/test-diagnostics/erl_crash.dump
+
+jobs:
+  local:
+    name: Local checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: "> 0"
+          otp-version: "> 0"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: mix deps.get
+      - name: Formatting, compiler checks, local examples and histories
+        run: |
+          mkdir -p "$GROUP_TEST_DIAGNOSTICS"
+          mix format --check-formatted 2>&1 | tee "$GROUP_TEST_DIAGNOSTICS/format.log"
+          mix compile --warnings-as-errors 2>&1 | tee "$GROUP_TEST_DIAGNOSTICS/compile.log"
+          mix test --only local --warnings-as-errors 2>&1 | tee "$GROUP_TEST_DIAGNOSTICS/local.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: local-failure
+          path: _build/test-diagnostics
+          retention-days: 14
+
+  test:
+    name: ${{ matrix.latest && 'Latest stable Elixir / OTP' || format('Elixir {0} / OTP {1}', matrix.elixir, matrix.otp) }}
+    needs: local
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: "1.19"
+            otp: "26"
+          - elixir: "1.19"
+            otp: "27"
+          - elixir: "1.19"
+            otp: "28"
+          - elixir: "1.20"
+            otp: "27"
+          - elixir: "1.20"
+            otp: "28"
+          # Unlike "latest", these ranges exclude prereleases.
+          - elixir: "> 0"
+            otp: "> 0"
+            latest: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Compile with warnings as errors
+        run: |
+          mkdir -p "$GROUP_TEST_DIAGNOSTICS"
+          mix compile --warnings-as-errors 2>&1 | tee "$GROUP_TEST_DIAGNOSTICS/compile.log"
+
+      - name: Run local and distributed tests
+        run: mix test --warnings-as-errors 2>&1 | tee "$GROUP_TEST_DIAGNOSTICS/test.log"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: runtime-failure-${{ strategy.job-index }}
+          path: _build/test-diagnostics
+          retention-days: 14

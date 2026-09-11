@@ -2,16 +2,8 @@ defmodule GroupTest.ExtractMeta do
   def strip(meta), do: Map.take(meta, [:public])
 end
 
-defmodule GroupTest do
-  use ExUnit.Case, async: true
-
-  @moduletag :capture_log
-
-  setup do
-    name = :"test_group_#{System.unique_integer([:positive])}"
-    start_supervised!({Group, name: name, shards: 4, log: false})
-    {:ok, name: name}
-  end
+defmodule GroupTest.Startup do
+  use Group.LocalCase, async: true
 
   describe "startup options" do
     test "runtime config omits unused callback state", %{name: name} do
@@ -32,6 +24,11 @@ defmodule GroupTest do
       end
     end
   end
+end
+
+defmodule GroupTest.ProcessGroups do
+  # Ingress fairness assertions change VM-global trace patterns.
+  use Group.LocalCase, async: false
 
   describe "replica ingress fairness" do
     test "an oversized incoming batch yields to an already queued local write", %{name: name} do
@@ -227,6 +224,10 @@ defmodule GroupTest do
       [{_pid, %{v: 2}}] = Group.members(name, key)
     end
   end
+end
+
+defmodule GroupTest.Registry do
+  use Group.LocalCase, async: true
 
   describe "named-cluster mutation fencing" do
     test "a shard rejects registry and PG writes after their cluster epoch retires", %{name: name} do
@@ -376,6 +377,10 @@ defmodule GroupTest do
       assert Group.lookup(name, key) == nil
     end
   end
+end
+
+defmodule GroupTest.Membership do
+  use Group.LocalCase, async: true
 
   describe "members/2" do
     test "returns only joined processes", %{name: name} do
@@ -628,6 +633,10 @@ defmodule GroupTest do
       end
     end
   end
+end
+
+defmodule GroupTest.Monitoring do
+  use Group.LocalCase, async: true
 
   describe "self-events" do
     test "joining process receives its own :joined event if subscribed", %{name: name} do
@@ -756,6 +765,11 @@ defmodule GroupTest do
       refute_receive {:group, _, _}, 200
     end
   end
+end
+
+defmodule GroupTest.Clusters do
+  # Dispatch assertions change VM-global trace patterns.
+  use Group.LocalCase, async: false
 
   describe "named clusters" do
     test "connect and disconnect reject non-binary cluster names", %{name: name} do
@@ -1323,6 +1337,10 @@ defmodule GroupTest do
       refute_receive {:group, _, _}, 200
     end
   end
+end
+
+defmodule GroupTest.Requests do
+  use Group.LocalCase, async: true
 
   describe "call timeout option" do
     test "register honors timeout option" do
@@ -1539,6 +1557,10 @@ defmodule GroupTest do
       assert :ok = Group.TestCluster.assert_replica_consistent(name)
     end
   end
+end
+
+defmodule GroupTest.Fairness do
+  use Group.LocalCase, async: true
 
   describe "local request fairness" do
     test "a control flood yields to a queued local request after bounded work" do
@@ -1641,6 +1663,10 @@ defmodule GroupTest do
       assert Group.members(name, join_key2) == [{caller2, %{order: 2}}]
     end
   end
+end
+
+defmodule GroupTest.Consistency do
+  use Group.LocalCase, async: true
 
   describe "ETS table consistency" do
     test "tables are consistent after register + unregister", %{name: name} do
@@ -1781,6 +1807,11 @@ defmodule GroupTest do
       assert Group.TestCluster.assert_ets_consistent(name) == :ok
     end
   end
+end
+
+defmodule GroupTest.Counts do
+  # ETS call-count assertions change VM-global trace patterns.
+  use Group.LocalCase, async: false
 
   describe "local_registry_count/1" do
     test "local activity checks use bounded ETS selects", %{name: name} do
@@ -2046,6 +2077,10 @@ defmodule GroupTest do
         end)
     end
   end
+end
+
+defmodule GroupTest.Queries do
+  use Group.LocalCase, async: true
 
   describe "local_members/3" do
     test "returns local exact-key members and honors the limit", %{name: name} do
@@ -2207,6 +2242,10 @@ defmodule GroupTest do
                ])
     end
   end
+end
+
+defmodule GroupTest.Concurrency do
+  use Group.LocalCase, async: true
 
   describe "concurrent operations" do
     test "concurrent join/leave on same key doesn't produce duplicates", %{name: name} do
@@ -2273,6 +2312,11 @@ defmodule GroupTest do
       assert length(error_results) == 4
     end
   end
+end
+
+defmodule GroupTest.Events do
+  # Replication assertions change VM-global trace patterns.
+  use Group.LocalCase, async: false
 
   describe "event batching" do
     test "process death batches :unregistered and :left into one message", %{name: name} do
@@ -2413,6 +2457,10 @@ defmodule GroupTest do
       assert [%Group.Event{type: :unregistered}] = events
     end
   end
+end
+
+defmodule GroupTest.PGBuffering do
+  use Group.LocalCase, async: true
 
   describe "replicated PG receiver buffering" do
     test "legacy unsequenced ingress cannot materialize or delete rows" do
@@ -2452,6 +2500,10 @@ defmodule GroupTest do
       assert :ok = Group.TestCluster.assert_replica_consistent(name)
     end
   end
+end
+
+defmodule GroupTest.RegistryBuffering do
+  use Group.LocalCase, async: true
 
   describe "replica write-ahead journal" do
     test "concurrent shards retain independent append order", %{name: name} do
@@ -3157,166 +3209,6 @@ defmodule GroupTest do
                Group.Replica.Data.replica_stream_head(name, 0, stream_id)
 
       assert :ok = Group.TestCluster.assert_replica_consistent(name)
-    end
-  end
-
-  defp start_single_shard_group(opts \\ []) do
-    name = :"test_timeout_group_#{System.unique_integer([:positive])}"
-    opts = Keyword.merge([name: name, shards: 1, log: false], opts)
-    start_supervised!({Group, opts})
-    name
-  end
-
-  defp keys_for_shard(cluster, prefix, num_shards, shard, count) do
-    1
-    |> Stream.iterate(&(&1 + 1))
-    |> Stream.map(&"#{prefix}/#{&1}")
-    |> Stream.filter(&(Group.Replica.shard_index_for(cluster, &1, num_shards) == shard))
-    |> Enum.take(count)
-  end
-
-  defp suspend_only_shard(name) do
-    shard = Group.Replica.shard_name(name, 0)
-    :ok = :sys.suspend(shard)
-    shard
-  end
-
-  defp resume_shard_if_alive(shard) do
-    if Process.whereis(shard) do
-      :ok = :sys.resume(shard)
-    end
-
-    :ok
-  end
-
-  defp assert_genserver_call_timeout(fun) do
-    assert {:timeout, {GenServer, :call, _}} = catch_exit(fun.())
-  end
-
-  defp replicated_pg_join(cluster, key, pid, meta, reason) do
-    {:replicate_pg_batch,
-     [{:join, cluster, key, pid, meta, System.system_time(), reason, node(pid)}]}
-  end
-
-  defp replicated_register(cluster, key, pid, meta, _reason, time \\ System.system_time()) do
-    {:replicate_registry_batch, [{:register, cluster, key, pid, meta, time, node(pid)}]}
-  end
-
-  defp spawn_requester(fun, tag) do
-    parent = self()
-
-    spawn(fn ->
-      result = fun.()
-      send(parent, {tag, self(), result})
-      Process.sleep(:infinity)
-    end)
-  end
-
-  defp shard_message_queue_len(shard) do
-    case Process.info(Process.whereis(shard), :message_queue_len) do
-      {:message_queue_len, len} -> len
-      nil -> 0
-    end
-  end
-
-  defp flush_replicated_registry_barrier(shard) do
-    send(shard, {:group_dispatch, [self()], {:replicated_registry_buffer_flushed, shard}})
-  end
-
-  defp force_cluster_lease_sweep(name) do
-    lease_manager = Group.ClusterLease.lease_name(name)
-    send(lease_manager, :force_sweep)
-    :sys.get_state(lease_manager)
-    :ok
-  end
-
-  defp expire_cluster_lease(name, cluster) do
-    {ttl_ms, _expires_at} = Group.Replica.Data.cluster_lease(name, cluster)
-
-    Group.Replica.Data.put_cluster_lease(
-      name,
-      cluster,
-      ttl_ms,
-      System.monotonic_time(:millisecond) - 1
-    )
-
-    ttl_ms
-  end
-
-  defp spawn_forever do
-    spawn(fn -> Process.sleep(:infinity) end)
-  end
-
-  defp replica_ingress_fairness_owner(parent) do
-    receive do
-      {:write, shard, request} ->
-        ref = make_ref()
-        send(shard, {:group_local_request, self(), ref, request})
-        {reply, calls} = receive_local_write_with_trace(shard, ref, 0)
-        send(parent, {:local_write_finished, self(), reply, calls})
-        Process.sleep(:infinity)
-    end
-  end
-
-  defp membership_count_owner_loop do
-    receive do
-      {:membership_count_call, caller, ref, {:join, name, key, meta, opts}} ->
-        send(caller, {ref, Group.join(name, key, meta, opts)})
-        membership_count_owner_loop()
-
-      {:membership_count_call, caller, ref, {:leave, name, key, _meta, opts}} ->
-        send(caller, {ref, Group.leave(name, key, opts)})
-        membership_count_owner_loop()
-    end
-  end
-
-  defp membership_count_owner_call(owner, request) do
-    ref = make_ref()
-    send(owner, {:membership_count_call, self(), ref, request})
-
-    receive do
-      {^ref, result} -> result
-    after
-      1_000 -> flunk("membership count owner call timed out")
-    end
-  end
-
-  defp receive_local_write_with_trace(shard, ref, calls) do
-    receive do
-      {:trace, ^shard, :call,
-       {Group.Replica, :handle_replica_message, [_state, _source_node, _message]}} ->
-        receive_local_write_with_trace(shard, ref, calls + 1)
-
-      {:group_local_reply, ^ref, reply} ->
-        {reply, calls}
-    end
-  end
-
-  defp kill_if_alive(pid) do
-    if Process.alive?(pid) do
-      Process.exit(pid, :kill)
-    end
-
-    :ok
-  end
-
-  defp wait_until(fun, timeout \\ 1_000)
-
-  defp wait_until(fun, timeout) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_wait_until(fun, deadline)
-  end
-
-  defp do_wait_until(fun, deadline) do
-    if fun.() do
-      :ok
-    else
-      if System.monotonic_time(:millisecond) >= deadline do
-        flunk("condition did not become true")
-      end
-
-      Process.sleep(10)
-      do_wait_until(fun, deadline)
     end
   end
 end

@@ -1,0 +1,148 @@
+name: Fault campaigns
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  MIX_ENV: test
+  ERL_FLAGS: "+S 4:4"
+  GROUP_HISTORY_STEPS: "2000"
+  GROUP_TEST_DIAGNOSTICS: ${{ github.workspace }}/_build/test-diagnostics
+  ERL_CRASH_DUMP: ${{ github.workspace }}/_build/test-diagnostics/erl_crash.dump
+
+jobs:
+  histories-and-faults:
+    name: Seed ${{ matrix.seed }} / ${{ matrix.schedulers }} peer schedulers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [104729, 130363, 155921]
+        schedulers: ["1", "2", "4"]
+    env:
+      GROUP_PEER_SCHEDULERS: ${{ matrix.schedulers }}
+      CAMPAIGN_SEED: ${{ matrix.seed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: "> 0"
+          otp-version: "> 0"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: mix deps.get
+      - name: Repeat histories, partitions, churn, restarts and race regressions
+        run: |
+          mkdir -p "$GROUP_TEST_DIAGNOSTICS"
+          mix compile --warnings-as-errors
+          for iteration in 0 1 2 3 4; do
+            seed=$((CAMPAIGN_SEED + iteration))
+            mix test --warnings-as-errors --seed "$seed" 2>&1 |
+              tee "$GROUP_TEST_DIAGNOSTICS/run-$seed.log"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: campaign-${{ matrix.seed }}-${{ matrix.schedulers }}
+          path: _build/test-diagnostics
+          retention-days: 14
+
+  qualification:
+    name: Protocol mutations and live checker qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GROUP_HISTORY_STEPS: "100"
+      GROUP_PEER_SCHEDULERS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: "> 0"
+          otp-version: "> 0"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: mix deps.get
+      - name: Run the upstream PR gate before qualification
+        run: |
+          mkdir -p "$GROUP_TEST_DIAGNOSTICS"
+          mix test --warnings-as-errors 2>&1 | tee "$GROUP_TEST_DIAGNOSTICS/baseline.log"
+      - name: Require protocol mutants and injected checker faults to be detected
+        run: |
+          GROUP_JEPSEN_SKIP_CHECKER=1 test/jepsen/qualify.sh 2>&1 |
+            tee "$GROUP_TEST_DIAGNOSTICS/qualification.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: qualification-reports
+          path: |
+            _build/test-diagnostics
+            tmp/mutation/**/*.log
+            test/jepsen/.cache/qualification.*
+            test/jepsen/store
+          include-hidden-files: true
+          retention-days: 14
+
+  soak:
+    name: Jepsen ${{ matrix.transport }} / ${{ matrix.scenario }}
+    needs: qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [distribution, tcp, chaos]
+        scenario: [mixed, permanent]
+    env:
+      GROUP_JEPSEN_SKIP_CHECKER: "1"
+      GROUP_JEPSEN_CAMPAIGN_TRANSPORT: ${{ matrix.transport }}
+      GROUP_JEPSEN_CAMPAIGN_SCENARIO: ${{ matrix.scenario }}
+      GROUP_JEPSEN_CAMPAIGN_ARTIFACT_DIR: ${{ github.workspace }}/_build/jepsen-campaign
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: "> 0"
+          otp-version: "> 0"
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - run: mix deps.get
+      # Split the upstream six-profile gate across jobs without reducing its
+      # default 20 five-minute histories per profile.
+      - run: test/jepsen/campaign.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: soak-${{ matrix.transport }}-${{ matrix.scenario }}
+          path: |
+            _build/jepsen-campaign
+            test/jepsen/store
+          retention-days: 14
