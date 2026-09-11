@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "${script_dir}/../.." && pwd)"
 artifact_dir="$(mktemp -d "${script_dir}/.cache/qualification.XXXXXX")"
+source "${script_dir}/qualification-result.sh"
 
 cd "${repo_dir}"
 
@@ -15,10 +16,12 @@ run_jepsen() {
   local expectation="$1"
   local corruption="$2"
   local log="${artifact_dir}/${expectation}-${corruption}.log"
+  local result="${artifact_dir}/${expectation}-${corruption}.result"
   local status=0
 
   set +e
-  timeout --signal=TERM --kill-after=30 180 "${script_dir}/run.sh" test \
+  GROUP_JEPSEN_QUALIFICATION_RESULT="${result}" \
+    timeout --signal=TERM --kill-after=30 180 "${script_dir}/run.sh" test \
     --no-ssh \
     --nodes n1,n2,n3 \
     --concurrency 2n \
@@ -31,13 +34,8 @@ run_jepsen() {
   status=$?
   set -e
 
-  if [[ "${expectation}" == "pass" ]] && [[ "${status}" -ne 0 ]]; then
-    echo "healthy Jepsen baseline failed; see ${log}" >&2
-    return 1
-  fi
-
-  if [[ "${expectation}" == "fail" ]] && [[ "${status}" -eq 0 ]]; then
-    echo "Jepsen checker accepted corruption ${corruption}; see ${log}" >&2
+  if ! qualification_result "${expectation}" "${corruption}" "${status}" "${result}"; then
+    echo "see ${log} and ${result}" >&2
     return 1
   fi
 
