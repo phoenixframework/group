@@ -55,9 +55,37 @@ cannot masquerade as a current owner. Every history explicitly restarts one
 node after the deterministic conflict prelude, proving the checker does not
 mistake restart-sensitive instrumentation for missing protocol coverage.
 
+Registry-conflict exits are obligations, not trusted coverage counters. Before
+calling Group, each owner journals its registration attempt independently of
+Group's tables; it journals successful or rejected replies, unregisters, and
+cluster-intent removal as well. Drivers retain the victim token, key, and
+winner metadata from every conflict death. The checker reconstructs the
+victim's registrations, requires the reported winner to rank strictly higher
+by `{revision, token}`, and requires a matching historical winning claim in
+the same cluster and key. Only validated deaths count toward coverage.
+
+Registration calls interrupted by death or an indeterminate reply remain
+possible claims: Group may have installed them before the owner could record
+success. A definitive `:taken` reply excludes an attempt. Winning evidence is
+retained after unregister, death, and BEAM restart because delayed replicas
+can legitimately act on an older claim. Local journal order excludes winners
+first attempted after a death; the oracle does not invent a global clock or
+infer remote deletion delivery from wall time. This establishes independently
+witnessed possible winners, not the exact instant a replica learned a claim.
+
+The append-only conflict journal retains small operation records for the
+bounded campaign, not production ETS rows. Its path defaults to
+`/tmp/group-jepsen-conflict-evidence` inside each container and can be overridden
+with the driver's `:conflict_evidence_path` option. Corrupt or unreadable
+journals fail closed. Checker qualification also loads the real Elixir
+Owner/Driver harness, injects valid and forged death reasons, exercises a
+register interrupted before its reply, and checks the emitted EDN with the
+Clojure lifecycle oracle.
+
 ## Requirements
 
 - Docker with Compose v2
+- Elixir/Mix with the repository dependencies installed (checker qualification)
 - Java 21 or newer
 - `curl`
 
