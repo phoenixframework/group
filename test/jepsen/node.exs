@@ -508,7 +508,7 @@ defmodule Group.Jepsen.Owner do
     registrations = drop_cluster(state.registrations, cluster)
     memberships = drop_cluster(state.memberships, cluster)
     state = %{state | registrations: registrations, memberships: memberships}
-    {:reply, :ok, state}
+    {:reply, snapshot(state), state}
   end
 
   def handle_call(:snapshot, _from, state), do: {:reply, snapshot(state), state}
@@ -582,7 +582,13 @@ defmodule Group.Jepsen.Driver do
   def kill(logical_owner), do: GenServer.call(driver(logical_owner), {:kill, logical_owner})
 
   def drop_cluster(cluster) do
-    Enum.each(names(), &GenServer.call(&1, {:drop_cluster, cluster}, 10_000))
+    Enum.each(names(), fn driver ->
+      case GenServer.call(driver, {:drop_cluster, cluster}, 30_000) do
+        :ok -> :ok
+        {:error, reason} -> raise "owner cluster cleanup failed: #{inspect(reason)}"
+      end
+    end)
+
     :ok
   end
 
@@ -661,55 +667,41 @@ defmodule Group.Jepsen.Driver do
   end
 
   def handle_call({:drop_cluster, cluster}, _from, state) do
-    Enum.each(state.owners, fn {_logical_owner, {pid, _token, _monitor, _owner_state}} ->
-      if Process.alive?(pid), do: GenServer.call(pid, {:drop_cluster, cluster}, 10_000)
-    end)
-
-    owners =
-      Map.new(state.owners, fn {logical_owner, {pid, token, monitor, _owner_state}} ->
-        owner_state = if Process.alive?(pid), do: GenServer.call(pid, :snapshot), else: nil
-        {logical_owner, {pid, token, monitor, owner_state}}
-      end)
-
-    {:reply, :ok, %{state | owners: owners}}
+    case refresh_owners(state, {:drop_cluster, cluster}) do
+      {:ok, _snapshots, state} -> {:reply, :ok, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(:owner_snapshots, _from, state) do
-    result =
-      Enum.reduce_while(state.owners, {[], %{}}, fn
-        {logical_owner, {pid, token, monitor_ref, cached}}, {snapshots, acc} ->
-          case live_owner_snapshot(pid) do
-            {:ok, owner_state} ->
-              {:cont,
-               {
-                 [owner_state | snapshots],
-                 Map.put(acc, logical_owner, {pid, token, monitor_ref, owner_state})
-               }}
-
-            {:error, reason} ->
-              {:halt, {:error, {logical_owner, token, reason, cached}}}
-          end
-      end)
-
-    case result do
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-
-      {owners, refreshed} ->
-        {:reply, {:ok, Enum.reverse(owners)}, %{state | owners: refreshed}}
+    case refresh_owners(state, :snapshot) do
+      {:ok, snapshots, state} -> {:reply, {:ok, snapshots}, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, state}
     end
   end
 
-  defp live_owner_snapshot(pid) do
-    if Process.alive?(pid) do
-      try do
-        {:ok, GenServer.call(pid, :snapshot, 10_000)}
-      catch
-        :exit, reason -> {:error, reason}
-      end
-    else
-      {:error, :not_alive}
-    end
+  # Cleanup returns its snapshot in the same Owner turn. There is no second
+  # unguarded call, and every confirmed death uses the normal monitor path.
+  defp refresh_owners(state, request) do
+    Enum.reduce_while(state.owners, {:ok, [], state}, fn
+      {logical_owner, {pid, token, monitor_ref, cached}}, {:ok, snapshots, state} ->
+        try do
+          owner_state = GenServer.call(pid, request, 10_000)
+          state = put_owner_state(state, logical_owner, pid, owner_state)
+          {:cont, {:ok, [owner_state | snapshots], state}}
+        catch
+          :exit, reason ->
+            # A timeout is not proof of death. Only the tracked monitor can
+            # remove this owner, preserving every unrelated owner and monitor.
+            receive do
+              {:DOWN, ^monitor_ref, :process, ^pid, _death_reason} = down ->
+                {:noreply, state} = handle_info(down, state)
+                {:cont, {:ok, snapshots, state}}
+            after
+              0 -> {:halt, {:error, {logical_owner, token, reason, cached}, state}}
+            end
+        end
+    end)
   end
 
   def handle_call(:unexpected_deaths, _from, state) do
