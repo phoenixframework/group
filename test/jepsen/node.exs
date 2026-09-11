@@ -1240,7 +1240,7 @@ defmodule Group.Jepsen.Snapshot do
             value =
               case Group.lookup(:jepsen_group, registry_key(key), cluster_opts(cluster)) do
                 nil -> nil
-                {_pid, %{token: token}} -> token
+                {_pid, %{token: _token} = meta} -> meta
                 {_pid, other} -> "INVALID:#{inspect(other)}"
               end
 
@@ -1258,7 +1258,7 @@ defmodule Group.Jepsen.Snapshot do
               :jepsen_group
               |> Group.members(pg_key(key), cluster_opts(cluster))
               |> Enum.map(fn
-                {_pid, %{token: token}} -> token
+                {_pid, %{token: _token} = meta} -> meta
                 {_pid, other} -> "INVALID:#{inspect(other)}"
               end)
               |> Enum.sort()
@@ -1565,4 +1565,6 @@ defmodule Group.Jepsen.Main do
   end
 end
 
-Group.Jepsen.Main.run(System.argv())
+unless System.get_env("GROUP_JEPSEN_LIBRARY") == "1" do
+  Group.Jepsen.Main.run(System.argv())
+end
