@@ -428,17 +428,18 @@ defmodule Group.Jepsen.Owner do
   @moduledoc false
   use GenServer
 
-  def start(token), do: GenServer.start(__MODULE__, token)
+  def start(token, api \\ Group), do: GenServer.start(__MODULE__, {token, api})
 
   @impl true
-  def init(token), do: {:ok, %{token: token, registrations: %{}, memberships: %{}}}
+  def init({token, api}),
+    do: {:ok, %{token: token, api: api, registrations: %{}, memberships: %{}}}
 
   @impl true
   def handle_call({:mutate, :register, cluster, key, revision}, _from, state) do
     meta = %{token: state.token, revision: revision}
 
-    case safe_group_call(fn ->
-           Group.register(:jepsen_group, registry_key(key), meta, cluster_opts(cluster))
+    case safe_group_call(state.token, fn ->
+           state.api.register(:jepsen_group, registry_key(key), meta, cluster_opts(cluster))
          end) do
       :ok ->
         entry = %{cluster: cluster, key: key, revision: revision}
@@ -454,8 +455,8 @@ defmodule Group.Jepsen.Owner do
     owner_key = {cluster, key}
 
     if Map.has_key?(state.registrations, owner_key) do
-      case safe_group_call(fn ->
-             Group.unregister(:jepsen_group, registry_key(key), cluster_opts(cluster))
+      case safe_group_call(state.token, fn ->
+             state.api.unregister(:jepsen_group, registry_key(key), cluster_opts(cluster))
            end) do
         :ok ->
           state = %{state | registrations: Map.delete(state.registrations, owner_key)}
@@ -472,8 +473,8 @@ defmodule Group.Jepsen.Owner do
   def handle_call({:mutate, :join, cluster, key, revision}, _from, state) do
     meta = %{token: state.token, revision: revision}
 
-    case safe_group_call(fn ->
-           Group.join(:jepsen_group, pg_key(key), meta, cluster_opts(cluster))
+    case safe_group_call(state.token, fn ->
+           state.api.join(:jepsen_group, pg_key(key), meta, cluster_opts(cluster))
          end) do
       :ok ->
         entry = %{cluster: cluster, key: key, revision: revision}
@@ -489,8 +490,8 @@ defmodule Group.Jepsen.Owner do
     owner_key = {cluster, key}
 
     if Map.has_key?(state.memberships, owner_key) do
-      case safe_group_call(fn ->
-             Group.leave(:jepsen_group, pg_key(key), cluster_opts(cluster))
+      case safe_group_call(state.token, fn ->
+             state.api.leave(:jepsen_group, pg_key(key), cluster_opts(cluster))
            end) do
         :ok ->
           state = %{state | memberships: Map.delete(state.memberships, owner_key)}
@@ -529,12 +530,49 @@ defmodule Group.Jepsen.Owner do
 
   defp sort_entries(entries), do: Enum.sort_by(entries, &{&1.cluster || "", &1.key})
 
-  defp safe_group_call(fun) do
-    fun.()
+  defp safe_group_call(token, fun) do
+    case fun.() do
+      :ok ->
+        :ok
+
+      {:error, code}
+      when code in [:taken, :undefined, :not_owner, :not_in_group, :stale_cluster_epoch] ->
+        {:error, code}
+
+      other ->
+        unexpected(token, :return, other, [])
+    end
   rescue
-    exception -> {:error, {:exception, Exception.message(exception)}}
+    exception in ArgumentError ->
+      case __STACKTRACE__ do
+        [{Group, :validate_cluster_connected!, _, _} | _] ->
+          {:error, :not_connected}
+
+        stack ->
+          unexpected(token, :exception, exception, stack)
+      end
+
+    exception ->
+      unexpected(token, :exception, exception, __STACKTRACE__)
   catch
-    kind, reason -> {:error, {kind, reason}}
+    :exit, {reason, {GenServer, :call, _}}
+    when reason in [:timeout, :noproc, :normal, :shutdown] ->
+      {:error, {:indeterminate, reason}}
+
+    kind, reason ->
+      unexpected(token, kind, reason, __STACKTRACE__)
+  end
+
+  defp unexpected(token, kind, reason, stack) do
+    evidence = %{kind: kind, reason: inspect(reason), stack: inspect(stack)}
+
+    :ok =
+      Group.Jepsen.Driver.persist_unexpected_death(%{
+        token: token,
+        reason: "operation failure: " <> inspect(evidence)
+      })
+
+    {:error, {:unexpected, evidence}}
   end
 
   defp cluster_opts(nil), do: []
@@ -611,6 +649,7 @@ defmodule Group.Jepsen.Driver do
      %{
        node_id: Keyword.fetch!(opts, :node_id),
        boot_id: Keyword.fetch!(opts, :boot_id),
+       api: Keyword.get(opts, :api, Group),
        owners: %{},
        monitors: %{},
        incarnations: %{},
@@ -629,14 +668,32 @@ defmodule Group.Jepsen.Driver do
            put_owner_state(state, logical_owner, pid, owner_state)}
 
         {:error, reason, owner_state} ->
-          {:reply, %{status: :fail, error: inspect(reason), owner: owner_state},
-           put_owner_state(state, logical_owner, pid, owner_state)}
+          response = Map.merge(failure_response(reason), %{owner: owner_state})
+          {:reply, response, put_owner_state(state, logical_owner, pid, owner_state)}
       end
     catch
       :exit, reason ->
-        {:reply, %{status: :unknown, error: inspect(reason)}, state}
+        {:reply, %{status: :unknown, code: :indeterminate, error: inspect(reason)}, state}
     end
   end
+
+  defp failure_response({:unexpected, evidence}),
+    do: %{status: :fail, code: :unexpected, error: evidence}
+
+  defp failure_response({:indeterminate, reason}),
+    do: %{status: :unknown, code: :indeterminate, error: inspect(reason)}
+
+  defp failure_response(code)
+       when code in [
+              :taken,
+              :undefined,
+              :not_owner,
+              :not_owned,
+              :not_connected,
+              :not_in_group,
+              :stale_cluster_epoch
+            ],
+       do: %{status: :fail, code: code, error: inspect(code)}
 
   def handle_call({:kill, logical_owner}, _from, state) do
     case Map.get(state.owners, logical_owner) do
@@ -757,7 +814,7 @@ defmodule Group.Jepsen.Driver do
   defp start_owner(state, logical_owner) do
     incarnation = Map.get(state.incarnations, logical_owner, 0) + 1
     token = "#{state.node_id}/#{state.boot_id}/#{logical_owner}/#{incarnation}"
-    {:ok, pid} = Group.Jepsen.Owner.start(token)
+    {:ok, pid} = Group.Jepsen.Owner.start(token, state.api)
     monitor_ref = Process.monitor(pid)
     owner_state = %{token: token, registrations: [], memberships: []}
 
@@ -788,12 +845,15 @@ defmodule Group.Jepsen.Driver do
   defp driver(logical_owner), do: name(:erlang.phash2(logical_owner, @driver_count))
   defp name(index), do: :"group_jepsen_driver_#{index}"
 
-  defp persist_unexpected_death(%{token: token, reason: reason}) do
-    File.write(@unexpected_death_log, token <> "\t" <> reason <> "\n", [:append])
+  def persist_unexpected_death(%{token: token, reason: reason}) do
+    File.write(unexpected_death_log(), token <> "\t" <> reason <> "\n", [:append])
   end
 
+  defp unexpected_death_log,
+    do: System.get_env("GROUP_JEPSEN_UNEXPECTED_DEATH_LOG", @unexpected_death_log)
+
   defp persisted_unexpected_deaths do
-    case File.read(@unexpected_death_log) do
+    case File.read(unexpected_death_log()) do
       {:ok, contents} ->
         contents
         |> String.split("\n", trim: true)
