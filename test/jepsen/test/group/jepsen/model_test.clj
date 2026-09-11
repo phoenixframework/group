@@ -94,6 +94,23 @@
                  (snapshot-op 2 "n3" survivors [] (empty-registry) (empty-pg))]]
     (is (:valid? (model/analyze permanent-test history)))))
 
+(deftest operation-failures-survive-owner-and-vm-retirement
+  (let [survivors ["n2" "n3"]
+        test (assoc test-map :terminal-nodes survivors)
+        snapshots [(snapshot-op 2 "n2" survivors [] (empty-registry) (empty-pg))
+                   (snapshot-op 3 "n3" survivors [] (empty-registry) (empty-pg))]
+        failure (fn [code error]
+                  {:index 1 :process 0 :type :fail :f :register
+                   :value {:node "n1" :response {:code code :error error}}})]
+    (doseq [code [:taken :undefined :not-owner :not-owned :not-in-group
+                 :stale-cluster-epoch :indeterminate]]
+      (is (:valid? (model/analyze test (cons (failure code "expected") snapshots)))))
+    (doseq [kind [:exception :throw :error :return]]
+      (let [op (failure :unexpected {:kind kind :reason "implementation bug"})
+            result (model/analyze test (cons op snapshots))]
+        (is (false? (:valid? result)))
+        (is (= [op] (:unexpected-operation-failures result)))))))
+
 (deftest rejects-zombies-missing-live-owners-and-divergence
   (let [live (owner "live" [(registration nil 0 1)] [])
         stale-registry (assoc-in (empty-registry) ["root" 0] "dead")

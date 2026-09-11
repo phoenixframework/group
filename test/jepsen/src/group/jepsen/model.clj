@@ -96,6 +96,12 @@
        (remove history/invoke?)
        (keep #(get-in % [:value :response :latency-us]))))
 
+(defn unexpected-operation-failures [history]
+  (->> history
+       (remove history/invoke?)
+       (filter #(= :unexpected (get-in % [:value :response :code])))
+       vec))
+
 (defn analyze [test history]
   (let [observations (snapshots-by-node history)
         snapshots (latest-snapshots history)
@@ -169,6 +175,7 @@
                           [node internal]))))
               relevant-snapshots)
         unexpected-deaths (->> relevant-snapshots vals (mapcat :unexpected-deaths) set)
+        operation-failures (unexpected-operation-failures history)
         live-tokens (set (keys (:owners expected)))
         actual-tokens (->> views
                            vals
@@ -198,6 +205,7 @@
                     (empty? (:conflicts expected))
                     (empty? mismatches)
                     (empty? unexpected-deaths)
+                    (empty? operation-failures)
                     (empty? orphaned)
                     (empty? missing-live)
                     (not latency-violation?))]
@@ -219,6 +227,7 @@
      :live-registry-conflicts (:conflicts expected)
      :mismatched-views mismatches
      :unexpected-owner-deaths unexpected-deaths
+     :unexpected-operation-failures operation-failures
      :orphaned-owner-tokens orphaned
      :missing-live-owner-tokens missing-live
      :expected expected-view}))
