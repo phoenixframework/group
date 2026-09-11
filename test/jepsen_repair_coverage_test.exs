@@ -1,3 +1,5 @@
+Code.require_file("jepsen/repair_coverage.exs", __DIR__)
+
 defmodule Group.JepsenRepairCoverageTest do
   use ExUnit.Case, async: false
 
@@ -8,8 +10,39 @@ defmodule Group.JepsenRepairCoverageTest do
   alias Group.Replica.Data
 
   @moduletag :capture_log
-  @moduletag :tmp_dir
+  @moduletag tmp_dir: "repair_coverage_#{System.pid()}"
   @moduletag timeout: 120_000
+
+  test "restart truncates an interrupted append before accepting new evidence", %{tmp_dir: dir} do
+    path = Path.join(dir, "interrupted")
+    committed = "multi_chunk_snapshot_committed\t1\n"
+
+    for suffix <- ["applied_delta_run_records_peak\t", "applied_delta_run_records_peak\t99"] do
+      File.write!(path, committed <> suffix)
+      start_supervised!({Coverage, path: path})
+      assert Coverage.snapshot() == %{multi_chunk_snapshot_committed: 1}
+      assert File.read!(path) == committed
+
+      Coverage.observe(:delta, 0, 2)
+      expected = %{multi_chunk_snapshot_committed: 1, applied_delta_run_records_peak: 2}
+      assert Coverage.snapshot() == expected
+      assert File.read!(path) == committed <> "applied_delta_run_records_peak\t2\n"
+
+      stop_supervised!(Coverage)
+      start_supervised!({Coverage, path: path})
+      assert Coverage.snapshot() == expected
+      stop_supervised!(Coverage)
+    end
+  end
+
+  test "malformed committed records fail without truncating the log", %{tmp_dir: dir} do
+    path = Path.join(dir, "malformed")
+    contents = "applied_delta_run_records_peak\t2\tunexpected\npartial"
+    File.write!(path, contents)
+    assert {:error, {reason, stack}} = GenServer.start(Coverage, path: path)
+    assert %MatchError{} = Exception.normalize(:error, reason, stack)
+    assert File.read!(path) == contents
+  end
 
   for transport <- [
         Group.Jepsen.Transport.Distribution,

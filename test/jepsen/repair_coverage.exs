@@ -132,16 +132,29 @@ defmodule Group.Jepsen.RepairCoverage do
   defp read_events(path) do
     case File.read(path) do
       {:ok, contents} ->
-        # An interrupted final append cannot certify evidence.
-        contents
-        |> String.split("\n")
-        |> Enum.drop(-1)
-        |> Enum.reduce(%{}, fn line, events ->
-          [event, value] = String.split(line, "\t")
-          event = String.to_existing_atom(event)
-          value = String.to_integer(value)
-          Map.update(events, event, value, &max(&1, value))
-        end)
+        {committed, [suffix]} = contents |> String.split("\n") |> Enum.split(-1)
+
+        events =
+          Enum.reduce(committed, %{}, fn line, events ->
+            [event, value] = String.split(line, "\t")
+            event = String.to_existing_atom(event)
+            value = String.to_integer(value)
+            Map.update(events, event, value, &max(&1, value))
+          end)
+
+        # Validate committed records before touching the file. An interrupted
+        # append is not evidence, and must not become the next append's prefix.
+        # Truncate only the suffix in place, preserving every committed byte.
+        if suffix != "" do
+          offset = byte_size(contents) - byte_size(suffix)
+
+          File.open!(path, [:read, :write, :binary], fn file ->
+            {:ok, ^offset} = :file.position(file, offset)
+            :ok = :file.truncate(file)
+          end)
+        end
+
+        events
 
       {:error, :enoent} ->
         %{}
