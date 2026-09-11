@@ -168,7 +168,16 @@
                                   (not= 0 (:snapshot-staging-count internal)))
                           [node internal]))))
               relevant-snapshots)
-        unexpected-deaths (->> relevant-snapshots vals (mapcat :unexpected-deaths) set)
+        completions (remove history/invoke? history)
+        retirement-evidence (keep #(get-in % [:value :lifecycle-evidence]) completions)
+        retired-nodes (set/difference (set (map name (:nodes test))) required-nodes)
+        collected-nodes (set (map :node retirement-evidence))
+        evidence-errors (vec (keep #(get-in % [:value :evidence-error]) completions))
+        missing-retirement-evidence (set/difference retired-nodes collected-nodes)
+        unexpected-deaths
+        (->> (concat (map :value (successful-snapshots history)) retirement-evidence)
+             (mapcat :unexpected-deaths)
+             set)
         live-tokens (set (keys (:owners expected)))
         actual-tokens (->> views
                            vals
@@ -198,6 +207,8 @@
                     (empty? (:conflicts expected))
                     (empty? mismatches)
                     (empty? unexpected-deaths)
+                    (empty? evidence-errors)
+                    (empty? missing-retirement-evidence)
                     (empty? orphaned)
                     (empty? missing-live)
                     (not latency-violation?))]
@@ -219,6 +230,8 @@
      :live-registry-conflicts (:conflicts expected)
      :mismatched-views mismatches
      :unexpected-owner-deaths unexpected-deaths
+     :lifecycle-evidence-errors evidence-errors
+     :missing-retirement-evidence missing-retirement-evidence
      :orphaned-owner-tokens orphaned
      :missing-live-owner-tokens missing-live
      :expected expected-view}))

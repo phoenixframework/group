@@ -139,10 +139,19 @@
 
   (invoke! [_this test op]
     (let [node (or (get-in op [:value :node]) (first (:nodes test)))]
-      (when (and (nil? @retired) (docker/running? node))
-        (db/kill! db test node)
+      (when (nil? @retired)
+        (when (docker/running? node)
+          (db/kill! db test node))
         (reset! retired node))
-      (assoc op :type :info, :value {:retired @retired})))
+      ;; Capture after the stop, including when an earlier nemesis already stopped
+      ;; the VM. Do not let loss of the client socket erase historical evidence.
+      (let [evidence (try
+                       {:lifecycle-evidence (docker/retired-evidence! @retired)}
+                       (catch Exception exception
+                         {:evidence-error {:node (name @retired)
+                                           :message (.getMessage exception)
+                                           :data (ex-data exception)}}))]
+        (assoc op :type :info, :value (merge {:retired @retired} evidence)))))
 
   (teardown! [_this test]
     (when-let [node @retired]
