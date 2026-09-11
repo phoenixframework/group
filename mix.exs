@@ -35,7 +35,7 @@ defmodule Group.MixProject do
   end
 
   def cli do
-    [preferred_envs: ["test.soak": :test]]
+    [preferred_envs: ["test.exunit": :test, "test.soak": :test]]
   end
 
   defp deps do
@@ -65,6 +65,9 @@ defmodule Group.MixProject do
   defp aliases do
     [
       test: ["test", "cmd test/jepsen/checker.sh"],
+      # Mutation targets must measure ExUnit, not the independent JVM gate.
+      # Invoke the task module directly so the `test` alias is not expanded.
+      "test.exunit": [&Mix.Tasks.Test.run/1],
       "test.soak": [
         # Run the PR gate in a child VM. test_helper starts distribution, and
         # keeping that VM alive for the following `cmd` phases can retain a
