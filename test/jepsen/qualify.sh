@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "${script_dir}/../.." && pwd)"
+mkdir -p "${script_dir}/.cache"
 artifact_dir="$(mktemp -d "${script_dir}/.cache/qualification.XXXXXX")"
 source "${script_dir}/qualification-result.sh"
 
