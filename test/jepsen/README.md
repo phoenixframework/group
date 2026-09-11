@@ -109,8 +109,17 @@ count, concurrency, keys, owners, and recovery time.
 Run mutation qualification plus live positive- and negative-checker tests:
 
 ```bash
-test/jepsen/qualify.sh
+elixir test/jepsen/qualify.exs
 ```
+
+`qualify.sh` remains a thin compatibility launcher for the same Elixir script.
+The script owns artifact creation, command sequencing, and result validation.
+Each live run still uses GNU `timeout` with a three-minute deadline and a
+30-second TERM/KILL grace period, and streams its output to a separate log.
+Qualification requires both the expected exit status and a fresh checker record
+confirming that the intended corruption was actually detected; a failed command
+alone never counts. Executable ExUnit regressions exercise this runner with
+stubbed external commands as part of normal `mix test`, without Docker.
 
 This runs every mutation defined by `test/mutation/run.exs`, then verifies that
 a healthy live history is accepted and deliberately injected owner-death,

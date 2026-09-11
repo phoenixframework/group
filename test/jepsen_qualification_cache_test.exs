@@ -15,6 +15,7 @@ defmodule Group.JepsenQualificationCacheTest do
       File.mkdir_p!(script_dir)
       File.mkdir_p!(bin)
       File.cp!("test/jepsen/qualify.sh", Path.join(script_dir, "qualify.sh"))
+      File.cp!("test/jepsen/qualify.exs", Path.join(script_dir, "qualify.exs"))
 
       if existing_cache? do
         File.mkdir_p!(cache)
