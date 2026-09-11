@@ -1,6 +1,12 @@
 (ns group.jepsen.model-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.edn :as edn]
+            [clojure.test :refer :all]
             [group.jepsen.model :as model]))
+
+(def applied-repair-events
+  ;; The receiver regression compares this fixture byte-for-byte with live EDN
+  ;; emitted after real delta application and terminal snapshot installation.
+  (edn/read-string (slurp "fixtures/applied-repair-events.edn")))
 
 (def test-map
   {:nodes ["n1" "n2" "n3"]
@@ -169,10 +175,7 @@
            (:missing-transport-events result)))))
 
 (deftest accepts-the-transport-event-names-emitted-by-the-live-nodes
-  (let [events {:delta-batch 1
-                :snapshot-chunk 2
-                :multi-chunk-snapshot 1
-                :registry-conflict-death 1}
+  (let [events (assoc applied-repair-events :registry-conflict-death 1)
         history [(assoc-in (snapshot-op 1 "n1" [] (empty-registry) (empty-pg))
                            [:value :transport-events]
                            events)
@@ -185,11 +188,9 @@
     (is (empty? (:missing-transport-events result)))))
 
 (deftest rejects-a-profile-which-never-repairs-a-multi-record-delta-run
-  (let [single-record-events {:delta-batch 3
-                              :snapshot-chunk 2
-                              :multi-chunk-snapshot 1
-                              :registry-conflict-death 1
-                              :delta-run-records-peak 1}
+  (let [single-record-events (assoc applied-repair-events
+                                   :registry-conflict-death 1
+                                   :applied-delta-run-records-peak 1)
         with-events #(assoc-in % [:value :transport-events] single-record-events)
         history [(with-events (snapshot-op 1 "n1" [] (empty-registry) (empty-pg)))
                  (with-events (snapshot-op 2 "n2" [] (empty-registry) (empty-pg)))
@@ -200,11 +201,7 @@
     (is (= 2 (:min-delta-run-records result)))))
 
 (deftest accepts-a-profile-which-repairs-a-multi-record-delta-run
-  (let [events {:delta-batch 1
-                :snapshot-chunk 1
-                :multi-chunk-snapshot 1
-                :registry-conflict-death 1
-                :delta-run-records-peak 8}
+  (let [events (assoc applied-repair-events :registry-conflict-death 1)
         history [(assoc-in (snapshot-op 1 "n1" [] (empty-registry) (empty-pg))
                            [:value :transport-events]
                            events)
@@ -212,7 +209,32 @@
                  (snapshot-op 3 "n3" [] (empty-registry) (empty-pg))]
         result (model/analyze (assoc test-map :min-delta-run-records 2) history)]
     (is (:valid? result))
-    (is (= 8 (:delta-run-records-peak result)))))
+    (is (= 2 (:delta-run-records-peak result)))))
+
+(deftest sender-attempts-never-certify-receiver-repair
+  (let [events {:delta-batch 100
+                :snapshot-chunk 100
+                :snapshot-commit 100
+                :multi-chunk-snapshot 100
+                :delta-run-records-peak 100
+                :attempted-delta-run-records-peak 100
+                :attempted-snapshot-chunks-peak 100
+                :transport-ok 100
+                :logical-drop 100
+                :registry-conflict-death 1}
+        history [(assoc-in (snapshot-op 1 "n1" [] (empty-registry) (empty-pg))
+                           [:value :transport-events] events)
+                 (snapshot-op 2 "n2" [] (empty-registry) (empty-pg))
+                 (snapshot-op 3 "n3" [] (empty-registry) (empty-pg))]
+        result (model/analyze
+                 (-> test-map
+                     (dissoc :required-transport-events)
+                     (assoc :min-delta-run-records 2))
+                 history)]
+    (is (false? (:valid? result)))
+    (is (zero? (:delta-run-records-peak result)))
+    (is (= #{:applied-delta-run-records-peak :multi-chunk-snapshot-committed}
+           (:missing-transport-events result)))))
 
 (deftest rejects-internal-corruption-or-leftover-snapshot-staging
   (let [bad (-> (snapshot-op 1 "n1" [] (empty-registry) (empty-pg))

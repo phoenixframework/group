@@ -4,7 +4,7 @@
             [jepsen.history :as history]))
 
 (def default-required-transport-events
-  #{:delta-batch :snapshot-chunk :multi-chunk-snapshot
+  #{:applied-delta-run-records-peak :multi-chunk-snapshot-committed
     :registry-conflict-death})
 
 (defn successful-snapshots [history]
@@ -148,7 +148,7 @@
         (set (remove #(pos? (get transport-events % 0)) required-transport-events))
         delta-run-records-peak
         (reduce max 0
-                (map #(get-in % [:transport-events :delta-run-records-peak] 0)
+                (map #(get-in % [:transport-events :applied-delta-run-records-peak] 0)
                      (vals relevant-snapshots)))
         min-delta-run-records (get test :min-delta-run-records 0)
         delta-run-coverage? (>= delta-run-records-peak min-delta-run-records)
