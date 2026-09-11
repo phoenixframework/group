@@ -55,6 +55,23 @@ cannot masquerade as a current owner. Every history explicitly restarts one
 node after the deterministic conflict prelude, proving the checker does not
 mistake restart-sensitive instrumentation for missing protocol coverage.
 
+Repair coverage is receiver evidence, not transport admission. Before starting
+Group, the Jepsen VM compiles test-only wrappers around the existing delta-run
+and terminal snapshot-install functions. Each wrapper samples the same stream's
+cursor before and after its original body in one shard turn. Only positive
+committed advancement emits `applied-delta-run-records-peak`; a completed snapshot
+with a multi-chunk manifest emits `multi-chunk-snapshot-committed`. Duplicate
+prefixes do not contribute to the delta peak. Provisional chunks, missing
+terminal frames, rejected authority, and logical drops contribute neither.
+The wrapper installation fails if either expected boundary disappears.
+
+The receiver evidence owner persists increasing maxima outside the shard and
+reloads them after VM restart. A crash before persistence can lose evidence
+(failing coverage conservatively), but cannot create it. This instrumentation
+is shared by distribution, TCP, and chaos and changes no production BEAM or API.
+Sender `attempted-*` peaks remain diagnostics only. The pure checker reads the
+same EDN fixture that executable receiver regressions compare to live output.
+
 ## Requirements
 
 - Docker with Compose v2

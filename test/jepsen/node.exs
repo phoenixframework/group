@@ -1,4 +1,5 @@
 Code.require_file("../support/test_tcp_transport.ex", __DIR__)
+Code.require_file("repair_coverage.exs", __DIR__)
 
 defmodule Group.Jepsen.Transport.Stats do
   @moduledoc false
@@ -38,6 +39,7 @@ defmodule Group.Jepsen.Transport.Stats do
     |> :ets.tab2list()
     |> Map.new()
     |> Map.merge(persisted, fn _event, current, durable -> max(current, durable) end)
+    |> Map.merge(Group.Jepsen.RepairCoverage.snapshot())
   end
 
   def block(target_node), do: :ets.insert(@gate, {target_node})
@@ -103,9 +105,7 @@ defmodule Group.Jepsen.Transport.Common do
   def record({:snapshot_commit, _version, _stream, _seq, chunk_count, _, _}) do
     Stats.increment(:snapshot_commit)
 
-    if chunk_count > 1 do
-      Stats.increment(:multi_chunk_snapshot)
-    end
+    Stats.observe_max(:attempted_snapshot_chunks_peak, chunk_count)
   end
 
   def record({:delta_batch, _version, runs}) do
@@ -119,7 +119,7 @@ defmodule Group.Jepsen.Transport.Common do
       end)
       |> Enum.max(fn -> 0 end)
 
-    Stats.observe_max(:delta_run_records_peak, peak)
+    Stats.observe_max(:attempted_delta_run_records_peak, peak)
   end
 
   def record(_message), do: Stats.increment(:other_message)
@@ -1520,6 +1520,11 @@ defmodule Group.Jepsen.Main do
 
     {:ok, _apps} = Application.ensure_all_started(:group)
 
+    :ok = Group.Jepsen.RepairCoverage.install!()
+
+    {:ok, _coverage} =
+      Group.Jepsen.RepairCoverage.start_link(path: "/tmp/group-jepsen-repair-coverage")
+
     {:ok, group} =
       Group.start_link(
         name: :jepsen_group,
@@ -1565,4 +1570,6 @@ defmodule Group.Jepsen.Main do
   end
 end
 
-Group.Jepsen.Main.run(System.argv())
+unless System.get_env("GROUP_JEPSEN_LIBRARY_ONLY") do
+  Group.Jepsen.Main.run(System.argv())
+end
