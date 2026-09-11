@@ -211,7 +211,22 @@
                         (when (not= expected-peers actual-peers)
                           [node {:expected expected-peers, :actual actual-peers}]))))
               relevant-snapshots)
-        conflicts (conflict-analysis relevant-snapshots)
+        completions (remove history/invoke? history)
+        retirement-evidence (keep #(get-in % [:value :lifecycle-evidence]) completions)
+        ;; Retired nodes no longer contribute live owners or public views, but
+        ;; their durable claims and deaths remain obligations for this history.
+        conflict-snapshots
+        (into {}
+              (map (fn [[node evidence]]
+                     [node {:conflict-evidence (->> evidence
+                                                   (mapcat :conflict-evidence)
+                                                   distinct
+                                                   (sort-by :sequence)
+                                                   vec)}]))
+              (group-by :node
+                        (concat (map :value (successful-snapshots history))
+                                retirement-evidence)))
+        conflicts (conflict-analysis conflict-snapshots)
         transport-events
         (assoc (reduce #(merge-with + %1 %2)
                        {}
@@ -244,8 +259,6 @@
                                   (not= 0 (:snapshot-staging-count internal)))
                           [node internal]))))
               relevant-snapshots)
-        completions (remove history/invoke? history)
-        retirement-evidence (keep #(get-in % [:value :lifecycle-evidence]) completions)
         retired-nodes (set/difference (set (map name (:nodes test))) required-nodes)
         collected-nodes (set (map :node retirement-evidence))
         evidence-errors (vec (keep #(get-in % [:value :evidence-error]) completions))

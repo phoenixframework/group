@@ -3,6 +3,7 @@
             [clojure.edn :as edn]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
+            [group.jepsen.docker :as docker]
             [group.jepsen.model :as model]))
 
 (def test-map
@@ -109,6 +110,30 @@
     ;; Unique incarnation tokens break equal-revision ties without pid order.
     (valid (assoc-in conflict-journal [0 :revision] 2))))
 
+(deftest conflict-evidence-survives-permanent-retirement
+  (let [test (assoc test-map :terminal-nodes ["n2" "n3"]
+                            :required-transport-events #{:registry-conflict-death})
+        winner [{:kind :register :sequence 1 :token "winner" :cluster nil :key 0 :revision 10}
+                {:kind :result :sequence 2 :attempt 1 :status :ok}]
+        victim [{:kind :register :sequence 1 :token "victim" :cluster nil :key 0 :revision 1}
+                {:kind :death :sequence 2 :token "victim" :key "jepsen/registry/0"
+                 :winner {:token "winner" :revision 10}}]
+        retired (fn [events] {:type :info :f :retire
+                              :value {:lifecycle-evidence {:node "n1" :unexpected-deaths []
+                                                            :conflict-evidence events}}})
+        terminal [(assoc-in (snapshot-op 1 "n2" ["n2" "n3"] [] (empty-registry) (empty-pg))
+                            [:value :conflict-evidence] victim)
+                  (snapshot-op 2 "n3" ["n2" "n3"] [] (empty-registry) (empty-pg))]
+        healthy (model/analyze test (conj terminal (retired winner)))
+        bad (model/analyze (assoc test :required-transport-events #{})
+                           [(retired (assoc-in conflict-journal [3 :winner :revision] -100))
+                            (snapshot-op 2 "n2" ["n2" "n3"] [] (empty-registry) (empty-pg))
+                            (snapshot-op 3 "n3" ["n2" "n3"] [] (empty-registry) (empty-pg))])]
+    (is (:valid? healthy))
+    (is (= 1 (get-in healthy [:transport-events :registry-conflict-death])))
+    (is (false? (:valid? bad)))
+    (is (= 1 (count (:invalid-conflict-deaths bad))))))
+
 (deftest conflict-statistics-alone-do-not-discharge-deaths
   (let [history [(assoc-in (snapshot-op 1 "n1" [] (empty-registry) (empty-pg))
                            [:value :transport-events] {:registry-conflict-death 99})
@@ -129,14 +154,37 @@
                             (str/split-lines out)))
         scenarios (when line (edn/read-string (subs line 15)))]
     (is (some? scenarios) (str out err))
-    (doseq [{:keys [label valid snapshots]} scenarios]
+    (doseq [{:keys [label valid snapshots reset-evidence]} scenarios]
       (let [history (mapv (fn [index node]
                             (assoc-in (snapshot-op index node [] (empty-registry) (empty-pg))
                                       [:value :conflict-evidence]
                                       (get-in snapshots [node :conflict-evidence])))
                           (range 3) ["n1" "n2" "n3"])
             result (model/analyze test-map history)]
-        (is (= valid (:valid? result)) (str label ": " result))))))
+        (is (= valid (:valid? result)) (str label ": " result)))
+      (let [empty-history (mapv #(assoc-in (snapshot-op %1 %2 [] (empty-registry) (empty-pg))
+                                         [:value :conflict-evidence] reset-evidence)
+                                (range 3) ["n1" "n2" "n3"])
+            result (model/analyze (assoc test-map :required-transport-events #{:registry-conflict-death})
+                                  empty-history)]
+        (is (false? (:valid? result)) "reset history cannot reuse conflict coverage")))
+    (when scenarios
+      (with-redefs [docker/docker!
+                    (fn [& args]
+                      (spit (last args)
+                            (if (str/includes? (second args) "conflict-evidence")
+                              (:archive (first scenarios)) "")))]
+        (let [archive (docker/retired-evidence! "n2")
+              test (assoc test-map :terminal-nodes ["n1" "n3"])
+              scenario (first scenarios)
+              history [{:type :info :f :retire :value {:lifecycle-evidence archive}}
+                       (assoc-in (snapshot-op 1 "n1" ["n1" "n3"] [] (empty-registry) (empty-pg))
+                                 [:value :conflict-evidence]
+                                 (get-in scenario [:snapshots "n1" :conflict-evidence]))
+                       (snapshot-op 2 "n3" ["n1" "n3"] [] (empty-registry) (empty-pg))]]
+          (is (= (get-in scenario [:snapshots "n2" :conflict-evidence])
+                 (:conflict-evidence archive)))
+          (is (:valid? (model/analyze test history))))))))
 
 (deftest accepts-an-exact-converged-multi-cluster-view
   (let [owners [(owner "a" [(registration nil 0 1) (registration "red" 1 2)] [])

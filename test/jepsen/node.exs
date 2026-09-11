@@ -434,6 +434,22 @@ defmodule Group.Jepsen.ConflictEvidence do
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   def record(event), do: GenServer.call(__MODULE__, {:record, event})
   def snapshot, do: GenServer.call(__MODULE__, :snapshot)
+  def reset, do: GenServer.call(__MODULE__, :reset)
+
+  def decode(contents) do
+    if contents != "" and not String.ends_with?(contents, "\n"),
+      do: raise("truncated conflict evidence")
+
+    contents
+    |> String.split("\n")
+    |> Enum.drop(-1)
+    |> Enum.with_index(1)
+    |> Enum.map(fn {line, sequence} ->
+      event = line |> Base.decode64!() |> :erlang.binary_to_term()
+      %{sequence: ^sequence} = event
+      event
+    end)
+  end
 
   @impl true
   def init(opts) do
@@ -442,9 +458,7 @@ defmodule Group.Jepsen.ConflictEvidence do
     events =
       case File.read(path) do
         {:ok, contents} ->
-          contents
-          |> String.split("\n", trim: true)
-          |> Enum.map(&(&1 |> Base.decode64!() |> :erlang.binary_to_term()))
+          decode(contents)
 
         {:error, :enoent} ->
           []
@@ -466,6 +480,14 @@ defmodule Group.Jepsen.ConflictEvidence do
 
   def handle_call(:snapshot, _from, state) do
     {:reply, Enum.reverse(state.events), state}
+  end
+
+  # Called only during DB setup, after restart and before workload mutations.
+  # Removing the file externally would leave the restarted recorder's loaded
+  # evidence alive in memory and leak coverage into the next history.
+  def handle_call(:reset, _from, state) do
+    :ok = File.write(state.path, "", [:sync])
+    {:reply, :ok, %{state | events: [], sequence: 0}}
   end
 end
 
@@ -1442,6 +1464,10 @@ defmodule Group.Jepsen.Wire do
   defp command(payload, context) do
     case String.split(payload, "\t") do
       ["ping"] ->
+        %{status: :ok}
+
+      ["reset-conflict-evidence"] ->
+        :ok = Group.Jepsen.ConflictEvidence.reset()
         %{status: :ok}
 
       ["ready", expected] ->

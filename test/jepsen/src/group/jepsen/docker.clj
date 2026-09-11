@@ -1,5 +1,6 @@
 (ns group.jepsen.docker
-  (:require [clojure.string :as str])
+  (:require [clojure.edn :as edn]
+            [clojure.string :as str])
   (:import (java.io File)
            (java.util.concurrent TimeUnit)))
 
@@ -98,23 +99,44 @@
             {:token token :reason reason}))
         (remove str/blank? (str/split-lines contents))))
 
-(defn retired-evidence!
-  "Reads the stopped container's durable oracle, without depending on its VM or socket.
-  Missing, truncated, unreadable, or oversized evidence is a qualification failure."
-  [node]
+(defn decode-conflict-evidence! [file]
+  (let [output (shell! "sh" "-c"
+                       (str "cd ../.. && exec env ERL_FLAGS='+S 2:2' mix run --no-start "
+                            "test/jepsen/decode_conflict_evidence.exs \"$1\"")
+                       "_" (.getAbsolutePath ^File file))
+        prefix "CONFLICT-EVIDENCE "
+        line (first (filter #(str/starts-with? % prefix) (str/split-lines output)))]
+    (when-not line
+      (throw (ex-info "missing decoded conflict evidence" {})))
+    (edn/read-string (subs line (count prefix)))))
+
+(defn collect-evidence! [node path bound decode]
   (let [file (File/createTempFile "group-jepsen-retired-" ".log")]
     (try
       (binding [*command-timeout-ms* 10000]
         (docker! "cp"
-                 (str (container node) ":/tmp/group-jepsen-unexpected-deaths")
+                 (str (container node) ":" path)
                  (.getAbsolutePath file)))
-      (when (> (.length file) (* 8 1024 1024))
+      (when (> (.length file) bound)
         (throw (ex-info "lifecycle evidence exceeds collection bound" {:node node})))
       (let [contents (slurp file)]
         (when (and (seq contents) (not (str/ends-with? contents "\n")))
           (throw (ex-info "truncated lifecycle evidence" {:node node})))
-        {:node (name node) :unexpected-deaths (parse-unexpected-deaths contents)})
+        (binding [*command-timeout-ms* 10000]
+          (decode file)))
       (finally (.delete file)))))
+
+(defn retired-evidence!
+  "Reads the stopped container's durable oracle, without depending on its VM or socket.
+  Missing, truncated, unreadable, or oversized evidence is a qualification failure."
+  [node]
+  {:node (name node)
+   :unexpected-deaths
+   (collect-evidence! node "/tmp/group-jepsen-unexpected-deaths" (* 8 1024 1024)
+                      #(parse-unexpected-deaths (slurp %)))
+   :conflict-evidence
+   (collect-evidence! node "/tmp/group-jepsen-conflict-evidence" (* 64 1024 1024)
+                      decode-conflict-evidence!)})
 
 (defn ensure-firewall-chain! [node chain]
   (exec-sh!

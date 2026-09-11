@@ -77,7 +77,18 @@ The append-only conflict journal retains small operation records for the
 bounded campaign, not production ETS rows. Its path defaults to
 `/tmp/group-jepsen-conflict-evidence` inside each container and can be overridden
 with the driver's `:conflict_evidence_path` option. Corrupt or unreadable
-journals fail closed. Checker qualification also loads the real Elixir
+journals fail closed. At permanent retirement, the stopped-container collector
+archives and decodes the journal alongside unexpected deaths. The checker
+replays retired and surviving nodes' evidence together, without treating retired
+owners as live. Conflict archives are bounded to 64 MiB with ten-second command
+deadlines; missing or malformed archives fail the history.
+
+Each new history resets the running recorder through the harness socket after
+DB restart and before workload mutations. This clears disk and in-memory
+evidence together and initializes an empty journal, so repeated histories
+cannot inherit earlier conflict coverage.
+
+Checker qualification also loads the real Elixir
 Owner/Driver harness, injects valid and forged death reasons, exercises a
 register interrupted before its reply, and checks the emitted EDN with the
 Clojure lifecycle oracle.

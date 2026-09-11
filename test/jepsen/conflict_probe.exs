@@ -13,7 +13,7 @@ defmodule Group.Jepsen.ConflictProbe do
     File.mkdir_p!(directory)
 
     try do
-      {winner, rejected, winner_events} = winner(directory)
+      {winner, rejected, winner_events, archive} = winner(directory)
 
       cases = [
         {"historical winner subsequently unregistered and died", true, 1, "jepsen/registry/0",
@@ -29,11 +29,13 @@ defmodule Group.Jepsen.ConflictProbe do
 
       scenarios =
         Enum.with_index(cases, fn {label, valid, revision, key, meta, pending}, index ->
-          events = victim(directory, index, revision, key, meta, pending)
+          {events, reset_events} = victim(directory, index, revision, key, meta, pending)
 
           %{
             label: label,
             valid: valid,
+            archive: archive,
+            reset_evidence: reset_events,
             snapshots: %{
               "n1" => %{conflict_evidence: events},
               "n2" => %{conflict_evidence: winner_events}
@@ -60,7 +62,7 @@ defmodule Group.Jepsen.ConflictProbe do
   end
 
   defp winner(directory) do
-    {group, evidence, driver, _path} = start(directory, "winner", "n2")
+    {group, evidence, driver, path} = start(directory, "winner", "n2")
     %{status: :ok, owner: %{token: token}} = mutate(driver, :register, 10)
 
     %{status: :fail, owner: %{token: rejected}} =
@@ -70,10 +72,11 @@ defmodule Group.Jepsen.ConflictProbe do
     %{status: :ok} = GenServer.call(driver, {:kill, "owner"})
     %{status: :ok} = GenServer.call(driver, {:kill, "rejected"})
     events = ConflictEvidence.snapshot()
+    archive = File.read!(path)
     GenServer.stop(driver)
     GenServer.stop(evidence)
     Supervisor.stop(group)
-    {%{token: token, revision: 10}, %{token: rejected, revision: 100}, events}
+    {%{token: token, revision: 10}, %{token: rejected, revision: 100}, events, archive}
   end
 
   defp victim(directory, index, revision, key, winner, pending) do
@@ -106,9 +109,27 @@ defmodule Group.Jepsen.ConflictProbe do
     # The exact registration/death obligations must survive a recorder restart.
     {:ok, evidence} = ConflictEvidence.start_link(conflict_evidence_path: path)
     ^events = ConflictEvidence.snapshot()
+    :ok = ConflictEvidence.reset()
+    [] = ConflictEvidence.snapshot()
+    "" = File.read!(path)
+    GenServer.stop(evidence)
+    {:ok, evidence} = ConflictEvidence.start_link(conflict_evidence_path: path)
+    [] = ConflictEvidence.snapshot()
+
+    1 =
+      ConflictEvidence.record(%{
+        kind: :register,
+        token: "next-history",
+        key: 0,
+        cluster: nil,
+        revision: 1
+      })
+
+    :ok = ConflictEvidence.reset()
+    reset_events = ConflictEvidence.snapshot()
     GenServer.stop(evidence)
     Supervisor.stop(group)
-    events
+    {events, reset_events}
   end
 
   defp wait(fun, remaining \\ 200)
