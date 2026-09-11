@@ -1166,11 +1166,10 @@ defmodule Group.MutationCampaign do
   end
 
   defp run_test(directory, test) do
-    run_with_timeout(directory, ["mix", "test" | test],
+    run_with_timeout(directory, ["mix", "test.exunit" | test],
       env: [
         {"GROUP_MODEL_RUNS", "1"},
-        {"GROUP_MODEL_COMMANDS", "8"},
-        {"GROUP_JEPSEN_SKIP_CHECKER", "1"}
+        {"GROUP_MODEL_COMMANDS", "8"}
       ]
     )
   end
