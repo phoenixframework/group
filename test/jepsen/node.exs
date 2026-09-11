@@ -677,24 +677,6 @@ defmodule Group.Jepsen.Driver do
     end
   end
 
-  defp failure_response({:unexpected, evidence}),
-    do: %{status: :fail, code: :unexpected, error: evidence}
-
-  defp failure_response({:indeterminate, reason}),
-    do: %{status: :unknown, code: :indeterminate, error: inspect(reason)}
-
-  defp failure_response(code)
-       when code in [
-              :taken,
-              :undefined,
-              :not_owner,
-              :not_owned,
-              :not_connected,
-              :not_in_group,
-              :stale_cluster_epoch
-            ],
-       do: %{status: :fail, code: code, error: inspect(code)}
-
   def handle_call({:kill, logical_owner}, _from, state) do
     case Map.get(state.owners, logical_owner) do
       nil ->
@@ -757,6 +739,28 @@ defmodule Group.Jepsen.Driver do
     end
   end
 
+  def handle_call(:unexpected_deaths, _from, state) do
+    {:reply, state.unexpected_deaths, state}
+  end
+
+  defp failure_response({:unexpected, evidence}),
+    do: %{status: :fail, code: :unexpected, error: evidence}
+
+  defp failure_response({:indeterminate, reason}),
+    do: %{status: :unknown, code: :indeterminate, error: inspect(reason)}
+
+  defp failure_response(code)
+       when code in [
+              :taken,
+              :undefined,
+              :not_owner,
+              :not_owned,
+              :not_connected,
+              :not_in_group,
+              :stale_cluster_epoch
+            ],
+       do: %{status: :fail, code: code, error: inspect(code)}
+
   defp live_owner_snapshot(pid) do
     if Process.alive?(pid) do
       try do
@@ -767,10 +771,6 @@ defmodule Group.Jepsen.Driver do
     else
       {:error, :not_alive}
     end
-  end
-
-  def handle_call(:unexpected_deaths, _from, state) do
-    {:reply, state.unexpected_deaths, state}
   end
 
   @impl true

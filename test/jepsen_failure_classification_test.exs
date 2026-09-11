@@ -1,14 +1,7 @@
 defmodule Group.JepsenFailureClassificationTest do
   use ExUnit.Case, async: false
-
-  # Load the executable's real modules without starting its TCP server.
-  @path Path.expand("jepsen/node.exs", __DIR__)
-  unless Code.ensure_loaded?(Group.Jepsen.Owner) do
-    @path
-    |> File.read!()
-    |> String.replace("Group.Jepsen.Main.run(System.argv())", "")
-    |> Code.compile_string(@path)
-  end
+  @moduletag :local
+  Code.require_file("jepsen/harness_modules.exs", __DIR__)
 
   defmodule API do
     def register(_, _, %{revision: revision}, _) do
