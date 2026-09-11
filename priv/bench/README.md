@@ -45,6 +45,22 @@ Uses 3 separate BEAM VMs (coordinator + 2 replicas) as OS processes:
 The script compiles once, starts both replicas in the background, then launches
 the coordinator. Replicas are killed automatically on exit.
 
+For a baseline/candidate comparison, run the candidate's comparison launcher:
+
+```bash
+epmd -daemon
+bash /path/to/candidate/priv/bench/compare_distributed.sh \
+  /path/to/baseline /path/to/candidate /path/to/reports --shards 4
+```
+
+Both runs use that same candidate harness and its workload/timing boundaries;
+only the `GROUP_BENCH_GROUP_PATH` library dependency changes. Each run has an
+isolated build directory so the candidate cannot reuse compiled baseline code.
+The launcher requires GNU `timeout`, caps each revision at 20 minutes, and
+retains separate logs. This is also the distributed comparison used by CI.
+An older baseline that cannot complete the common workload fails the comparison;
+the launcher never substitutes that revision's older, weaker completion checks.
+
 To isolate the 10,000-cluster lifecycle scenario:
 
 ```bash

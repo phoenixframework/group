@@ -71,10 +71,8 @@ jobs:
       - name: Distributed load and recovery, baseline then candidate
         run: |
           epmd -daemon
-          for revision in baseline candidate; do
-            timeout 20m bash "$revision/priv/bench/run_distributed.sh" 2>&1 |
-              tee "reports/distributed-$revision.log"
-          done
+          bash candidate/priv/bench/compare_distributed.sh \
+            "$PWD/baseline" "$PWD/candidate" "$PWD/reports"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
