@@ -860,6 +860,10 @@ defmodule Group.Jepsen.Cluster do
   defp result({:error, reason}), do: %{status: :fail, error: inspect(reason)}
 end
 
+defmodule Group.Jepsen.InvariantViolation do
+  defexception [:message, :invariant]
+end
+
 defmodule Group.Jepsen.Invariant do
   @moduledoc false
 
@@ -868,9 +872,9 @@ defmodule Group.Jepsen.Invariant do
   def snapshot(retired_nodes) do
     config = Group.get_config(:jepsen_group)
     shards = 0..(config.num_shards - 1)
-    maybe_inject_cursor_marker_corruption(shards)
+    injected_corruptions = maybe_inject_cursor_marker_corruption(shards)
 
-    errors =
+    failures =
       check("dual indexes", &assert_dual_indexes/0) ++
         check("registry claims", &assert_registry_claims/0) ++
         check("oplog", &assert_oplogs/0) ++
@@ -889,8 +893,10 @@ defmodule Group.Jepsen.Invariant do
       end)
 
     %{
-      healthy: errors == [] and staging_count == 0,
-      errors: errors,
+      healthy: failures == [] and staging_count == 0,
+      errors: Enum.map(failures, & &1.message),
+      failed_invariants: Enum.flat_map(failures, &List.wrap(&1.invariant)),
+      injected_corruptions: injected_corruptions,
       snapshot_staging_count: staging_count,
       oplog_entries: oplog_entries,
       oplog_max_entries_per_shard: config.replicated_oplog_max_entries,
@@ -905,6 +911,8 @@ defmodule Group.Jepsen.Invariant do
       %{
         healthy: false,
         errors: ["invariant snapshot failed: #{Exception.message(exception)}"],
+        failed_invariants: [],
+        injected_corruptions: [],
         snapshot_staging_count: -1
       }
   end
@@ -928,9 +936,13 @@ defmodule Group.Jepsen.Invariant do
             {stream, {:snapshot_installing, 1}}
           )
 
+          [:"cursor-marker"]
+
         nil ->
           raise "no remote replica cursor available for corruption"
       end
+    else
+      []
     end
   end
 
@@ -938,9 +950,13 @@ defmodule Group.Jepsen.Invariant do
     fun.()
     []
   rescue
-    exception -> ["#{label}: #{Exception.message(exception)}"]
+    exception in Group.Jepsen.InvariantViolation ->
+      [%{invariant: exception.invariant, message: "#{label}: #{Exception.message(exception)}"}]
+
+    exception ->
+      [%{invariant: nil, message: "#{label}: #{Exception.message(exception)}"}]
   catch
-    kind, reason -> ["#{label}: #{inspect({kind, reason})}"]
+    kind, reason -> [%{invariant: nil, message: "#{label}: #{inspect({kind, reason})}"}]
   end
 
   defp assert_dual_indexes do
@@ -973,7 +989,13 @@ defmodule Group.Jepsen.Invariant do
           {cluster, key, pid, meta, time, origin}
         end)
 
-      assert_equal!(reg_key, reg_pid, "registry dual indexes shard #{shard}")
+      assert_equal!(
+        reg_key,
+        reg_pid,
+        "registry dual indexes shard #{shard}",
+        :registry_dual_indexes
+      )
+
       assert_equal!(pg_key, pg_pid, "PG dual indexes shard #{shard}")
 
       expected_counts =
@@ -1074,7 +1096,7 @@ defmodule Group.Jepsen.Invariant do
           {cluster, key, pid, meta, time, origin}
         end)
 
-      assert_equal!(expected, visible, "registry projection shard #{shard}")
+      assert_equal!(expected, visible, "registry projection shard #{shard}", :registry_projection)
     end)
   end
 
@@ -1140,6 +1162,12 @@ defmodule Group.Jepsen.Invariant do
       Data.replica_cursor_table(:jepsen_group, shard)
       |> :ets.tab2list()
       |> Enum.each(fn {stream, seq} ->
+        if match?({:snapshot_installing, _}, seq) do
+          raise Group.Jepsen.InvariantViolation,
+            invariant: :cursor_snapshot_marker,
+            message: "cursor contains uncommitted snapshot marker #{inspect({stream, seq})}"
+        end
+
         origin = WireProtocol.stream_origin(stream)
         cluster = WireProtocol.stream_cluster(stream)
 
@@ -1202,10 +1230,13 @@ defmodule Group.Jepsen.Invariant do
     Enum.each(0..(num_shards - 1), fun)
   end
 
-  defp assert_equal!(left, right, label) do
+  defp assert_equal!(left, right, label, invariant \\ nil) do
     if left != right do
-      raise "#{label}: left-only=#{inspect(MapSet.difference(left, right))} " <>
-              "right-only=#{inspect(MapSet.difference(right, left))}"
+      raise Group.Jepsen.InvariantViolation,
+        invariant: invariant,
+        message:
+          "#{label}: left-only=#{inspect(MapSet.difference(left, right))} " <>
+            "right-only=#{inspect(MapSet.difference(right, left))}"
     end
   end
 
@@ -1439,7 +1470,7 @@ defmodule Group.Jepsen.Wire do
   defp corrupt("internal-index") do
     table = Group.Replica.Data.reg_by_pid_table(:jepsen_group, 0)
     :ets.insert(table, {{self(), nil, "jepsen/registry/corrupt"}, %{}, 0, node()})
-    %{status: :ok}
+    %{status: :ok, injected: :"internal-index"}
   end
 
   defp corrupt("cursor-marker") do
@@ -1483,7 +1514,7 @@ defmodule Group.Jepsen.Wire do
       end)
 
     if corrupted do
-      %{status: :ok}
+      %{status: :ok, injected: :"registry-projection"}
     else
       %{status: :fail, error: "no visible registry claim available for corruption"}
     end

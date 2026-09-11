@@ -1,6 +1,28 @@
 (ns group.jepsen.qualification
   (:require [jepsen.checker :as checker]))
 
+(def internal-invariants
+  {:internal-index :registry-dual-indexes
+   :cursor-marker :cursor-snapshot-marker
+   :registry-projection :registry-projection})
+
+(defn internal-qualified? [mode history result]
+  ;; Match completion and the precise assertion on the same injected node.
+  ;; Arming the cursor marker file is not injection: only a successful snapshot
+  ;; insertion can attest that a remote cursor existed and was corrupted.
+  (some (fn [op]
+          (let [internal (get-in result [:internal-invariant-errors
+                                        (get-in op [:value :node])])
+                completed? (if (= :cursor-marker mode)
+                             (some #{mode} (:injected-corruptions internal))
+                             (= mode (get-in op [:value :response :injected])))]
+            (and (= :corrupt (:f op))
+                 (= :ok (:type op))
+                 (= mode (get-in op [:value :request :mode]))
+                 completed?
+                 (some #{(internal-invariants mode)} (:failed-invariants internal)))))
+        history))
+
 (defn qualified? [test history result]
   (let [mode (keyword (:corruption test))
         injected? (some #(and (= :corrupt (:f %))
@@ -11,9 +33,9 @@
       (case mode
         :none (true? (:valid? result))
         :unexpected-death (and injected? (seq (:unexpected-owner-deaths result)))
-        :internal-index (and injected? (seq (:internal-invariant-errors result)))
-        :cursor-marker (and injected? (seq (:internal-invariant-errors result)))
-        :registry-projection (and injected? (seq (:internal-invariant-errors result)))
+        :internal-index (internal-qualified? mode history result)
+        :cursor-marker (internal-qualified? mode history result)
+        :registry-projection (internal-qualified? mode history result)
         :terminal-unavailable
         (let [target (first (:terminal-nodes test))]
           (and (some #(and (= :retire-node (:f %))
