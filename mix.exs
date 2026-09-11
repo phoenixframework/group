@@ -64,7 +64,7 @@ defmodule Group.MixProject do
 
   defp aliases do
     [
-      test: ["test", "cmd test/jepsen/checker.sh"],
+      test: ["test", "cmd test/jepsen/checker.sh", "cmd test/jepsen/lein.sh test :capture"],
       "test.soak": [
         # Run the PR gate in a child VM. test_helper starts distribution, and
         # keeping that VM alive for the following `cmd` phases can retain a
