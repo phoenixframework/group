@@ -424,6 +424,73 @@ defmodule Group.Jepsen.ConflictResolver do
   defp rank(_meta), do: {-1, ""}
 end
 
+defmodule Group.Jepsen.ConflictEvidence do
+  @moduledoc false
+  use GenServer
+
+  # Independent of Group's ETS, and retained across container/BEAM restarts.
+  # Persist the invocation before calling Group: a conflict can kill an owner
+  # before its register call returns, even though its claim was installed.
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  def record(event), do: GenServer.call(__MODULE__, {:record, event})
+  def snapshot, do: GenServer.call(__MODULE__, :snapshot)
+  def reset, do: GenServer.call(__MODULE__, :reset)
+
+  def decode(contents) do
+    if contents != "" and not String.ends_with?(contents, "\n"),
+      do: raise("truncated conflict evidence")
+
+    contents
+    |> String.split("\n")
+    |> Enum.drop(-1)
+    |> Enum.with_index(1)
+    |> Enum.map(fn {line, sequence} ->
+      event = line |> Base.decode64!() |> :erlang.binary_to_term()
+      %{sequence: ^sequence} = event
+      event
+    end)
+  end
+
+  @impl true
+  def init(opts) do
+    path = Keyword.get(opts, :conflict_evidence_path, "/tmp/group-jepsen-conflict-evidence")
+
+    events =
+      case File.read(path) do
+        {:ok, contents} ->
+          decode(contents)
+
+        {:error, :enoent} ->
+          []
+
+        {:error, reason} ->
+          raise "cannot read conflict evidence: #{inspect(reason)}"
+      end
+
+    {:ok, %{path: path, events: Enum.reverse(events), sequence: length(events)}}
+  end
+
+  @impl true
+  def handle_call({:record, event}, _from, state) do
+    event = Map.put(event, :sequence, state.sequence + 1)
+    encoded = event |> :erlang.term_to_binary() |> Base.encode64()
+    :ok = File.write(state.path, encoded <> "\n", [:append, :sync])
+    {:reply, event.sequence, %{state | events: [event | state.events], sequence: event.sequence}}
+  end
+
+  def handle_call(:snapshot, _from, state) do
+    {:reply, Enum.reverse(state.events), state}
+  end
+
+  # Called only during DB setup, after restart and before workload mutations.
+  # Removing the file externally would leave the restarted recorder's loaded
+  # evidence alive in memory and leak coverage into the next history.
+  def handle_call(:reset, _from, state) do
+    :ok = File.write(state.path, "", [:sync])
+    {:reply, :ok, %{state | events: [], sequence: 0}}
+  end
+end
+
 defmodule Group.Jepsen.Owner do
   @moduledoc false
   use GenServer
@@ -437,15 +504,26 @@ defmodule Group.Jepsen.Owner do
   def handle_call({:mutate, :register, cluster, key, revision}, _from, state) do
     meta = %{token: state.token, revision: revision}
 
+    attempt =
+      Group.Jepsen.ConflictEvidence.record(%{
+        kind: :register,
+        token: state.token,
+        cluster: cluster,
+        key: key,
+        revision: revision
+      })
+
     case safe_group_call(fn ->
            Group.register(:jepsen_group, registry_key(key), meta, cluster_opts(cluster))
          end) do
       :ok ->
+        registration_result(attempt, :ok)
         entry = %{cluster: cluster, key: key, revision: revision}
         state = put_in(state.registrations[{cluster, key}], entry)
         {:reply, {:ok, snapshot(state)}, state}
 
       {:error, reason} ->
+        registration_result(attempt, if(reason == :taken, do: :fail, else: :unknown))
         {:reply, {:error, reason, snapshot(state)}, state}
     end
   end
@@ -458,6 +536,13 @@ defmodule Group.Jepsen.Owner do
              Group.unregister(:jepsen_group, registry_key(key), cluster_opts(cluster))
            end) do
         :ok ->
+          Group.Jepsen.ConflictEvidence.record(%{
+            kind: :unregister,
+            token: state.token,
+            cluster: cluster,
+            key: key
+          })
+
           state = %{state | registrations: Map.delete(state.registrations, owner_key)}
           {:reply, {:ok, snapshot(state)}, state}
 
@@ -505,6 +590,12 @@ defmodule Group.Jepsen.Owner do
   end
 
   def handle_call({:drop_cluster, cluster}, _from, state) do
+    Group.Jepsen.ConflictEvidence.record(%{
+      kind: :drop_cluster,
+      token: state.token,
+      cluster: cluster
+    })
+
     registrations = drop_cluster(state.registrations, cluster)
     memberships = drop_cluster(state.memberships, cluster)
     state = %{state | registrations: registrations, memberships: memberships}
@@ -512,6 +603,10 @@ defmodule Group.Jepsen.Owner do
   end
 
   def handle_call(:snapshot, _from, state), do: {:reply, snapshot(state), state}
+
+  defp registration_result(attempt, status) do
+    Group.Jepsen.ConflictEvidence.record(%{kind: :result, attempt: attempt, status: status})
+  end
 
   defp drop_cluster(entries, cluster) do
     entries
@@ -546,8 +641,6 @@ end
 defmodule Group.Jepsen.Driver do
   @moduledoc false
   use GenServer
-
-  alias Group.Jepsen.Transport.Stats
 
   @driver_count 8
   @unexpected_death_log "/tmp/group-jepsen-unexpected-deaths"
@@ -731,7 +824,16 @@ defmodule Group.Jepsen.Driver do
 
         unexpected_deaths =
           if match?({:group_registry_conflict, _key, _winner_meta}, reason) do
-            Stats.increment_persistent(:registry_conflict_death)
+            {:group_registry_conflict, key, winner_meta} = reason
+
+            Group.Jepsen.ConflictEvidence.record(%{
+              kind: :death,
+              token: token,
+              key: if(is_binary(key), do: key, else: %{invalid: inspect(key)}),
+              winner:
+                if(is_map(winner_meta), do: winner_meta, else: %{invalid: inspect(winner_meta)})
+            })
+
             state.unexpected_deaths
           else
             death = %{token: token, reason: inspect(reason)}
@@ -821,7 +923,11 @@ defmodule Group.Jepsen.Driver.Supervisor do
 
   @impl true
   def init(opts),
-    do: Supervisor.init(Group.Jepsen.Driver.child_specs(opts), strategy: :one_for_one)
+    do:
+      Supervisor.init(
+        [{Group.Jepsen.ConflictEvidence, opts} | Group.Jepsen.Driver.child_specs(opts)],
+        strategy: :one_for_one
+      )
 end
 
 defmodule Group.Jepsen.Cluster do
@@ -1277,6 +1383,7 @@ defmodule Group.Jepsen.Snapshot do
         peers: Group.nodes(:jepsen_group) |> Enum.map(&Atom.to_string/1) |> Enum.sort(),
         owners: owners,
         unexpected_deaths: Group.Jepsen.Driver.unexpected_deaths(),
+        conflict_evidence: Group.Jepsen.ConflictEvidence.snapshot(),
         transport_events: Group.Jepsen.Transport.Stats.snapshot(),
         transport_profile: Group.Jepsen.Transport.Control.profile(),
         internal: Group.Jepsen.Invariant.snapshot(retired_nodes),
@@ -1357,6 +1464,10 @@ defmodule Group.Jepsen.Wire do
   defp command(payload, context) do
     case String.split(payload, "\t") do
       ["ping"] ->
+        %{status: :ok}
+
+      ["reset-conflict-evidence"] ->
+        :ok = Group.Jepsen.ConflictEvidence.reset()
         %{status: :ok}
 
       ["ready", expected] ->
@@ -1565,4 +1676,6 @@ defmodule Group.Jepsen.Main do
   end
 end
 
-Group.Jepsen.Main.run(System.argv())
+unless System.get_env("GROUP_JEPSEN_LIBRARY_ONLY") == "1" do
+  Group.Jepsen.Main.run(System.argv())
+end

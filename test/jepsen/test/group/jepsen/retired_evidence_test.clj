@@ -1,6 +1,8 @@
 (ns group.jepsen.retired-evidence-test
   (:require [clojure.test :refer :all]
             [group.jepsen.docker :as docker]
+            [group.jepsen.client :as client]
+            [group.jepsen.db :as group-db]
             [group.jepsen.nemesis :as group-nemesis]
             [jepsen.db :as db]
             [jepsen.nemesis :as nemesis]))
@@ -11,15 +13,18 @@
                   (fn [& args]
                     (swap! calls conj args)
                     (is (= 10000 docker/*command-timeout-ms*))
-                    (spit (last args) "n1/boot/owner/1\t:boom\n"))]
-      (is (= {:node "n1" :unexpected-deaths [{:token "n1/boot/owner/1" :reason ":boom"}]}
+                    (spit (last args) "n1/boot/owner/1\t:boom\n"))
+                  docker/decode-conflict-evidence! (constantly [])]
+      (is (= {:node "n1" :unexpected-deaths [{:token "n1/boot/owner/1" :reason ":boom"}]
+              :conflict-evidence []}
              (docker/retired-evidence! "n1")))
       (is (= ["cp" "group-jepsen-n1:/tmp/group-jepsen-unexpected-deaths"]
              (vec (take 2 (first @calls))))))))
 
 (deftest collector-distinguishes-empty-evidence-from-loss
   (doseq [contents ["" "bad\n" "token\t:boom"]]
-    (with-redefs [docker/docker! (fn [& args] (spit (last args) contents))]
+    (with-redefs [docker/docker! (fn [& args] (spit (last args) contents))
+                  docker/decode-conflict-evidence! (constantly [])]
       (if (= "" contents)
         (is (= [] (:unexpected-deaths (docker/retired-evidence! "n1"))))
         (is (thrown? Exception (docker/retired-evidence! "n1"))))))
@@ -32,6 +37,32 @@
                   (is (= "n1" node))
                   (is (re-find #": > /tmp/group-jepsen-unexpected-deaths" script)))]
     (docker/reset-oracle! "n1")))
+
+(deftest workload-reset-clears-the-running-conflict-recorder
+  (let [calls (atom [])]
+    (with-redefs [docker/heal! (fn [_])
+                  docker/restart! #(swap! calls conj [:restart %])
+                  docker/reset-oracle! #(swap! calls conj [:disk-reset %])
+                  client/wait-listening! #(swap! calls conj [:listening %])
+                  client/request! (fn [node fields]
+                                    (swap! calls conj [node fields])
+                                    {:status :ok})
+                  client/wait-ready! (fn [node _] (swap! calls conj [:ready node]))]
+      (dotimes [_ 2]
+        (db/setup! (group-db/db) {:nodes ["n1"]} "n1"))
+      (is (= (vec (mapcat identity (repeat 2 [[:restart "n1"] [:disk-reset "n1"]
+                                             [:listening "n1"]
+                                             ["n1" ["reset-conflict-evidence"]]
+                                             [:ready "n1"]])))
+             @calls)))))
+
+(deftest conflict-archive-decode-fails-closed
+  (doseq [contents ["not-base64\n" "truncated"]]
+    (with-redefs [docker/docker!
+                  (fn [& args]
+                    (spit (last args)
+                          (if (.contains (second args) "conflict-evidence") contents "")))]
+      (is (thrown? Exception (docker/retired-evidence! "n1"))))))
 
 (deftest retirement-captures-after-stop-even-if-node-was-already-unavailable
   (doseq [running? [true false]]

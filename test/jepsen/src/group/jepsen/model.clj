@@ -88,6 +88,7 @@
   {:owners (set (:owners snapshot))
    :peers (set (:peers snapshot))
    :unexpected-deaths (set (:unexpected-deaths snapshot))
+   :conflict-evidence (:conflict-evidence snapshot)
    :view (normalize-view test snapshot)
    :internal (stable-internal snapshot)})
 
@@ -95,6 +96,79 @@
   (->> history
        (remove history/invoke?)
        (keep #(get-in % [:value :response :latency-us]))))
+
+(defn replay-conflict-evidence [node events]
+  (reduce
+    (fn [state {:keys [kind sequence token cluster key attempt status] :as event}]
+      (let [slot [cluster key]]
+        (case kind
+          :register (-> state
+                        (assoc-in [:claims sequence] (assoc event :node node))
+                        (assoc-in [:pending token sequence] slot))
+          :result (let [claim (get-in state [:claims attempt])
+                        token (:token claim)
+                        slot [(:cluster claim) (:key claim)]]
+                    (cond-> (assoc-in state [:claims attempt :status] status)
+                      (not= :unknown status) (update-in [:pending token] dissoc attempt)
+                      (= :ok status) (assoc-in [:active token slot] attempt)))
+          :unregister
+          (-> state
+              (update-in [:active token] dissoc slot)
+              (update-in [:pending token]
+                         #(into {} (remove (fn [[_ s]] (= slot s))) %)))
+          :drop-cluster
+          (-> state
+              (update-in [:active token]
+                         #(into {} (remove (fn [[[c _] _]] (= cluster c))) %))
+              (update-in [:pending token]
+                         #(into {} (remove (fn [[_ [c _]]] (= cluster c))) %)))
+          :death
+          (let [attempts (concat (vals (get-in state [:active token]))
+                                 (keys (get-in state [:pending token])))]
+            (-> state
+                (update :deaths conj
+                        (assoc event :node node :victim-attempts (set attempts)))
+                (update :active dissoc token)
+                (update :pending dissoc token)))
+          state)))
+    {:claims {} :active {} :pending {} :deaths []}
+    events))
+
+(defn conflict-analysis [snapshots]
+  (let [journals (into {} (map (fn [[node snapshot]]
+                                [node (replay-conflict-evidence
+                                        node (:conflict-evidence snapshot))]))
+                       snapshots)
+        claims (mapcat (comp vals :claims val) journals)
+        possible? #(not= :fail (:status %))
+        winners (group-by (juxt :token :revision :key) (filter possible? claims))
+        deaths (mapcat (comp :deaths val) journals)
+        justified?
+        (fn [{:keys [node sequence token key winner victim-attempts]}]
+          (boolean
+            (some
+              (fn [id]
+                (let [victim (get-in journals [node :claims id])
+                      rank (juxt :revision :token)]
+                  (and (possible? victim)
+                       (= token (:token victim))
+                       (= key (str "jepsen/registry/" (:key victim)))
+                       (integer? (:revision winner))
+                       (string? (:token winner))
+                       (not= token (:token winner))
+                       (pos? (compare (rank winner) (rank victim)))
+                       (some #(and (= (:cluster victim) (:cluster %))
+                                   ;; Local order is known. Across nodes there
+                                   ;; is no synchronized oracle clock; delayed
+                                   ;; remote deletions may still lose a conflict.
+                                   (or (not= node (:node %))
+                                       (< (:sequence %) sequence)))
+                             (get winners [(:token winner) (:revision winner)
+                                           (:key victim)])))))
+              victim-attempts)))
+        invalid (vec (remove justified? deaths))]
+    {:invalid invalid
+     :validated-count (- (count deaths) (count invalid))}))
 
 (defn analyze [test history]
   (let [observations (snapshots-by-node history)
@@ -137,10 +211,27 @@
                         (when (not= expected-peers actual-peers)
                           [node {:expected expected-peers, :actual actual-peers}]))))
               relevant-snapshots)
+        completions (remove history/invoke? history)
+        retirement-evidence (keep #(get-in % [:value :lifecycle-evidence]) completions)
+        ;; Retired nodes no longer contribute live owners or public views, but
+        ;; their durable claims and deaths remain obligations for this history.
+        conflict-snapshots
+        (into {}
+              (map (fn [[node evidence]]
+                     [node {:conflict-evidence (->> evidence
+                                                   (mapcat :conflict-evidence)
+                                                   distinct
+                                                   (sort-by :sequence)
+                                                   vec)}]))
+              (group-by :node
+                        (concat (map :value (successful-snapshots history))
+                                retirement-evidence)))
+        conflicts (conflict-analysis conflict-snapshots)
         transport-events
-        (reduce #(merge-with + %1 %2)
-                {}
-                (map #(or (:transport-events %) {}) (vals relevant-snapshots)))
+        (assoc (reduce #(merge-with + %1 %2)
+                       {}
+                       (map #(or (:transport-events %) {}) (vals relevant-snapshots)))
+               :registry-conflict-death (:validated-count conflicts))
         required-transport-events
         (get test :required-transport-events
              default-required-transport-events)
@@ -168,8 +259,6 @@
                                   (not= 0 (:snapshot-staging-count internal)))
                           [node internal]))))
               relevant-snapshots)
-        completions (remove history/invoke? history)
-        retirement-evidence (keep #(get-in % [:value :lifecycle-evidence]) completions)
         retired-nodes (set/difference (set (map name (:nodes test))) required-nodes)
         collected-nodes (set (map :node retirement-evidence))
         evidence-errors (vec (keep #(get-in % [:value :evidence-error]) completions))
@@ -207,6 +296,7 @@
                     (empty? (:conflicts expected))
                     (empty? mismatches)
                     (empty? unexpected-deaths)
+                    (empty? (:invalid conflicts))
                     (empty? evidence-errors)
                     (empty? missing-retirement-evidence)
                     (empty? orphaned)
@@ -230,6 +320,7 @@
      :live-registry-conflicts (:conflicts expected)
      :mismatched-views mismatches
      :unexpected-owner-deaths unexpected-deaths
+     :invalid-conflict-deaths (:invalid conflicts)
      :lifecycle-evidence-errors evidence-errors
      :missing-retirement-evidence missing-retirement-evidence
      :orphaned-owner-tokens orphaned

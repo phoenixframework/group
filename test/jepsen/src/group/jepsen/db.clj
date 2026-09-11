@@ -9,6 +9,10 @@
     (docker/heal! (:nodes test))
     (docker/restart! node)
     (docker/reset-oracle! node)
+    (group-client/wait-listening! node)
+    (let [response (group-client/request! node ["reset-conflict-evidence"])]
+      (when-not (= :ok (:status response))
+        (throw (ex-info "conflict oracle reset failed" {:node node :response response}))))
     (group-client/wait-ready! node (count (:nodes test))))
 
   (teardown! [_this test _node]
