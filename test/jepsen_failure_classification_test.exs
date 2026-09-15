@@ -1,7 +1,17 @@
 defmodule Group.JepsenFailureClassificationTest do
   use ExUnit.Case, async: false
   @moduletag :local
+  @moduletag :tmp_dir
   Code.require_file("jepsen/harness_modules.exs", __DIR__)
+
+  setup %{tmp_dir: tmp_dir} do
+    start_supervised!(
+      {Group.Jepsen.ConflictEvidence,
+       conflict_evidence_path: Path.join(tmp_dir, "conflict-evidence")}
+    )
+
+    :ok
+  end
 
   defmodule API do
     def register(_, _, %{revision: revision}, _) do
@@ -37,7 +47,6 @@ defmodule Group.JepsenFailureClassificationTest do
     for owner <- ["one", "two"], do: GenServer.call(driver, {:kill, owner})
   end
 
-  @tag :tmp_dir
   test "actual Owner/Driver boundary preserves unexpected failures independently of owner life",
        %{tmp_dir: tmp_dir} do
     old = System.get_env("GROUP_JEPSEN_UNEXPECTED_DEATH_LOG")
