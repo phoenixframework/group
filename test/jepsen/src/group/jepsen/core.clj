@@ -4,6 +4,7 @@
             [group.jepsen.db :as group-db]
             [group.jepsen.model :as model]
             [group.jepsen.nemesis :as group-nemesis]
+            [group.jepsen.qualification :as qualification]
             [jepsen.cli :as cli]
             [jepsen.generator :as gen]
             [jepsen.os :as os]
@@ -168,7 +169,7 @@
             :nemesis (group-nemesis/nemesis db)
             :pure-generators true
             :generator (workload opts)
-            :checker (model/checker)})))
+            :checker (qualification/checker (model/checker))})))
 
 (def cli-options
   [[nil "--key-count NUMBER" "Number of keys in each cluster and data type"
