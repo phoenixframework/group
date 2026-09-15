@@ -271,7 +271,10 @@
 (deftest operation-failures-survive-owner-and-vm-retirement
   (let [survivors ["n2" "n3"]
         test (assoc test-map :terminal-nodes survivors)
-        snapshots [(snapshot-op 2 "n2" survivors [] (empty-registry) (empty-pg))
+        snapshots [{:index 1 :process :nemesis :type :info :f :retire-node
+                    :value {:retired "n1"
+                            :lifecycle-evidence {:node "n1" :unexpected-deaths []}}}
+                   (snapshot-op 2 "n2" survivors [] (empty-registry) (empty-pg))
                    (snapshot-op 3 "n3" survivors [] (empty-registry) (empty-pg))]
         failure (fn [code error]
                   {:index 1 :process 0 :type :fail :f :register
