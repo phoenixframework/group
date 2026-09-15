@@ -44,6 +44,7 @@ Message ==
 VARIABLES authorityEpoch,
           cursor,
           visible,
+          installedCommitted,
           stagedSnapshot,
           stagedChunks,
           stagedRows,
@@ -52,13 +53,14 @@ VARIABLES authorityEpoch,
           messages
 
 vars ==
-  <<authorityEpoch, cursor, visible, stagedSnapshot, stagedChunks,
+  <<authorityEpoch, cursor, visible, installedCommitted, stagedSnapshot, stagedChunks,
     stagedRows, stagedCommitted, commitAllowed, messages>>
 
 Init ==
   /\ authorityEpoch = 1
   /\ cursor = 0
   /\ visible = {}
+  /\ installedCommitted = TRUE
   /\ stagedSnapshot = 0
   /\ stagedChunks = {}
   /\ stagedRows = {}
@@ -69,20 +71,20 @@ Init ==
 SendChunk(snapshot, chunk) ==
   /\ messages' = messages \union
        {[kind |-> "chunk", snapshot |-> snapshot, chunk |-> chunk]}
-  /\ UNCHANGED <<authorityEpoch, cursor, visible, stagedSnapshot,
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, installedCommitted, stagedSnapshot,
                  stagedChunks, stagedRows, stagedCommitted, commitAllowed>>
 
 SendCommit(snapshot) ==
   /\ snapshot \in commitAllowed
   /\ messages' = messages \union
        {[kind |-> "commit", snapshot |-> snapshot, chunk |-> 0]}
-  /\ UNCHANGED <<authorityEpoch, cursor, visible, stagedSnapshot,
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, installedCommitted, stagedSnapshot,
                  stagedChunks, stagedRows, stagedCommitted, commitAllowed>>
 
 InvalidateBeforeCommit(snapshot) ==
   /\ snapshot \in commitAllowed
   /\ commitAllowed' = commitAllowed \ {snapshot}
-  /\ UNCHANGED <<authorityEpoch, cursor, visible, stagedSnapshot,
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, installedCommitted, stagedSnapshot,
                  stagedChunks, stagedRows, stagedCommitted, messages>>
 
 Valid(snapshot) ==
@@ -102,7 +104,7 @@ StartChunk(message) ==
   /\ stagedChunks' = {message.chunk}
   /\ stagedRows' = ChunkRows(message.snapshot, message.chunk)
   /\ stagedCommitted' = FALSE
-  /\ UNCHANGED <<authorityEpoch, cursor, visible, commitAllowed, messages>>
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, installedCommitted, commitAllowed, messages>>
 
 StartCommit(message) ==
   /\ message.kind = "commit"
@@ -111,7 +113,7 @@ StartCommit(message) ==
   /\ stagedChunks' = {}
   /\ stagedRows' = {}
   /\ stagedCommitted' = TRUE
-  /\ UNCHANGED <<authorityEpoch, cursor, visible, commitAllowed, messages>>
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, installedCommitted, commitAllowed, messages>>
 
 ContinueChunk(message) ==
   /\ message.kind = "chunk"
@@ -122,11 +124,13 @@ ContinueChunk(message) ==
      IN IF stagedCommitted /\ nextChunks = Chunks
         THEN /\ cursor' = SnapshotSeq(message.snapshot)
              /\ visible' = SnapshotRows(message.snapshot)
+             (* Retain the actual pre-install evidence after staging is cleared. *)
+             /\ installedCommitted' = stagedCommitted
              /\ stagedSnapshot' = 0
              /\ stagedChunks' = {}
              /\ stagedRows' = {}
              /\ stagedCommitted' = FALSE
-        ELSE /\ UNCHANGED <<cursor, visible, stagedSnapshot, stagedCommitted>>
+        ELSE /\ UNCHANGED <<cursor, visible, installedCommitted, stagedSnapshot, stagedCommitted>>
              /\ stagedChunks' = nextChunks
              /\ stagedRows' = nextRows
   /\ UNCHANGED <<authorityEpoch, commitAllowed, messages>>
@@ -138,12 +142,14 @@ ContinueCommit(message) ==
   /\ IF stagedChunks = Chunks
      THEN /\ cursor' = SnapshotSeq(message.snapshot)
           /\ visible' = SnapshotRows(message.snapshot)
+          (* This transition delivers the terminal commit itself. *)
+          /\ installedCommitted' = TRUE
           /\ stagedSnapshot' = 0
           /\ stagedChunks' = {}
           /\ stagedRows' = {}
           /\ stagedCommitted' = FALSE
      ELSE /\ stagedCommitted' = TRUE
-          /\ UNCHANGED <<cursor, visible, stagedSnapshot, stagedChunks, stagedRows>>
+          /\ UNCHANGED <<cursor, visible, installedCommitted, stagedSnapshot, stagedChunks, stagedRows>>
   /\ UNCHANGED <<authorityEpoch, commitAllowed, messages>>
 
 Ignore(message) ==
@@ -163,7 +169,7 @@ Deliver(message) ==
 Drop(message) ==
   /\ message \in messages
   /\ messages' = messages \ {message}
-  /\ UNCHANGED <<authorityEpoch, cursor, visible, stagedSnapshot,
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, installedCommitted, stagedSnapshot,
                  stagedChunks, stagedRows, stagedCommitted, commitAllowed>>
 
 InstallNewAuthority ==
@@ -171,6 +177,7 @@ InstallNewAuthority ==
   /\ authorityEpoch' = 2
   /\ cursor' = 0
   /\ visible' = {}
+  /\ installedCommitted' = TRUE
   (* Invisible old staging may remain until expiry, but can never commit. *)
   /\ UNCHANGED <<stagedSnapshot, stagedChunks, stagedRows, stagedCommitted,
                  commitAllowed, messages>>
@@ -181,7 +188,7 @@ DiscardStaging ==
   /\ stagedChunks' = {}
   /\ stagedRows' = {}
   /\ stagedCommitted' = FALSE
-  /\ UNCHANGED <<authorityEpoch, cursor, visible, commitAllowed, messages>>
+  /\ UNCHANGED <<authorityEpoch, cursor, visible, installedCommitted, commitAllowed, messages>>
 
 Next ==
   \/ \E snapshot \in Snapshots, chunk \in Chunks : SendChunk(snapshot, chunk)
@@ -196,6 +203,7 @@ TypeOK ==
   /\ authorityEpoch \in {1, 2}
   /\ cursor \in 0..2
   /\ visible \subseteq Rows
+  /\ installedCommitted \in BOOLEAN
   /\ stagedSnapshot \in {0} \union Snapshots
   /\ stagedChunks \subseteq Chunks
   /\ stagedRows \subseteq Rows
@@ -217,8 +225,7 @@ StagingBelongsToOneSnapshot ==
     stagedRows = UNION {ChunkRows(stagedSnapshot, chunk) : chunk \in stagedChunks}
 
 NoCommitMeansNoInstall ==
-  stagedSnapshot # 0 /\ ~stagedCommitted =>
-    SnapshotSeq(stagedSnapshot) > cursor
+  installedCommitted
 
 Spec == Init /\ [][Next]_vars
 

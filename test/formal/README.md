@@ -19,6 +19,12 @@ at a previously committed exact state until every chunk and a valid terminal
 commit for one snapshot are present; stale or mixed partial state can never
 become visible.
 
+The commit invariant retains the last installation's commit evidence separately
+from disposable staging. The formal matrix also removes the terminal-commit guard
+in an isolated copy and requires TLC to reject it specifically with
+`NoCommitMeansNoInstall`. A surviving mutant, parser error, or runtime failure
+fails this qualification.
+
 `PeerEviction.tla` isolates the lifecycle boundary for a peer which never
 returns and for a later process using the same node name with a fresh
 generation. During its finite faulty prefix it retains and reorders stale
@@ -66,8 +72,11 @@ TLA_JAR=/path/to/tla2tools.jar \
   TLA_CONFIG="$PWD/test/formal/SnapshotAssembly.cfg" \
   test/formal/check.sh
 
-# Run all default models
+# Run all default models and snapshot commit qualification (also requires Elixir)
 TLA_JAR=/path/to/tla2tools.jar test/formal/check_matrix.sh
+
+# Run only snapshot assembly and its negative commit qualification
+TLA_JAR=/path/to/tla2tools.jar elixir test/formal/check_snapshot_commit.exs
 
 # Also run the larger two-key, three-sequence anti-entropy state space
 TLA_JAR=/path/to/tla2tools.jar TLA_EXTENDED=1 test/formal/check_matrix.sh
