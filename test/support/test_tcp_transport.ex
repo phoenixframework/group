@@ -87,7 +87,11 @@ defmodule Group.TestTCPTransport do
 
   @doc false
   def connected?(group, remote_node) do
-    :ets.member(route_table(group), remote_node)
+    try do
+      :ets.member(route_table(group), remote_node)
+    rescue
+      ArgumentError -> false
+    end
   end
 
   @doc false
