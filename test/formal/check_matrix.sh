@@ -14,7 +14,7 @@ run_check() {
 }
 
 run_check GroupAntiEntropy GroupAntiEntropy
-run_check SnapshotAssembly SnapshotAssembly
+elixir "${script_dir}/check_snapshot_commit.exs"
 run_check PeerEviction PeerEviction
 run_check AuthorityProjection AuthorityProjection
 run_check AuthorityHint AuthorityHint

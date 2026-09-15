@@ -10,7 +10,7 @@ defmodule Group.MixProject do
       version: @version,
       elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
-      test_ignore_filters: [~r"^test/jepsen/", ~r"^test/mutation/"],
+      test_ignore_filters: [~r"^test/jepsen/", ~r"^test/mutation/", ~r"^test/formal/"],
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
