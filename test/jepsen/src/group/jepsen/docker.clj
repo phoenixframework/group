@@ -88,6 +88,7 @@
 (defn reset-oracle! [node]
   (exec-sh! node
             (str "rm -f /tmp/group-jepsen-persistent-events "
+                 "/tmp/group-jepsen-repair-coverage "
                  "/tmp/group-jepsen-cursor-marker-corruption && "
                  ": > /tmp/group-jepsen-unexpected-deaths")))
 
