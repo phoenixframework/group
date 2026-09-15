@@ -40,9 +40,10 @@
   (let [owners (->> snapshots vals (mapcat :owners) (map (juxt :token identity)) (into {}))
         registry-candidates
         (reduce (fn [by-key [_ owner]]
-                  (reduce (fn [entries {:keys [cluster key]}]
+                  (reduce (fn [entries {:keys [cluster key revision]}]
                             (update entries [(or cluster "root") key]
-                                    (fnil conj #{}) (:token owner)))
+                                    (fnil conj #{}) {:token (:token owner)
+                                                     :revision revision}))
                           by-key
                           (owner-entries owner :registrations)))
                 {}
@@ -55,9 +56,10 @@
                 registry-candidates)
         pg
         (reduce (fn [view [_ owner]]
-                  (reduce (fn [entries {:keys [cluster key]}]
+                  (reduce (fn [entries {:keys [cluster key revision]}]
                             (update-in entries [(or cluster "root") key]
-                                       (fnil conj #{}) (:token owner)))
+                                       (fnil conj #{}) {:token (:token owner)
+                                                        :revision revision}))
                           view
                           (owner-entries owner :memberships)))
                 (empty-view test #{})
@@ -176,11 +178,12 @@
                                      (concat
                                        (->> registry vals (mapcat vals) (remove nil?))
                                        (->> pg vals (mapcat vals) (mapcat identity)))))
+                           (map :token)
                            set)
         expected-tokens
         (set/union
-          (->> (:registry expected) vals (mapcat vals) (remove nil?) set)
-          (->> (:pg expected) vals (mapcat vals) (mapcat identity) set))
+          (->> (:registry expected) vals (mapcat vals) (remove nil?) (map :token) set)
+          (->> (:pg expected) vals (mapcat vals) (mapcat identity) (map :token) set))
         orphaned (set/difference actual-tokens live-tokens)
         missing-live (set/difference expected-tokens actual-tokens)
         latencies (operation-latencies history)

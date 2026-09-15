@@ -63,11 +63,29 @@
 (defn with-unexpected-death [op token]
   (assoc-in op [:value :unexpected-deaths] [{:token token, :reason ":boom"}]))
 
+(deftest compares-each-owner-recorded-revision-exactly
+  (let [owners [(owner "a" [(registration nil 0 2)] [(membership nil 0 3)])]
+        registry (assoc-in (empty-registry) ["root" 0] {:token "a" :revision 2})
+        pg (assoc-in (empty-pg) ["root" 0] [{:token "a" :revision 3}])
+        history (mapv #(snapshot-op % (str "n" %) (if (= 1 %) owners [])
+                                    registry pg) [1 2 3])]
+    (is (:valid? (model/analyze test-map history)))
+    (doseq [field [:registry :pg]
+            bad [{:token "a" :revision 1} {:token "a"} {:token "b" :revision 2}
+                 {:token "a" :revision "2"} nil]]
+      (let [changed (assoc-in history [1 :value field "root" 0]
+                             (if (= field :pg) [bad] bad))
+            result (model/analyze test-map changed)]
+        (is (false? (:valid? result)))
+        (is (contains? (:mismatched-views result) "n2"))))))
+
 (deftest accepts-an-exact-converged-multi-cluster-view
   (let [owners [(owner "a" [(registration nil 0 1) (registration "red" 1 2)] [])
                 (owner "b" [] [(membership nil 1 2) (membership "red" 0 3)])]
-        registry (public-view {0 "a", 1 nil} {0 nil, 1 "a"})
-        pg (public-view {0 [], 1 ["b"]} {0 ["b"], 1 []})
+        registry (public-view {0 {:token "a" :revision 1}, 1 nil}
+                              {0 nil, 1 {:token "a" :revision 2}})
+        pg (public-view {0 [], 1 [{:token "b" :revision 2}]}
+                        {0 [{:token "b" :revision 3}], 1 []})
         history [(snapshot-op 1 "n1" owners registry pg)
                  (snapshot-op 2 "n2" [] registry pg)
                  (snapshot-op 3 "n3" [] registry pg)]]
@@ -96,7 +114,7 @@
 
 (deftest rejects-zombies-missing-live-owners-and-divergence
   (let [live (owner "live" [(registration nil 0 1)] [])
-        stale-registry (assoc-in (empty-registry) ["root" 0] "dead")
+        stale-registry (assoc-in (empty-registry) ["root" 0] {:token "dead" :revision 1})
         result (model/analyze
                  test-map
                  [(snapshot-op 1 "n1" [live] stale-registry (empty-pg))
@@ -116,7 +134,8 @@
                  (snapshot-op 3 "n3" [] registry (empty-pg))]
         result (model/analyze test-map history)]
     (is (false? (:valid? result)))
-    (is (= {["root" 0] #{"a" "b"}} (:live-registry-conflicts result)))))
+    (is (= {["root" 0] #{{:token "a" :revision 1} {:token "b" :revision 2}}}
+           (:live-registry-conflicts result)))))
 
 (deftest rejects-an-unexpected-owner-death-even-after-cleanup
   (let [result (model/analyze
