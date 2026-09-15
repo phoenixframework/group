@@ -4,6 +4,7 @@ defmodule Group.JepsenCursorCapture do
             [
               Group.Jepsen.Driver,
               Group.Jepsen.Driver.Supervisor,
+              Group.Jepsen.RepairCoverage,
               Group.Jepsen.Transport.Stats,
               Group.Jepsen.Snapshot
             ]}
@@ -11,9 +12,19 @@ defmodule Group.JepsenCursorCapture do
 
   def start(path) do
     System.put_env("GROUP_JEPSEN_LIBRARY", "1")
+    Code.require_file(Path.join(Path.dirname(path), "repair_coverage.exs"))
     Code.require_file(path)
 
+    repair_path =
+      Path.join(
+        System.tmp_dir!(),
+        "group-jepsen-cursor-repair-#{Atom.to_string(node())}"
+      )
+
+    File.rm(repair_path)
+
     for starter <- [
+          fn -> Group.Jepsen.RepairCoverage.start_link(path: repair_path) end,
           fn -> Group.Jepsen.Transport.Stats.start_link([]) end,
           &start_group/0,
           fn ->
