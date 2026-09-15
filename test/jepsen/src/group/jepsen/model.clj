@@ -1,5 +1,6 @@
 (ns group.jepsen.model
   (:require [clojure.set :as set]
+            [group.jepsen.streams :as streams]
             [jepsen.checker :as checker]
             [jepsen.history :as history]))
 
@@ -91,6 +92,7 @@
    :peers (set (:peers snapshot))
    :unexpected-deaths (set (:unexpected-deaths snapshot))
    :conflict-evidence (:conflict-evidence snapshot)
+   :streams (:streams snapshot)
    :view (normalize-view test snapshot)
    :internal (stable-internal snapshot)})
 
@@ -197,6 +199,7 @@
                           [node fingerprints]))))
               relevant-observations)
         expected (expected-state test relevant-snapshots)
+        stream-errors (streams/errors relevant-snapshots)
         expected-view (select-keys expected [:registry :pg])
         views (into {} (map (fn [[node snapshot]]
                               [node (normalize-view test snapshot)]))
@@ -296,6 +299,7 @@
                     delta-run-coverage?
                     (empty? transport-profile-mismatches)
                     (empty? internal-errors)
+                    (empty? stream-errors)
                     (empty? (:conflicts expected))
                     (empty? mismatches)
                     (empty? unexpected-deaths)
@@ -317,6 +321,7 @@
      :min-delta-run-records min-delta-run-records
      :transport-profile-mismatches transport-profile-mismatches
      :internal-invariant-errors internal-errors
+     :stream-position-errors stream-errors
      :max-group-operation-latency-ms (/ max-latency-us 1000.0)
      :group-operation-latency-limit-ms (/ latency-limit-us 1000.0)
      :live-owner-count (count live-tokens)
