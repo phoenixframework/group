@@ -56,9 +56,65 @@ cannot masquerade as a current owner. Every history explicitly restarts one
 node after the deterministic conflict prelude, proving the checker does not
 mistake restart-sensitive instrumentation for missing protocol coverage.
 
+Registry-conflict exits are obligations, not trusted coverage counters. Before
+calling Group, each owner journals its registration attempt independently of
+Group's tables; it journals successful or rejected replies, unregisters, and
+cluster-intent removal as well. Drivers retain the victim token, key, and
+winner metadata from every conflict death. The checker reconstructs the
+victim's registrations, requires the reported winner to rank strictly higher
+by `{revision, token}`, and requires a matching historical winning claim in
+the same cluster and key. Only validated deaths count toward coverage.
+
+Registration calls interrupted by death or an indeterminate reply remain
+possible claims: Group may have installed them before the owner could record
+success. A definitive `:taken` reply excludes an attempt. Winning evidence is
+retained after unregister, death, and BEAM restart because delayed replicas
+can legitimately act on an older claim. Local journal order excludes winners
+first attempted after a death; the oracle does not invent a global clock or
+infer remote deletion delivery from wall time. This establishes independently
+witnessed possible winners, not the exact instant a replica learned a claim.
+
+The append-only conflict journal retains small operation records for the
+bounded campaign, not production ETS rows. Its path defaults to
+`/tmp/group-jepsen-conflict-evidence` inside each container and can be overridden
+with the driver's `:conflict_evidence_path` option. Corrupt or unreadable
+journals fail closed. At permanent retirement, the stopped-container collector
+archives and decodes the journal alongside unexpected deaths. The checker
+replays retired and surviving nodes' evidence together, without treating retired
+owners as live. Conflict archives are bounded to 64 MiB with ten-second command
+deadlines; missing or malformed archives fail the history.
+
+Each new history resets the running recorder through the harness socket after
+DB restart and before workload mutations. This clears disk and in-memory
+evidence together and initializes an empty journal, so repeated histories
+cannot inherit earlier conflict coverage.
+
+Checker qualification also loads the real Elixir
+Owner/Driver harness, injects valid and forged death reasons, exercises a
+register interrupted before its reply, and checks the emitted EDN with the
+Clojure lifecycle oracle.
+
+Repair coverage is receiver evidence, not transport admission. Before starting
+Group, the Jepsen VM compiles test-only wrappers around the existing delta-run
+and terminal snapshot-install functions. Each wrapper samples the same stream's
+cursor before and after its original body in one shard turn. Only positive
+committed advancement emits `applied-delta-run-records-peak`; a completed snapshot
+with a multi-chunk manifest emits `multi-chunk-snapshot-committed`. Duplicate
+prefixes do not contribute to the delta peak. Provisional chunks, missing
+terminal frames, rejected authority, and logical drops contribute neither.
+The wrapper installation fails if either expected boundary disappears.
+
+The receiver evidence owner persists increasing maxima outside the shard and
+reloads them after VM restart. A crash before persistence can lose evidence
+(failing coverage conservatively), but cannot create it. This instrumentation
+is shared by distribution, TCP, and chaos and changes no production BEAM or API.
+Sender `attempted-*` peaks remain diagnostics only. The pure checker reads the
+same EDN fixture that executable receiver regressions compare to live output.
+
 ## Requirements
 
 - Docker with Compose v2
+- Elixir/Mix with the repository dependencies installed (checker qualification)
 - Java 21 or newer
 - `curl`
 
