@@ -1,9 +1,17 @@
 System.put_env("GROUP_JEPSEN_LIBRARY", "1")
+Code.require_file("repair_coverage.exs", __DIR__)
 Code.require_file("node.exs", __DIR__)
 
 alias Group.Jepsen.{Driver, EDN, Snapshot}
 alias Group.Replica.Data
 
+repair_path =
+  Path.join(
+    System.tmp_dir!(),
+    "group-jepsen-metadata-repair-#{System.unique_integer([:positive])}"
+  )
+
+{:ok, _} = Group.Jepsen.RepairCoverage.start_link(path: repair_path)
 {:ok, _} = Group.Jepsen.Transport.Stats.start_link([])
 
 {:ok, _} =
@@ -74,3 +82,4 @@ Enum.each(originals, fn {table, rows} -> :ets.insert(table, rows) end)
 false = reincarnated.token == owner.token
 
 File.write!(hd(System.argv()), EDN.encode(%{healthy: healthy, corruptions: corruptions}))
+File.rm(repair_path)

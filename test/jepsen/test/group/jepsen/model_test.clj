@@ -402,7 +402,9 @@
                  history)]
     (is (false? (:valid? result)))
     (is (zero? (:delta-run-records-peak result)))
-    (is (= #{:applied-delta-run-records-peak :multi-chunk-snapshot-committed}
+    (is (= #{:applied-delta-run-records-peak
+             :multi-chunk-snapshot-committed
+             :registry-conflict-death}
            (:missing-transport-events result)))))
 
 (deftest rejects-internal-corruption-or-leftover-snapshot-staging
