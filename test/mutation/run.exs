@@ -310,7 +310,7 @@ defmodule Group.MutationCampaign do
         "         remote_replica_authority_hint(state.name, remote_node) == {generation, observed} do",
       faulty_source:
         "         elem(remote_replica_authority_hint(state.name, remote_node), 1) == observed do",
-      test: ["test/group_test.exs:3035"]
+      test: ["test/group_test.exs:3101"]
     },
     %{
       name: "install_incremental_after_newer_hint",
@@ -495,7 +495,7 @@ defmodule Group.MutationCampaign do
       file: "lib/group/replica.ex",
       correct_source: ":ok = Data.repair_local_replica_journal(name, shard_index)",
       faulty_source: ":ok",
-      test: ["test/group_test.exs:2588"]
+      test: ["test/group_test.exs:2624"]
     },
     %{
       name: "skip_index_crash_repair",

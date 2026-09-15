@@ -1124,16 +1124,16 @@ defmodule Group.DistributedTest do
           TestCluster.rpc!(node_a, Group, :members, [name, pg_key, [cluster: cluster]]) == []
       end)
 
-      # Remove both entries while A is disconnected. Reconnecting with an
-      # additive snapshot must not resurrect either entry on A.
-      assert :ok =
-               TestCluster.rpc!(node_b, Group, :unregister, [
-                 name,
-                 registry_key,
-                 [cluster: cluster]
-               ])
+      # Commit both removals at B before A can reconnect and request recovery.
+      unregister_args = [name, registry_key, [cluster: cluster]]
+      assert :ok = TestCluster.rpc!(node_b, Group, :unregister, unregister_args)
 
       TestCluster.rpc!(node_b, Process, :exit, [pg_pid, :kill])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group, :members, [name, pg_key, [cluster: cluster]]) == []
+      end)
+
       assert :ok = TestCluster.rpc!(node_a, Group, :connect, [name, cluster])
 
       TestCluster.assert_eventually(fn ->
@@ -4276,18 +4276,18 @@ defmodule Group.DistributedTest do
       control = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 0)])
       _state = TestCluster.rpc!(node_b, :sys, :get_state, [control])
 
-      messages = TestCluster.rpc!(node_b, Process, :info, [old_lane, :messages])
+      # Exact authority repair may overtake the incremental close, so no one
+      # queued message shape is stable. Shared authority is closed while this
+      # suspended lane still holds the rows that its restart must sweep.
+      assert match?(
+               {^reg_pid, _},
+               TestCluster.rpc!(node_b, Group, :lookup, [name, reg_key, [cluster: "game"]])
+             )
 
-      assert {:messages, queued} = messages
-
-      assert Enum.any?(queued, fn
-               {:replica_cluster_close_control_local, ^node_a, _generation, _revision,
-                [{"game", _epoch}]} ->
-                 true
-
-               _ ->
-                 false
-             end)
+      assert match?(
+               [{^pg_pid, _}],
+               TestCluster.rpc!(node_b, Group, :members, [name, pg_key, [cluster: "game"]])
+             )
 
       true = TestCluster.rpc!(node_b, Process, :exit, [old_lane, :kill])
 
