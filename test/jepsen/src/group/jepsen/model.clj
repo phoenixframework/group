@@ -174,6 +174,12 @@
     {:invalid invalid
      :validated-count (- (count deaths) (count invalid))}))
 
+(defn unexpected-operation-failures [history]
+  (->> history
+       (remove history/invoke?)
+       (filter #(= :unexpected (get-in % [:value :response :code])))
+       vec))
+
 (defn analyze [test history]
   (let [observations (snapshots-by-node history)
         snapshots (latest-snapshots history)
@@ -272,6 +278,7 @@
         (->> (concat (map :value (successful-snapshots history)) retirement-evidence)
              (mapcat :unexpected-deaths)
              set)
+        operation-failures (unexpected-operation-failures history)
         live-tokens (set (keys (:owners expected)))
         actual-tokens (->> views
                            vals
@@ -306,6 +313,7 @@
                     (empty? (:invalid conflicts))
                     (empty? evidence-errors)
                     (empty? missing-retirement-evidence)
+                    (empty? operation-failures)
                     (empty? orphaned)
                     (empty? missing-live)
                     (not latency-violation?))]
@@ -331,6 +339,7 @@
      :invalid-conflict-deaths (:invalid conflicts)
      :lifecycle-evidence-errors evidence-errors
      :missing-retirement-evidence missing-retirement-evidence
+     :unexpected-operation-failures operation-failures
      :orphaned-owner-tokens orphaned
      :missing-live-owner-tokens missing-live
      :expected expected-view}))
