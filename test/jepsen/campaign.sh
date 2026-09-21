@@ -80,7 +80,9 @@ for transport in "${transports[@]}"; do
         --min-delta-run-records "${min_delta_run_records}" \
         --transport "${transport}" \
         --scenario "${scenario}" >"${log}" 2>&1; then
-      valid_count="$(rg -c "Everything looks good" "${log}" || true)"
+      # Use a standard runner utility, and let read/command errors fail the
+      # campaign instead of silently turning them into zero valid histories.
+      valid_count="$(awk '/^Everything looks good/ { count++ } END { print count + 0 }' "${log}")"
 
       if [[ "${valid_count}" != "${test_count}" ]]; then
         echo "Failed ${transport}/${scenario}: expected ${test_count} valid histories, found ${valid_count:-0}" >&2
