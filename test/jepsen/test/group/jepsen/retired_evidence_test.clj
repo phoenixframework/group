@@ -40,7 +40,7 @@
 
 (deftest workload-reset-clears-the-running-conflict-recorder
   (let [calls (atom [])]
-    (with-redefs [docker/heal! (fn [_])
+    (with-redefs [docker/heal! #(swap! calls conj [:heal %])
                   docker/restart! #(swap! calls conj [:restart %])
                   docker/reset-oracle! #(swap! calls conj [:disk-reset %])
                   client/wait-listening! #(swap! calls conj [:listening %])
@@ -50,7 +50,8 @@
                   client/wait-ready! (fn [node _] (swap! calls conj [:ready node]))]
       (dotimes [_ 2]
         (db/setup! (group-db/db) {:nodes ["n1"]} "n1"))
-      (is (= (vec (mapcat identity (repeat 2 [[:restart "n1"] [:disk-reset "n1"]
+      (is (= (vec (mapcat identity (repeat 2 [[:restart "n1"] [:heal ["n1"]]
+                                             [:disk-reset "n1"]
                                              [:listening "n1"]
                                              ["n1" ["reset-conflict-evidence"]]
                                              [:ready "n1"]])))

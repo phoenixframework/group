@@ -1140,23 +1140,24 @@ defmodule Group.DistributedTest do
         node_b in TestCluster.rpc!(node_a, Group, :nodes, [name, cluster])
       end)
 
-      assert TestCluster.rpc!(node_a, Group, :lookup, [
-               name,
-               registry_key,
-               [cluster: cluster]
-             ]) == nil
-
-      assert TestCluster.rpc!(node_a, Group, :members, [name, pg_key, [cluster: cluster]]) == []
-
+      # Routing readiness is not a recovery barrier: replay can expose an old
+      # join before its leave. Require both removals and retained rows in the
+      # same converged observation, not immediately after route discovery.
       TestCluster.assert_eventually(fn ->
-        match?(
-          {^retained_registry_pid, %{from: :b, retained: true}},
-          TestCluster.rpc!(node_a, Group, :lookup, [
-            name,
-            retained_registry_key,
-            [cluster: cluster]
-          ])
-        ) and
+        TestCluster.rpc!(node_a, Group, :lookup, [
+          name,
+          registry_key,
+          [cluster: cluster]
+        ]) == nil and
+          TestCluster.rpc!(node_a, Group, :members, [name, pg_key, [cluster: cluster]]) == [] and
+          match?(
+            {^retained_registry_pid, %{from: :b, retained: true}},
+            TestCluster.rpc!(node_a, Group, :lookup, [
+              name,
+              retained_registry_key,
+              [cluster: cluster]
+            ])
+          ) and
           match?(
             [{^retained_pg_pid, %{from: :b, retained: true}}],
             TestCluster.rpc!(node_a, Group, :members, [

@@ -3385,6 +3385,10 @@ defmodule Group.AntiEntropyFaultRegressionTest do
       end
     end)
 
+    # Name registration precedes init/1. Wait for startup repair to finish
+    # before reading ETS directly; the transport remains in :drop mode.
+    TestCluster.flush_shards(context.node_b, name)
+
     assert TestCluster.rpc!(context.node_b, Group, :lookup, [name, registry_key]) == nil
     assert TestCluster.rpc!(context.node_b, Group, :members, [name, pg_key]) == []
 
