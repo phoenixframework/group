@@ -373,24 +373,34 @@ defmodule Group.AntiEntropyFaultRegressionTest do
     :ok = TestCluster.rpc!(context.node_a, Group, :connect, [name, cluster])
 
     TestCluster.assert_eventually(fn ->
-      observed =
-        TestCluster.rpc!(
-          context.node_b,
-          Group.Replica.Data,
-          :remote_cluster_epoch_observed_revision,
-          [name, context.node_a]
-        )
-
-      exact =
-        TestCluster.rpc!(
-          context.node_b,
-          Group.Replica.Data,
-          :remote_cluster_epoch_exact_revision,
-          [name, context.node_a]
-        )
-
-      is_integer(observed) and observed > exact_before and exact == exact_before
+      TestCluster.rpc!(
+        context.node_b,
+        Group.Replica.Data,
+        :remote_cluster_epoch_exact_revision,
+        [name, context.node_a]
+      ) > exact_before
     end)
+
+    exact_before_gap =
+      TestCluster.rpc!(
+        context.node_b,
+        Group.Replica.Data,
+        :remote_cluster_epoch_exact_revision,
+        [name, context.node_a]
+      )
+
+    receiver =
+      TestCluster.rpc!(context.node_b, Process, :whereis, [Group.Replica.shard_name(name, 0)])
+
+    :ok = TestCluster.rpc!(context.node_b, :sys, :suspend, [receiver])
+    :ok = TestCluster.rpc!(context.node_a, Group, :connect, [name, "authority-dirty/next"])
+
+    TestCluster.rpc!(
+      context.node_b,
+      Group.Replica.Data,
+      :observe_remote_cluster_epoch_revision,
+      [name, context.node_a, exact_before_gap + 1]
+    )
 
     source =
       TestCluster.rpc!(context.node_a, Process, :whereis, [Group.Replica.shard_name(name, 0)])
@@ -401,8 +411,7 @@ defmodule Group.AntiEntropyFaultRegressionTest do
       _ = TestCluster.resume_shard_if_alive(context.node_a, name, 0)
     end)
 
-    old_receiver =
-      TestCluster.rpc!(context.node_b, Process, :whereis, [Group.Replica.shard_name(name, 0)])
+    old_receiver = receiver
 
     true = TestCluster.rpc!(context.node_b, Process, :exit, [old_receiver, :kill])
 

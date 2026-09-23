@@ -153,13 +153,13 @@ defmodule Group.Replica do
   retain mailbox order. Flushes group records by target and stream. Size, age,
   control/routing barriers, and idle timers bound the delay.
 
-  Incremental cluster controls are generation fenced, receiver batched, and
+  Incremental cluster controls are generation fenced, and
   installed only by shard 0 into the node-wide authority table; controls that
   arrive on another lane are forwarded locally to that single owner. Revisions
   must be contiguous. A gap records the highest observation, fences every lane,
   and requests an exact hello instead of applying a partial authority set. The
-  last exact revision, complete applied revision, and highest observed revision
-  are distinct. The Data owner compare-and-installs an incremental batch only
+  last proven exact revision, complete applied revision, and highest observed
+  revision are distinct. The Data owner compare-and-installs an incremental control only
   when its expected revision still matches the applied revision and persisted
   hint. Shard-local lane readiness is separate from shared authority, so no
   epoch map is copied per shard. On shard restart, constant-size retained
@@ -168,7 +168,7 @@ defmodule Group.Replica do
   lane deletes its own view only after purging its rows/cursors, so shard 0
   cannot erase a sibling's restart breadcrumb. Shard 0 also reconstructs an
   exact-hello obligation whenever the persisted observed authority revision is
-  newer than the last exact revision. If a registry conflict is reconciled
+  newer than the last proven exact revision. If a registry conflict is reconciled
   while one retained claim is temporarily fenced by such an authority gap, the
   lane remembers only that key and reprojects it when the exact view is
   installed. This avoids a shard-wide claim scan while ensuring a current
@@ -690,14 +690,10 @@ defmodule Group.Replica do
     if state.shard_index == 0 do
       remote_node = node(remote_pid)
 
-      controls =
-        collect_replica_cluster_controls(
-          :replica_cluster_open,
-          remote_pid,
-          generation,
-          [{revision, epochs}],
-          state.replicated_sender_buffer_size - 1
-        )
+      # Open and close controls share one revision sequence. Selectively
+      # receiving more opens would pull them past an earlier queued close and
+      # manufacture a gap that forces a full authority hello.
+      controls = [{revision, epochs}]
 
       case accepted_replica_cluster_epochs(state, remote_node, generation, controls) do
         {:accept, expected_revision, observed_revision, epochs} ->
@@ -726,7 +722,7 @@ defmodule Group.Replica do
 
               state =
                 state
-                |> mark_authority_dirty(remote_node)
+                |> retain_dirty_authority_if_inexact(remote_node)
                 |> purge_closed_remote_epochs(remote_node, stale)
                 |> purge_superseded_remote_streams(remote_node, epochs)
                 |> purge_remote_streams_outside_authority(remote_node)
@@ -818,14 +814,7 @@ defmodule Group.Replica do
     state = flush_pending_replicated_message_barrier(state)
     remote_node = node(remote_pid)
 
-    controls =
-      collect_replica_cluster_controls(
-        :replica_cluster_close,
-        remote_pid,
-        generation,
-        [{revision, epochs}],
-        state.replicated_sender_buffer_size - 1
-      )
+    controls = [{revision, epochs}]
 
     case accepted_replica_cluster_epochs(state, remote_node, generation, controls) do
       {:accept, expected_revision, observed_revision, epochs} ->
@@ -851,7 +840,7 @@ defmodule Group.Replica do
 
             state =
               state
-              |> mark_cluster_control_dirty(remote_node)
+              |> retain_dirty_authority_if_inexact(remote_node)
               |> purge_closed_remote_epochs(remote_node, closed)
               |> purge_remote_streams_outside_authority(remote_node)
 
@@ -1568,11 +1557,20 @@ defmodule Group.Replica do
         {:cluster_connect, clusters, epochs} ->
           do_cluster_connect(state, clusters, epochs)
 
+        {:cluster_connect, clusters, epochs, revision} ->
+          do_cluster_connect(state, clusters, epochs, revision)
+
+        :cluster_connect_barrier ->
+          {:ok, state}
+
         {:cluster_disconnect, clusters} ->
           do_cluster_disconnect(state, clusters)
 
         {:cluster_disconnect, clusters, epochs} ->
           do_cluster_disconnect(state, clusters, epochs)
+
+        {:cluster_disconnect, clusters, epochs, revision} ->
+          do_cluster_disconnect(state, clusters, epochs, revision)
 
         _ ->
           {{:error, :invalid_local_request}, state}
@@ -2140,7 +2138,10 @@ defmodule Group.Replica do
         Enum.map(clusters, &{&1, Data.local_cluster_epoch(state.name, &1)})
       )
 
-  defp do_cluster_connect(state, clusters, epochs) do
+  defp do_cluster_connect(state, clusters, epochs),
+    do: do_cluster_connect(state, clusters, epochs, Data.local_cluster_epoch_revision(state.name))
+
+  defp do_cluster_connect(state, clusters, epochs, revision) do
     state = flush_pending_replicated_sender_barrier(state)
     %{name: name} = state
 
@@ -2154,8 +2155,7 @@ defmodule Group.Replica do
       send_remote_shard_message(
         state,
         target_node,
-        {:replica_cluster_open, self(), Data.generation(name),
-         Data.local_cluster_epoch_revision(name), epochs}
+        {:replica_cluster_open, self(), Data.generation(name), revision, epochs}
       )
     end
 
@@ -2170,7 +2170,16 @@ defmodule Group.Replica do
         Enum.map(clusters, &{&1, Data.closed_local_cluster_epoch(state.name, &1)})
       )
 
-  defp do_cluster_disconnect(state, _clusters, epochs) do
+  defp do_cluster_disconnect(state, clusters, epochs),
+    do:
+      do_cluster_disconnect(
+        state,
+        clusters,
+        epochs,
+        Data.local_cluster_epoch_revision(state.name)
+      )
+
+  defp do_cluster_disconnect(state, _clusters, epochs, revision) do
     epochs =
       Enum.filter(epochs, fn
         {cluster, epoch} when not is_nil(epoch) ->
@@ -2186,12 +2195,22 @@ defmodule Group.Replica do
       end)
 
     case epochs do
-      [] -> {:ok, state}
-      epochs -> do_cluster_disconnect_epochs(state, epochs)
+      [] ->
+        if state.shard_index == 0 do
+          broadcast_to_peers(
+            state,
+            {:replica_cluster_close, self(), Data.generation(state.name), revision, []}
+          )
+        end
+
+        {:ok, state}
+
+      epochs ->
+        do_cluster_disconnect_epochs(state, epochs, revision)
     end
   end
 
-  defp do_cluster_disconnect_epochs(state, epochs) do
+  defp do_cluster_disconnect_epochs(state, epochs, revision) do
     state = flush_pending_replicated_sender_barrier(state)
     %{name: name, shard_index: shard} = state
     clusters = Enum.map(epochs, &elem(&1, 0))
@@ -2254,8 +2273,7 @@ defmodule Group.Replica do
     if shard == 0 do
       broadcast_to_peers(
         state,
-        {:replica_cluster_close, self(), Data.generation(name),
-         Data.local_cluster_epoch_revision(name), epochs}
+        {:replica_cluster_close, self(), Data.generation(name), revision, epochs}
       )
     end
 
@@ -3232,24 +3250,6 @@ defmodule Group.Replica do
     }
   end
 
-  defp collect_replica_cluster_controls(_tag, _remote_pid, _generation, acc, 0),
-    do: Enum.reverse(acc)
-
-  defp collect_replica_cluster_controls(tag, remote_pid, generation, acc, remaining) do
-    receive do
-      {^tag, ^remote_pid, ^generation, revision, epochs} ->
-        collect_replica_cluster_controls(
-          tag,
-          remote_pid,
-          generation,
-          [{revision, epochs} | acc],
-          remaining - 1
-        )
-    after
-      0 -> Enum.reverse(acc)
-    end
-  end
-
   defp accepted_replica_cluster_epochs(state, remote_node, generation, controls) do
     case {
       Data.remote_replica_authority_hint(state.name, remote_node),
@@ -3295,8 +3295,11 @@ defmodule Group.Replica do
 
   defp contiguous_cluster_controls?(controls, expected_revision) do
     Enum.reduce_while(controls, expected_revision, fn
-      {^expected_revision, _epochs}, ^expected_revision -> {:cont, expected_revision + 1}
-      _control, _expected -> {:halt, false}
+      {revision, _epochs}, next_revision when revision == next_revision ->
+        {:cont, next_revision + 1}
+
+      _control, _expected ->
+        {:halt, false}
     end) != false
   end
 
@@ -3306,6 +3309,15 @@ defmodule Group.Replica do
       | cluster_control_dirty:
           Map.put(state.cluster_control_dirty, remote_node, monotonic_millis())
     }
+  end
+
+  defp retain_dirty_authority_if_inexact(state, remote_node) do
+    if Data.remote_cluster_epoch_exact_revision(state.name, remote_node) ==
+         Data.remote_cluster_epoch_observed_revision(state.name, remote_node) do
+      %{state | cluster_control_dirty: Map.delete(state.cluster_control_dirty, remote_node)}
+    else
+      mark_cluster_control_dirty(state, remote_node)
+    end
   end
 
   defp mark_authority_dirty(%{shard_index: 0} = state, remote_node) do
@@ -4364,12 +4376,53 @@ defmodule Group.Replica do
         state
 
       runs ->
-        outgoing_replica_message(
-          state,
-          target_node,
-          {:delta_batch, WireProtocol.version(), Enum.reverse(runs)}
-        )
+        runs = Enum.reverse(runs)
+
+        case emit_replica_delta_batch(state, target_node, runs) do
+          :ok -> state
+          :disconnected -> state
+          :busy -> send_replica_repair_records(state, target_node, runs)
+        end
     end
+  end
+
+  # A distribution link can have enough headroom for heartbeats and small
+  # frames while rejecting a full catch-up batch. Retrying that same batch on
+  # every anti-entropy turn makes no progress. Once the batch reports busy,
+  # send an ordered record-at-a-time prefix and stop at the first record that
+  # cannot be accepted. The receiver cursor then advances by whatever fit, so
+  # the next advertised head resumes after that prefix instead of retrying the
+  # permanently-too-large batch from the same sequence.
+  defp send_replica_repair_records(state, target_node, runs) do
+    Enum.reduce_while(runs, state, fn
+      {stream_id, _first_seq, records, advertised_head}, acc ->
+        result =
+          Enum.reduce_while(records, :ok, fn {seq, _mutations} = record, :ok ->
+            case emit_replica_delta_batch(
+                   acc,
+                   target_node,
+                   [{stream_id, seq, [record], advertised_head}]
+                 ) do
+              :ok -> {:cont, :ok}
+              result when result in [:busy, :disconnected] -> {:halt, result}
+            end
+          end)
+
+        case result do
+          :ok -> {:cont, acc}
+          _blocked -> {:halt, acc}
+        end
+    end)
+  end
+
+  defp emit_replica_delta_batch(state, target_node, runs) do
+    state.replica_transport.outgoing(
+      state.name,
+      target_node,
+      state.shard_index,
+      {:delta_batch, WireProtocol.version(), runs},
+      state.replica_transport_opts
+    )
   end
 
   defp replica_repair(state, target_node, stream_id, next_seq) do

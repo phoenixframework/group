@@ -13,7 +13,13 @@ defmodule Group.TestReplicaTransport do
   def set_mode(group, mode)
       when mode in @simple_modes or
              (is_tuple(mode) and tuple_size(mode) == 2 and
-                elem(mode, 0) in [:drop_types, :duplicate_types, :capture_drop, :capture_pass]) or
+                elem(mode, 0) in [
+                  :drop_types,
+                  :duplicate_types,
+                  :capture_drop,
+                  :capture_pass,
+                  :busy_delta_above
+                ]) or
              (is_tuple(mode) and tuple_size(mode) == 3 and elem(mode, 0) == :delay_types) or
              (is_tuple(mode) and tuple_size(mode) == 3 and
                 elem(mode, 0) == :accept_types_up_to) or
@@ -103,6 +109,22 @@ defmodule Group.TestReplicaTransport do
       {:capture_pass, types} ->
         if message_type(message) in types, do: capture(group, target_node, shard, message)
         forward(group, target_node, shard, message)
+
+      {:busy_delta_above, max_records} when is_integer(max_records) and max_records > 0 ->
+        case message do
+          {:delta_batch, _version, runs} ->
+            record_count =
+              Enum.reduce(runs, 0, fn {_stream_id, _first_seq, records, _head}, count ->
+                count + length(records)
+              end)
+
+            if record_count > max_records,
+              do: :busy,
+              else: forward(group, target_node, shard, message)
+
+          _other ->
+            forward(group, target_node, shard, message)
+        end
 
       {:capture_drop_pause_once, types, observer} ->
         if message_type(message) in types do

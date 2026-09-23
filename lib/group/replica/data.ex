@@ -131,13 +131,14 @@ defmodule Group.Replica.Data do
 
   ### replication_meta and epoch tables
 
-  `replication_meta` holds the local origin generation, last exact, complete applied, and
+  `replication_meta` holds the local origin generation, last proven exact, complete applied, and
   highest observed authority revisions, a persisted `{generation, revision}` authority hint,
   per-shard installed remote views, journal metadata, and one append counter per shard.
   `local_cluster_epochs` and `closed_local_cluster_epochs` fence local named-cluster
   lifetimes; `remote_cluster_epochs` is the node-wide authority installed by shard 0.
   The three revision roles are separate so a partial control burst cannot be promoted to
-  authoritative membership. Contiguous incremental controls compare-and-install against the
+  authoritative membership. An incremental control extends exact authority only when its
+  predecessor was exact. Contiguous incremental controls compare-and-install against the
   current generation, applied revision, observed revision, and hint in this GenServer turn;
   a concurrent heartbeat makes the whole update stale. A newer hint atomically fences every
   lane view, but cannot be created after exact authority has been retired; only a later exact
@@ -2517,6 +2518,13 @@ defmodule Group.Replica.Data do
 
     if durable?, do: project_activated_local_clusters(state.name, clusters)
 
+    if durable? and clusters != [] do
+      Group.Replica.local_cast(
+        Group.Replica.shard_name(state.name, 0),
+        {:cluster_connect, clusters, epochs, local_cluster_epoch_revision(state.name)}
+      )
+    end
+
     {epochs, state}
   end
 
@@ -2553,7 +2561,7 @@ defmodule Group.Replica.Data do
       cast_cluster_lifecycle(
         state.name,
         0..(state.num_shards - 1),
-        {:cluster_disconnect, clusters, epochs}
+        {:cluster_disconnect, clusters, epochs, local_cluster_epoch_revision(state.name)}
       )
     end
 
@@ -2780,6 +2788,9 @@ defmodule Group.Replica.Data do
          expected_revision,
          revision
        ) do
+      exact_predecessor? =
+        remote_cluster_epoch_exact_revision(state.name, remote_node) == expected_revision
+
       observe_remote_cluster_revision(state.name, remote_node, revision, state.num_shards)
 
       stale_epochs =
@@ -2801,6 +2812,13 @@ defmodule Group.Replica.Data do
         replication_meta_table(state.name),
         {{:remote_epoch_revision, remote_node}, revision}
       )
+
+      if exact_predecessor? do
+        :ets.insert(
+          replication_meta_table(state.name),
+          {{:remote_epoch_exact, remote_node}, revision}
+        )
+      end
 
       {:reply, {:ok, stale_epochs}, state}
     else
@@ -2920,6 +2938,9 @@ defmodule Group.Replica.Data do
          expected_revision,
          revision
        ) do
+      exact_predecessor? =
+        remote_cluster_epoch_exact_revision(state.name, remote_node) == expected_revision
+
       observe_remote_cluster_revision(state.name, remote_node, revision, state.num_shards)
 
       closed =
@@ -2941,6 +2962,13 @@ defmodule Group.Replica.Data do
         replication_meta_table(state.name),
         {{:remote_epoch_revision, remote_node}, revision}
       )
+
+      if exact_predecessor? do
+        :ets.insert(
+          replication_meta_table(state.name),
+          {{:remote_epoch_exact, remote_node}, revision}
+        )
+      end
 
       {:reply, {:ok, closed}, state}
     else

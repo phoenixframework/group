@@ -4092,6 +4092,63 @@ defmodule Group.DistributedTest do
     end
 
     @tag timeout: 60_000
+    test "busy catch-up deltas make progress through smaller ordered repairs" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_busy_catchup_#{System.unique_integer([:positive])}"
+
+      opts = [
+        name: name,
+        shards: 1,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_sender_buffer_size: 8,
+        replicated_anti_entropy_interval: 25,
+        replicated_peer_lease_timeout: 1_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_b in TestCluster.rpc!(node_a, Group, :nodes, [name])
+      end)
+
+      :ok = TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [name, :drop])
+
+      registrations =
+        for index <- 1..8 do
+          key = "anti-entropy/busy-catchup/#{index}"
+          {key, TestCluster.spawn_register(node_a, name, key, %{index: index})}
+        end
+
+      TestCluster.flush_shards(node_a, name)
+
+      assert Enum.all?(registrations, fn {key, _pid} ->
+               TestCluster.rpc!(node_b, Group, :lookup, [name, key]) == nil
+             end)
+
+      :ok =
+        TestCluster.rpc!(node_a, Group.TestReplicaTransport, :set_mode, [
+          name,
+          {:busy_delta_above, 1}
+        ])
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(registrations, fn {key, pid} ->
+            match?(
+              {^pid, _meta},
+              TestCluster.rpc!(node_b, Group, :lookup, [name, key])
+            )
+          end)
+        end,
+        timeout: 5_000,
+        interval: 25
+      )
+    end
+
+    @tag timeout: 60_000
     test "a pruned gap falls back to an exact origin snapshot and removes stale rows" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
@@ -4494,7 +4551,7 @@ defmodule Group.DistributedTest do
             false
         end)
 
-      {:replica_hello, _remote_pid, _version, _generation, full_revision, _epochs, _transport,
+      {:replica_hello, _remote_pid, _version, _generation, _full_revision, _epochs, _transport,
        _descriptor} = duplicate_full
 
       Enum.each(1..128, fn _ -> send(b_control, duplicate_full) end)
@@ -4547,14 +4604,14 @@ defmodule Group.DistributedTest do
                Group.Replica.Data,
                :remote_cluster_epoch_exact_revision,
                [name, node_a]
-             ) == full_revision
+             ) == latest_revision
 
       assert TestCluster.rpc!(
                node_b,
                Group.Replica.Data,
                :remote_view_cluster_epoch_revision,
                [name, 2, node_a]
-             ) == full_revision
+             ) == latest_revision
     end
 
     @tag timeout: 60_000
@@ -5403,6 +5460,176 @@ defmodule Group.DistributedTest do
 
       assert :ok =
                TestCluster.rpc!(node_b, Group.TestCluster, :assert_replica_consistent, [name])
+    end
+
+    @tag timeout: 60_000
+    test "contiguous cluster controls do not request a quiet full authority hello" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"quiet_cluster_controls_#{System.unique_integer([:positive])}"
+
+      start_group_on_peers(peers,
+        name: name,
+        shards: 1,
+        replicated_anti_entropy_interval: 100,
+        replicated_peer_lease_timeout: 5_000
+      )
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      :ok = TestCluster.rpc!(node_a, Group, :connect, [name, "tenant/quiet"])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_cluster_epoch_observed_revision, [
+          name,
+          node_a
+        ]) == 1
+      end)
+
+      sender = TestCluster.rpc!(node_a, Process, :whereis, [Group.Replica.shard_name(name, 0)])
+      :ok = TestCluster.rpc!(node_a, :sys, :suspend, [sender])
+      on_exit(fn -> TestCluster.rpc!(node_a, Group.TestCluster, :resume_if_alive, [sender]) end)
+
+      Process.sleep(350)
+
+      {:messages, sender_messages} = TestCluster.rpc!(node_a, Process, :info, [sender, :messages])
+
+      refute Enum.any?(sender_messages, fn
+               {:replica_hello_request, remote_pid} -> node(remote_pid) == node_b
+               _ -> false
+             end)
+    end
+
+    @tag timeout: 60_000
+    test "queued cluster opens use their own revisions without full authority repair" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"ordered_cluster_controls_#{System.unique_integer([:positive])}"
+
+      start_group_on_peers(peers,
+        name: name,
+        shards: 1,
+        replicated_anti_entropy_interval: 60_000,
+        replicated_peer_lease_timeout: 120_000
+      )
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      installs_before =
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_authority_install_count, [
+          name,
+          node_a
+        ])
+
+      sender =
+        TestCluster.rpc!(node_a, Process, :whereis, [Group.Replica.shard_name(name, 0)])
+
+      receiver =
+        TestCluster.rpc!(node_b, Process, :whereis, [Group.Replica.shard_name(name, 0)])
+
+      :ok = TestCluster.rpc!(node_a, :sys, :suspend, [sender])
+      :ok = TestCluster.rpc!(node_b, :sys, :suspend, [receiver])
+      on_exit(fn -> TestCluster.rpc!(node_a, Group.TestCluster, :resume_if_alive, [sender]) end)
+      on_exit(fn -> TestCluster.rpc!(node_b, Group.TestCluster, :resume_if_alive, [receiver]) end)
+
+      clusters = for i <- 1..32, do: "tenant/queued/#{i}"
+
+      tasks =
+        for cluster <- clusters do
+          Task.async(fn -> TestCluster.rpc!(node_a, Group, :connect, [name, cluster]) end)
+        end
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_a, Group.Replica.Data, :local_cluster_epoch_revision, [name]) ==
+          length(clusters)
+      end)
+
+      :ok = TestCluster.rpc!(node_a, :sys, :resume, [sender])
+      assert Enum.all?(Task.await_many(tasks, 20_000), &(&1 == :ok))
+
+      queued_revisions = fn ->
+        {:messages, messages} = TestCluster.rpc!(node_b, Process, :info, [receiver, :messages])
+
+        for {:replica_cluster_open, remote_pid, _generation, revision, _epochs} <- messages,
+            node(remote_pid) == node_a,
+            do: revision
+      end
+
+      TestCluster.assert_eventually(fn -> length(queued_revisions.()) == length(clusters) end)
+      assert queued_revisions.() == Enum.to_list(1..length(clusters))
+
+      :ok = TestCluster.rpc!(node_a, :sys, :suspend, [sender])
+      :ok = TestCluster.rpc!(node_b, :sys, :resume, [receiver])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_cluster_epoch_observed_revision, [
+          name,
+          node_a
+        ]) == length(clusters)
+      end)
+
+      {:messages, sender_messages} = TestCluster.rpc!(node_a, Process, :info, [sender, :messages])
+
+      refute Enum.any?(sender_messages, fn
+               {:replica_hello_request, remote_pid} -> node(remote_pid) == node_b
+               _ -> false
+             end)
+
+      :ok = TestCluster.rpc!(node_a, :sys, :resume, [sender])
+
+      assert TestCluster.rpc!(
+               node_b,
+               Group.Replica.Data,
+               :remote_authority_install_count,
+               [name, node_a]
+             ) == installs_before
+
+      :ok = TestCluster.rpc!(node_b, :sys, :suspend, [receiver])
+      :ok = TestCluster.rpc!(node_a, Group, :connect, [name, "tenant/transient"])
+      :ok = TestCluster.rpc!(node_a, Group, :disconnect, [name, "tenant/transient"])
+      :ok = TestCluster.rpc!(node_a, Group, :connect, [name, "tenant/after-close"])
+
+      {:messages, queued_messages} =
+        TestCluster.rpc!(node_b, Process, :info, [receiver, :messages])
+
+      queued_controls =
+        for {kind, remote_pid, _generation, revision, _epochs} <- queued_messages,
+            kind in [:replica_cluster_open, :replica_cluster_close],
+            node(remote_pid) == node_a,
+            do: {kind, revision}
+
+      assert queued_controls == [
+               {:replica_cluster_open, 33},
+               {:replica_cluster_close, 34},
+               {:replica_cluster_open, 35}
+             ]
+
+      :ok = TestCluster.rpc!(node_a, :sys, :suspend, [sender])
+      :ok = TestCluster.rpc!(node_b, :sys, :resume, [receiver])
+
+      TestCluster.assert_eventually(fn ->
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_cluster_epoch_observed_revision, [
+          name,
+          node_a
+        ]) == 35
+      end)
+
+      {:messages, sender_messages} = TestCluster.rpc!(node_a, Process, :info, [sender, :messages])
+
+      refute Enum.any?(sender_messages, fn
+               {:replica_hello_request, remote_pid} -> node(remote_pid) == node_b
+               _ -> false
+             end)
+
+      :ok = TestCluster.rpc!(node_a, :sys, :resume, [sender])
     end
 
     @tag timeout: 120_000

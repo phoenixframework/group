@@ -420,17 +420,17 @@ cluster-epoch revision changes, the receiver requests a fresh authoritative
 hello; if heartbeats stop, lease expiry purges that origin's complete local
 view and discovery probes allow it to rejoin later.
 
-Incremental cluster open/close controls are generation fenced, receiver
-batched, and installed by shard 0 into one node-wide authority table. The
-highest observed revision keeps heartbeats constant-size during a burst; after
-the burst becomes quiet, one authoritative hello closes any gaps left by
-dropped or reordered controls. Per-shard view rows record only constant-size
-lane readiness; they do not copy the epoch map. The highest observed
-incremental revision, complete applied revision, and last exact revision are
-tracked separately. Data installs a contiguous incremental batch only if its
-expected generation/revision still matches the applied authority, observation,
-and persisted hint in the same serialized callback; a raced heartbeat rejects
-the whole batch. A persisted `{generation, revision}` hint fences every lane
+Incremental cluster open/close controls are generation fenced, processed in
+revision order, and installed by shard 0 into one node-wide authority table.
+Each contiguous control extends exact authority when its predecessor was
+exact; a missing or reordered control requests a full authoritative hello.
+Per-shard view rows record only constant-size lane readiness; they do not copy
+the epoch map. The highest observed incremental revision, complete applied
+revision, and last proven exact revision are tracked separately. Data installs
+a contiguous incremental control only if its expected generation/revision
+still matches the applied authority, observation, and persisted hint in the
+same serialized callback; a raced heartbeat rejects that control. A persisted
+`{generation, revision}` hint fences every lane
 when any heartbeat observes newer authority. It can refine only an already
 known peer: after complete retirement, delayed heartbeats and lane hellos cannot
 recreate authority, a transport route, or a lease. Only an exact dist-Erlang

@@ -878,6 +878,9 @@ defmodule GroupTest.Clusters do
             {:group_local_request, _alias, {:cluster_disconnect, [^cluster], _epochs}} ->
               true
 
+            {:group_local_request, _alias, {:cluster_disconnect, [^cluster], _epochs, _revision}} ->
+              true
+
             {:group_local_request, _caller, _ref, {:cluster_disconnect, [^cluster]}} ->
               true
 

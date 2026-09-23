@@ -253,10 +253,10 @@ an origin that cannot emit them.
   exact snapshot. Delayed cleanup rechecks shared authority before deleting
   routes, and a lane hello is not reported `peer_up` until authority admits it.
 - Incremental named-cluster open/close controls are generation fenced and
-  batched, but shard 0 is their only node-wide authority writer; controls
-  arriving on other lanes are forwarded locally. Revisions must be contiguous.
-  A gap fences every lane and requests an exact hello instead of applying a
-  partial authority set.
+  processed in revision order; shard 0 is their only node-wide authority
+  writer. Controls arriving on other lanes are forwarded locally. Contiguous
+  controls extend proven exact authority. A gap fences every lane and requests
+  an exact hello instead of applying a partial authority set.
 - Local cluster close uses a temporary all-shard completion barrier. The last
   shard removes routing/epoch rows; restart repair completes abandoned closes,
   and reconnect waits so an old close cannot erase new writes.
@@ -291,8 +291,8 @@ FIFO local-request turn to prevent replica pressure from starving callers.
 2. Exact snapshots replace one origin slice; they are never additive merges.
 3. Authority requires generation, complete applied epoch revision, a matching
    persisted observation hint, and installed lane readiness. Observed
-   heartbeats alone are not authority; the last exact snapshot revision remains
-   separate while a contiguous incremental update is applied. Exact
+   heartbeats alone are not authority; a contiguous incremental update extends
+   proven exact authority only when its predecessor was exact. Exact
    authority and its shared-cluster routing projection are installed atomically.
    Local activation is projected atomically; deactivation cleanup is durable
    before its initiating caller can disappear.

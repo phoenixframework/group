@@ -1150,15 +1150,12 @@ defmodule Group do
   def connect_clusters(name, clusters, timeout)
       when is_atom(name) and is_list(clusters) and is_integer(timeout) do
     timeout = Data.await_closed_local_clusters(name, clusters, timeout)
-    epochs = Data.activate_local_clusters_durable(name, clusters)
+    _epochs = Data.activate_local_clusters_durable(name, clusters)
 
-    notify_shard = :rand.uniform(get_config(name).num_shards) - 1
-
-    Replica.local_request(
-      Replica.shard_name(name, notify_shard),
-      {:cluster_connect, clusters, epochs},
-      timeout
-    )
+    # Data enqueues the revision-stamped announcement before replying. This
+    # request waits for shard zero to process that announcement before connect
+    # returns, without letting concurrent callers reorder announcements.
+    Replica.local_request(Replica.shard_name(name, 0), :cluster_connect_barrier, timeout)
   end
 
   @doc false
