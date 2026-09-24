@@ -127,7 +127,8 @@ defmodule Group.ReplicaSnapshotDistributedTest do
         name,
         node_b,
         0,
-        {:need, Group.Replica.WireProtocol.version(), stream_id, 1}
+        {:needs, Group.Replica.WireProtocol.version(),
+         [{stream_id, 1, local_head(node_a, name, stream_id)}]}
       ])
 
     assert_receive {:replica_transport_paused, worker, ^name, :snapshot_chunk}, 5_000
@@ -174,7 +175,8 @@ defmodule Group.ReplicaSnapshotDistributedTest do
         name,
         node_b,
         0,
-        {:need, Group.Replica.WireProtocol.version(), stream_id, 1}
+        {:needs, Group.Replica.WireProtocol.version(),
+         [{stream_id, 1, local_head(node_a, name, stream_id)}]}
       ])
 
     TestCluster.assert_eventually(fn ->
@@ -986,7 +988,8 @@ defmodule Group.ReplicaSnapshotDistributedTest do
         name,
         node_b,
         0,
-        {:needs, Group.Replica.WireProtocol.version(), [{stream_id, next_seq}]}
+        {:needs, Group.Replica.WireProtocol.version(),
+         [{stream_id, next_seq, local_head(node_a, name, stream_id)}]}
       ])
 
     TestCluster.assert_eventually(
@@ -1048,7 +1051,8 @@ defmodule Group.ReplicaSnapshotDistributedTest do
         name,
         node_b,
         0,
-        {:needs, Group.Replica.WireProtocol.version(), [{stream_id, 1}]}
+        {:needs, Group.Replica.WireProtocol.version(),
+         [{stream_id, 1, local_head(node_a, name, stream_id)}]}
       ])
 
     source = TestCluster.rpc!(node_a, Process, :whereis, [Group.Replica.shard_name(name, 0)])
@@ -1116,6 +1120,13 @@ defmodule Group.ReplicaSnapshotDistributedTest do
 
   defp local_stream(node, name, cluster) do
     TestCluster.rpc!(node, Group.Replica.Data, :local_stream_id, [name, 0, cluster])
+  end
+
+  defp local_head(node, name, stream_id) do
+    {_floor, head, _applied} =
+      TestCluster.rpc!(node, Group.Replica.Data, :replica_stream_head, [name, 0, stream_id])
+
+    head
   end
 
   defp replica_cursor(node, name, stream_id) do

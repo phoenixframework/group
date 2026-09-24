@@ -19,7 +19,7 @@ defmodule Group.MutationCampaign do
         "        WireProtocol.stream_generation(stream_id) ==\n" <>
           "          Data.remote_generation(state.name, source_node) and",
       faulty_source: "        true and",
-      test: ["test/distributed_test.exs:5487"]
+      test: ["test/distributed_test.exs:5842"]
     },
     %{
       name: "accept_old_epoch",
@@ -28,14 +28,14 @@ defmodule Group.MutationCampaign do
         "        WireProtocol.stream_epoch(stream_id) ==\n" <>
           "          Data.remote_cluster_epoch(state.name, source_node, cluster) and",
       faulty_source: "        true and",
-      test: ["test/distributed_test.exs:4890"]
+      test: ["test/distributed_test.exs:5062"]
     },
     %{
       name: "advance_cursor_across_gap",
       file: "lib/group/replica.ex",
       correct_source: """
               [{first_seq, _mutations} | _] when first_seq > cursor + 1 ->
-                request_replica_need(state, source_node, stream_id, cursor + 1)
+                request_replica_need(state, source_node, stream_id, cursor + 1, advertised_head)
       """,
       faulty_source: """
               [{first_seq, _mutations} | _] when first_seq > cursor + 1 ->
@@ -55,7 +55,7 @@ defmodule Group.MutationCampaign do
                   advertised_head
                 )
       """,
-      test: ["test/distributed_test.exs:5564"]
+      test: ["test/replica_ack_test.exs:403"]
     },
     %{
       name: "registry_snapshot_is_additive",
@@ -68,20 +68,14 @@ defmodule Group.MutationCampaign do
           acc =
             Enum.reduce([], acc, fn
       """,
-      test: [
-        "test/replica_snapshot_distributed_test.exs:16",
-        "test/distributed_test.exs:4094"
-      ]
+      test: ["test/group_test.exs:2742"]
     },
     %{
       name: "pg_snapshot_is_additive",
       file: "lib/group/replica.ex",
       correct_source: "          if Snapshot.member_pg?(staging_table, key, pid) do",
       faulty_source: "          if Process.alive?(self()) do",
-      test: [
-        "test/replica_snapshot_distributed_test.exs:16",
-        "test/distributed_test.exs:4094"
-      ]
+      test: ["test/distributed_test.exs:4152"]
     },
     %{
       name: "commit_incomplete_snapshot",
@@ -92,7 +86,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "        if MapSet.size(transfer.received) >= 1 and chunk_count >= 1 and\n" <>
           "             registry_count >= 0 and pg_count >= 0 do",
-      test: ["test/replica_snapshot_distributed_test.exs:223"]
+      test: ["test/replica_snapshot_distributed_test.exs:225"]
     },
     %{
       name: "commit_snapshot_without_terminal_manifest",
@@ -122,7 +116,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "          MapSet.member?(transfer.received, chunk_index) and\n" <>
           "              Process.alive?(self()) ->",
-      test: ["test/replica_snapshot_distributed_test.exs:385"]
+      test: ["test/replica_snapshot_distributed_test.exs:387"]
     },
     %{
       name: "retain_conflicting_snapshot_manifest",
@@ -135,7 +129,7 @@ defmodule Group.MutationCampaign do
             {:ok, state, _conflicting_transfer} ->
               state
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:191"]
+      test: ["test/replica_snapshot_distributed_test.exs:193"]
     },
     %{
       name: "commit_snapshot_after_source_changes_during_scan",
@@ -161,7 +155,7 @@ defmodule Group.MutationCampaign do
       file: "lib/group/replica.ex",
       correct_source: "        _event_buffer = Snapshot.finish_event_buffer(event_buffer)",
       faulty_source: "        _event_buffer = event_buffer",
-      test: ["test/replica_snapshot_distributed_test.exs:223"]
+      test: ["test/replica_snapshot_distributed_test.exs:225"]
     },
     %{
       name: "allow_duplicate_snapshot_rows",
@@ -173,7 +167,7 @@ defmodule Group.MutationCampaign do
       faulty_source: """
           if :ets.insert(table, objects) and size_before >= 0 do
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:385"]
+      test: ["test/replica_snapshot_distributed_test.exs:387"]
     },
     %{
       name: "do_not_supersede_partial_snapshot",
@@ -187,7 +181,7 @@ defmodule Group.MutationCampaign do
         "      %{snapshot_seq: existing_seq} when existing_seq < snapshot_seq ->\n" <>
           "        _ = existing_seq\n" <>
           "        {:ignore, state}",
-      test: ["test/replica_snapshot_distributed_test.exs:328"]
+      test: ["test/replica_snapshot_distributed_test.exs:330"]
     },
     %{
       name: "accept_stale_snapshot_authority",
@@ -203,7 +197,7 @@ defmodule Group.MutationCampaign do
           snapshot_seq > Data.replica_cursor(state.name, state.shard_index, stream_id)
         end
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:556"]
+      test: ["test/replica_snapshot_distributed_test.exs:558"]
     },
     %{
       name: "disable_snapshot_staging_expiry",
@@ -224,7 +218,7 @@ defmodule Group.MutationCampaign do
               acc
             end
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:482"]
+      test: ["test/replica_snapshot_distributed_test.exs:484"]
     },
     %{
       name: "disable_below_floor_snapshot",
@@ -247,7 +241,7 @@ defmodule Group.MutationCampaign do
           "        append_process_down_records(state, reason_by_pid, pending_reg, pending_pg)\n",
       faulty_source:
         "      sequenced_downs =\n        if false,\n          do: append_process_down_records(state, reason_by_pid, pending_reg, pending_pg),\n          else: []\n",
-      test: ["test/distributed_test.exs:4004"]
+      test: ["test/distributed_test.exs:4005"]
     },
     %{
       name: "do_not_exit_conflict_loser",
@@ -267,7 +261,7 @@ defmodule Group.MutationCampaign do
       file: "lib/group/replica/data.ex",
       correct_source: "        hint_generation == generation and\n",
       faulty_source: "        false and hint_generation == generation and\n",
-      test: ["test/anti_entropy_fault_regression_test.exs:2199"]
+      test: ["test/anti_entropy_fault_regression_test.exs:2226"]
     },
     %{
       name: "heartbeat_does_not_fence_newer_generation",
@@ -279,7 +273,7 @@ defmodule Group.MutationCampaign do
         "        not is_nil(hint_generation) and\n" <>
           "            WireProtocol.generation_newer?(generation, hint_generation) and\n" <>
           "            Process.get(:fence_newer_generation, false) ->\n",
-      test: ["test/anti_entropy_fault_regression_test.exs:2362"]
+      test: ["test/anti_entropy_fault_regression_test.exs:2389"]
     },
     %{
       name: "drop_new_generation_authority_hint",
@@ -292,7 +286,7 @@ defmodule Group.MutationCampaign do
         "          # below are being updated. Existing materialized projections may remain\n" <>
           "          # visible until exact-authority repair or bounded lease retirement.\n" <>
           "          _ = {state.name, remote_node, generation, revision}",
-      test: ["test/anti_entropy_fault_regression_test.exs:2362"]
+      test: ["test/anti_entropy_fault_regression_test.exs:2389"]
     },
     %{
       name: "accept_authority_older_than_generation_hint",
@@ -301,7 +295,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "    _ = hinted_stale?\n" <>
           "    known_stale? or revision_stale?",
-      test: ["test/anti_entropy_fault_regression_test.exs:2362"]
+      test: ["test/anti_entropy_fault_regression_test.exs:2389"]
     },
     %{
       name: "install_lane_view_behind_generation_hint",
@@ -310,7 +304,7 @@ defmodule Group.MutationCampaign do
         "         remote_replica_authority_hint(state.name, remote_node) == {generation, observed} do",
       faulty_source:
         "         elem(remote_replica_authority_hint(state.name, remote_node), 1) == observed do",
-      test: ["test/group_test.exs:3101"]
+      test: ["test/group_test.exs:3105"]
     },
     %{
       name: "install_incremental_after_newer_hint",
@@ -321,7 +315,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "      Process.get(:ignore_incremental_authority_race, true) and\n" <>
           "      is_tuple(remote_replica_authority_hint(name, remote_node))\n",
-      test: ["test/group_test.exs:3035"]
+      test: ["test/group_test.exs:3039"]
     },
     %{
       name: "accept_hint_without_exact_authority",
@@ -332,7 +326,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "        (is_nil(hint_generation) or\n" <>
           "           WireProtocol.generation_newer?(generation, hint_generation)) ->\n",
-      test: ["test/anti_entropy_fault_regression_test.exs:3458"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3489"]
     },
     %{
       name: "admit_retired_lane_route_without_authority",
@@ -345,7 +339,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "          state = put_remote_shard(state, remote_node, remote_pid)\n" <>
           "          {:noreply, request_replica_authority(state, remote_node)}",
-      test: ["test/anti_entropy_fault_regression_test.exs:3458"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3489"]
     },
     %{
       name: "do_not_restore_hint_lease_after_lane_restart",
@@ -357,20 +351,20 @@ defmodule Group.MutationCampaign do
           "      # crash in that window cannot strand the peer forever.\n" <>
           "      {{{:remote_authority_hint, :\"$1\"}, :_, :_}, [], [:\"$1\"]}\n",
       faulty_source: "      {{{:remote_view_info, shard, :\"$1\"}, :_, :_, :_}, [], [:\"$1\"]}\n",
-      test: ["test/group_test.exs:2974"]
+      test: ["test/group_test.exs:2978"]
     },
     %{
       name: "retain_retired_authority_repair",
       file: "lib/group/replica.ex",
       correct_source:
-        "          is_nil(Data.remote_generation(state.name, remote_node)) and\n" <>
-          "              is_nil(Data.remote_replica_authority_hint(state.name, remote_node)) ->\n" <>
-          "            acc\n",
+        "            is_nil(Data.remote_generation(state.name, remote_node)) and\n" <>
+          "                is_nil(Data.remote_replica_authority_hint(state.name, remote_node)) ->\n" <>
+          "              {acc_state, dirty}\n",
       faulty_source:
-        "          is_nil(Data.remote_generation(state.name, remote_node)) and\n" <>
-          "              is_nil(Data.remote_replica_authority_hint(state.name, remote_node)) ->\n" <>
-          "            Map.put(acc, remote_node, last_activity)\n",
-      test: ["test/anti_entropy_fault_regression_test.exs:3458"]
+        "            is_nil(Data.remote_generation(state.name, remote_node)) and\n" <>
+          "                is_nil(Data.remote_replica_authority_hint(state.name, remote_node)) ->\n" <>
+          "              {acc_state, Map.put(dirty, remote_node, last_activity)}\n",
+      test: ["test/anti_entropy_fault_regression_test.exs:3489"]
     },
     %{
       name: "skip_authority_fanout",
@@ -385,7 +379,7 @@ defmodule Group.MutationCampaign do
       faulty_source: """
             :ok
       """,
-      test: ["test/distributed_test.exs:5709"]
+      test: ["test/distributed_test.exs:6064"]
     },
     %{
       name: "wait_for_periodic_lane_probe_after_authority_fanout",
@@ -397,11 +391,12 @@ defmodule Group.MutationCampaign do
                 # retirement must not recreate an unleased peer. Once exact authority
                 # reaches this lane, repeat shard-local discovery immediately instead
                 # of waiting for the next anti-entropy probe.
+                state = advance_peer_probe_epoch(state, remote_node)
+
                 send_remote_shard_message(
                   state,
                   remote_node,
-                  {:peer_connect, self(), state.shard_index, state.num_shards,
-                   Data.my_clusters(state.name)}
+                  peer_connect_message(state, remote_node)
                 )
 
                 state
@@ -409,10 +404,11 @@ defmodule Group.MutationCampaign do
       """,
       faulty_source: """
               else
+                _ = advance_peer_probe_epoch(state, remote_node)
                 state
               end
       """,
-      test: ["test/anti_entropy_fault_regression_test.exs:3963"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3994"]
     },
     %{
       name: "assume_authority_fanout_reaches_late_lane",
@@ -442,7 +438,7 @@ defmodule Group.MutationCampaign do
           state
         end
       """,
-      test: ["test/anti_entropy_fault_regression_test.exs:3963"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3994"]
     },
     %{
       name: "skip_generation_purge",
@@ -474,35 +470,29 @@ defmodule Group.MutationCampaign do
         defp maybe_purge_remote_generation(state, _remote_node, _old_generation, _generation),
           do: state
       """,
-      test: ["test/distributed_test.exs:5709"]
+      test: ["test/distributed_test.exs:6064"]
     },
     %{
-      name: "disable_periodic_heads",
+      name: "disable_pending_head_retry",
       file: "lib/group/replica.ex",
-      correct_source: """
-        defp broadcast_replica_heads(state) do
-          peers = Map.keys(state.peer_last_seen)
-      """,
-      faulty_source: """
-        defp broadcast_replica_heads(state) do
-          _ = state.peer_last_seen
-          peers = []
-      """,
-      test: ["test/distributed_test.exs:4059"]
+      correct_source: "        |> retry_pending_replica_heads()",
+      faulty_source:
+        "        |> then(fn current -> if current.replica_ack_backoff, do: retry_pending_replica_heads(current), else: current end)",
+      test: ["test/replica_ack_test.exs:87"]
     },
     %{
       name: "skip_journal_crash_repair",
       file: "lib/group/replica.ex",
       correct_source: ":ok = Data.repair_local_replica_journal(name, shard_index)",
       faulty_source: ":ok",
-      test: ["test/group_test.exs:2624"]
+      test: ["test/group_test.exs:2628"]
     },
     %{
       name: "skip_index_crash_repair",
       file: "lib/group/replica.ex",
       correct_source: ":ok = Data.repair_shard_indexes(name, shard_index)",
       faulty_source: ":ok",
-      test: ["test/group_test.exs:2670"]
+      test: ["test/group_test.exs:2674"]
     },
     %{
       name: "skip_pg_count_projection_update",
@@ -518,14 +508,14 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "        _ = {table, count_key, total_delta, local_delta}\n" <>
           "        [total_count, local_count] = [0, 0]\n",
-      test: ["test/group_test.exs:1966"]
+      test: ["test/group_test.exs:1970"]
     },
     %{
       name: "retain_stale_pg_counts_on_shard_repair",
       file: "lib/group/replica/data.ex",
       correct_source: "    :ets.delete_all_objects(pg_counts)",
       faulty_source: "    _ = pg_counts",
-      test: ["test/group_test.exs:2670"]
+      test: ["test/group_test.exs:2674"]
     },
     %{
       name: "consult_stale_pg_counts_during_snapshot_repair",
@@ -550,7 +540,7 @@ defmodule Group.MutationCampaign do
           :ok
         end
       """,
-      test: ["test/anti_entropy_fault_regression_test.exs:3278"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3305"]
     },
     %{
       name: "replay_local_journal_before_pg_count_repair",
@@ -565,7 +555,7 @@ defmodule Group.MutationCampaign do
           state = replay_local_journal(state)
           :ok = Data.repair_shard_indexes(name, shard_index)
       """,
-      test: ["test/group_test.exs:3171"]
+      test: ["test/group_test.exs:3175"]
     },
     %{
       name: "skip_inactive_cluster_repair",
@@ -575,7 +565,7 @@ defmodule Group.MutationCampaign do
         "    if Process.get(:run_primary_replica_repair, false),\n" <>
           "      do: repair_primary_replica_rows(name, shard),\n" <>
           "      else: :ok",
-      test: ["test/group_test.exs:2778"]
+      test: ["test/group_test.exs:2782"]
     },
     %{
       name: "skip_closed_cluster_completion",
@@ -591,7 +581,7 @@ defmodule Group.MutationCampaign do
       faulty_source: """
           _completed_clusters = []
       """,
-      test: ["test/group_test.exs:2778"]
+      test: ["test/group_test.exs:2782"]
     },
     %{
       name: "accept_unfenced_cluster_disconnect",
@@ -606,7 +596,7 @@ defmodule Group.MutationCampaign do
           "          Process.get(:accept_unfenced_cluster_disconnect, true)\n" <>
           "      end)\n\n" <>
           "    case epochs do\n",
-      test: ["test/group_test.exs:1528"]
+      test: ["test/group_test.exs:1531"]
     },
     %{
       name: "accept_completed_cluster_disconnect",
@@ -621,14 +611,14 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "          _ = cluster\n" <>
           "          Process.get(:accept_completed_cluster_disconnect, true)",
-      test: ["test/group_test.exs:1528"]
+      test: ["test/group_test.exs:1531"]
     },
     %{
       name: "acknowledge_wrong_cluster_close_epoch",
       file: "lib/group/replica/data.ex",
       correct_source: "          [{^cluster, ^request_epoch, pending_shards}] ->\n",
       faulty_source: "          [{^cluster, _stored_epoch, pending_shards}] ->\n",
-      test: ["test/group_test.exs:2819"]
+      test: ["test/group_test.exs:2823"]
     },
     %{
       name: "accept_shared_authority_before_lane_install",
@@ -639,7 +629,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "        WireProtocol.stream_shard(stream_id) == state.shard_index and\n" <>
           "        true and",
-      test: ["test/anti_entropy_fault_regression_test.exs:1313"]
+      test: ["test/anti_entropy_fault_regression_test.exs:1340"]
     },
     %{
       name: "apply_incremental_authority_across_revision_gap",
@@ -648,21 +638,23 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "            if contiguous_cluster_controls?(accepted, next_revision) or\n" <>
           "                 Enum.any?(accepted, fn {revision, _epochs} -> revision >= next_revision end) do",
-      test: ["test/anti_entropy_fault_regression_test.exs:1505"]
+      test: ["test/anti_entropy_fault_regression_test.exs:1532"]
     },
     %{
       name: "allow_non_owner_lane_to_mutate_shared_authority",
       file: "lib/group/replica.ex",
-      correct_source: "    if state.shard_index == 0 do\n      remote_node = node(remote_pid)",
-      faulty_source: "    if true do\n      remote_node = node(remote_pid)",
-      test: ["test/anti_entropy_fault_regression_test.exs:1505"]
+      correct_source:
+        "    if state.shard_index == 0 do\n      remote_node = node(remote_pid)\n\n      # Open and close controls",
+      faulty_source:
+        "    if true do\n      remote_node = node(remote_pid)\n\n      # Open and close controls",
+      test: ["test/anti_entropy_fault_regression_test.exs:1532"]
     },
     %{
       name: "crash_lane_when_local_authority_owner_is_missing",
       file: "lib/group/replica.ex",
       correct_source: "      _ = send_local_control_message(state, control)",
       faulty_source: "      send(shard_name(state.name, 0), control)",
-      test: ["test/anti_entropy_fault_regression_test.exs:1452"]
+      test: ["test/anti_entropy_fault_regression_test.exs:1479"]
     },
     %{
       name: "retire_local_owner_after_remote_authority_changed",
@@ -671,7 +663,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "      Process.get(:skip_remote_registry_authority, true) or\n" <>
           "          registry_winner_authoritative?(state, cluster, winner) ->",
-      test: ["test/anti_entropy_fault_regression_test.exs:1664"]
+      test: ["test/anti_entropy_fault_regression_test.exs:1691"]
     },
     %{
       name: "skip_registry_reprojection_after_authority_restore",
@@ -696,7 +688,7 @@ defmodule Group.MutationCampaign do
           state
         end
       """,
-      test: ["test/anti_entropy_fault_regression_test.exs:1847"]
+      test: ["test/anti_entropy_fault_regression_test.exs:1874"]
     },
     %{
       name: "retain_registry_reprojection_after_peer_expiry",
@@ -712,7 +704,7 @@ defmodule Group.MutationCampaign do
           state = discard_snapshot_transfers_for_source(state, remote_node)
           state = discard_snapshot_send_offsets_for_target(state, remote_node)
       """,
-      test: ["test/anti_entropy_fault_regression_test.exs:2023"]
+      test: ["test/anti_entropy_fault_regression_test.exs:2050"]
     },
     %{
       name: "retain_registry_reprojection_after_nodedown",
@@ -730,7 +722,7 @@ defmodule Group.MutationCampaign do
           state = discard_snapshot_transfers_for_source(state, dead_node)
           state = discard_snapshot_send_offsets_for_target(state, dead_node)
       """,
-      test: ["test/anti_entropy_fault_regression_test.exs:3741"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3772"]
     },
     %{
       name: "separate_exact_authority_from_cluster_projection",
@@ -739,7 +731,7 @@ defmodule Group.MutationCampaign do
         "    replace_remote_cluster_projection(state.name, remote_node, current_epochs)\n",
       faulty_source:
         "    _ = {&replace_remote_cluster_projection/3, state.name, remote_node, current_epochs}\n",
-      test: ["test/anti_entropy_fault_regression_test.exs:3777"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3808"]
     },
     %{
       name: "separate_local_activation_from_cluster_projection",
@@ -748,7 +740,7 @@ defmodule Group.MutationCampaign do
         "    if durable?, do: project_activated_local_clusters(state.name, clusters)\n",
       faulty_source:
         "    _ = {durable?, &project_activated_local_clusters/2, state.name, clusters}\n",
-      test: ["test/anti_entropy_fault_regression_test.exs:3832"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3863"]
     },
     %{
       name: "drop_durable_cluster_deactivation_cleanup",
@@ -757,11 +749,11 @@ defmodule Group.MutationCampaign do
         "      cast_cluster_lifecycle(\n" <>
           "        state.name,\n" <>
           "        0..(state.num_shards - 1),\n" <>
-          "        {:cluster_disconnect, clusters, epochs}\n" <>
+          "        {:cluster_disconnect, clusters, epochs, local_cluster_epoch_revision(state.name)}\n" <>
           "      )\n",
       faulty_source:
         "      _ = {&cast_cluster_lifecycle/3, state.name, state.num_shards, clusters, epochs}\n",
-      test: ["test/anti_entropy_fault_regression_test.exs:3881"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3912"]
     },
     %{
       name: "delete_close_marker_before_terminal_route_cleanup",
@@ -771,7 +763,7 @@ defmodule Group.MutationCampaign do
           "              :ets.delete(closed_local_cluster_epochs_table(state.name), cluster)\n",
       faulty_source:
         "              :ets.delete(closed_local_cluster_epochs_table(state.name), cluster)\n",
-      test: ["test/group_test.exs:2819"]
+      test: ["test/group_test.exs:2823"]
     },
     %{
       name: "retire_peer_authority_before_terminal_route_cleanup",
@@ -781,7 +773,7 @@ defmodule Group.MutationCampaign do
           "    :ok = delete_peer_routes(name, remote_node)\n",
       faulty_source:
         "    :ets.delete(replication_meta_table(name), {:remote_generation, remote_node})\n",
-      test: ["test/group_test.exs:2873"]
+      test: ["test/group_test.exs:2877"]
     },
     %{
       name: "stale_peer_cleanup_removes_rediscovered_routes",
@@ -793,7 +785,7 @@ defmodule Group.MutationCampaign do
         "    if Process.get(:purge_rediscovered_peer_routes, true) or\n" <>
           "         (is_nil(remote_generation(state.name, dead_node)) and\n" <>
           "            is_nil(remote_replica_authority_hint(state.name, dead_node))) do\n",
-      test: ["test/group_test.exs:2926"]
+      test: ["test/group_test.exs:2930"]
     },
     %{
       name: "stale_restart_cleanup_removes_reactivated_routes",
@@ -801,7 +793,7 @@ defmodule Group.MutationCampaign do
       correct_source:
         "      Enum.filter(clusters, &is_nil(local_cluster_epoch(state.name, &1)))\n",
       faulty_source: "      clusters\n",
-      test: ["test/group_test.exs:2853"]
+      test: ["test/group_test.exs:2857"]
     },
     %{
       name: "retain_authority_repair_after_nodedown",
@@ -812,7 +804,7 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "        cluster_control_dirty: state.cluster_control_dirty,\n" <>
           "        authority_dirty_notified: MapSet.delete(state.authority_dirty_notified, dead_node)\n",
-      test: ["test/group_test.exs:2912"]
+      test: ["test/group_test.exs:2916"]
     },
     %{
       name: "retain_receive_cursor_for_inactive_local_cluster",
@@ -823,14 +815,14 @@ defmodule Group.MutationCampaign do
       faulty_source:
         "      WireProtocol.stream_origin(stream_id) != node() and\n" <>
           "      true and",
-      test: ["test/anti_entropy_fault_regression_test.exs:2876"]
+      test: ["test/anti_entropy_fault_regression_test.exs:2903"]
     },
     %{
       name: "retire_shared_authority_with_live_lanes",
       file: "lib/group/replica/data.ex",
       correct_source: "    result =\n      if remaining_lanes == 0 do",
       faulty_source: "    _ = remaining_lanes\n\n    result =\n      if true do",
-      test: ["test/anti_entropy_fault_regression_test.exs:857"]
+      test: ["test/anti_entropy_fault_regression_test.exs:884"]
     },
     %{
       name: "shard_zero_deletes_sibling_restart_views",
@@ -893,7 +885,7 @@ defmodule Group.MutationCampaign do
         "            Enum.split_while(contiguous, fn {_seq, mutations} ->\n" <>
           "              valid_replica_mutations?(%{state | num_shards: 1}, stream_id, mutations)\n" <>
           "            end)",
-      test: ["test/anti_entropy_fault_regression_test.exs:512"]
+      test: ["test/anti_entropy_fault_regression_test.exs:521"]
     },
     %{
       name: "restore_unsequenced_cluster_disconnect",
@@ -930,7 +922,7 @@ defmodule Group.MutationCampaign do
         {:noreply, state}
       end
       """,
-      test: ["test/group_test.exs:2466"]
+      test: ["test/group_test.exs:2470"]
     },
     %{
       name: "skip_cursorless_restart_authority_repair",
@@ -940,7 +932,7 @@ defmodule Group.MutationCampaign do
         "    if Process.get(:run_primary_replica_repair, false),\n" <>
           "      do: repair_primary_replica_rows(name, shard),\n" <>
           "      else: :ok",
-      test: ["test/anti_entropy_fault_regression_test.exs:3166"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3193"]
     },
     %{
       name: "project_stale_claims_before_restart_repair",
@@ -955,7 +947,7 @@ defmodule Group.MutationCampaign do
           {state, _events} = rebuild_registry_projections(state)
           :ok = Data.repair_shard_indexes(name, shard_index)
       """,
-      test: ["test/anti_entropy_fault_regression_test.exs:3598"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3629"]
     },
     %{
       name: "skip_interrupted_snapshot_install_repair",
@@ -965,7 +957,7 @@ defmodule Group.MutationCampaign do
         "    if Process.get(:run_snapshot_install_repair, false),\n" <>
           "      do: repair_interrupted_snapshot_installs(name, shard),\n" <>
           "      else: :ok",
-      test: ["test/anti_entropy_fault_regression_test.exs:3278"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3305"]
     },
     %{
       name: "retain_cursorless_remote_registry_claims",
@@ -974,20 +966,28 @@ defmodule Group.MutationCampaign do
         "      :ets.member(replica_cursor_table(name, shard), stream_id)\n    else\n      false\n    end\n  end\n\n  defp valid_remote_pg_authority?",
       faulty_source:
         "      is_tuple(stream_id)\n    else\n      false\n    end\n  end\n\n  defp valid_remote_pg_authority?",
-      test: ["test/anti_entropy_fault_regression_test.exs:3166"]
+      test: ["test/anti_entropy_fault_regression_test.exs:3193"]
     },
     %{
       name: "restart_snapshot_from_first_chunk_after_busy",
       file: "lib/group/replica.ex",
-      correct_source: "    resume = Map.get(offsets, snapshot_key, {:chunk, 1})",
+      correct_source: """
+          resume =
+            case Map.get(offsets, snapshot_key) do
+              {:sent, _sent_at} -> {:chunk, 1}
+              nil -> {:chunk, 1}
+              offset -> offset
+            end
+      """,
       faulty_source: """
           resume =
             case Map.get(offsets, snapshot_key) do
+              {:sent, _sent_at} -> {:chunk, 1}
               {:commit, _manifest} = commit -> commit
               _chunk_resume -> {:chunk, 1}
             end
       """,
-      test: ["test/replica_snapshot_distributed_test.exs:877"]
+      test: ["test/replica_snapshot_distributed_test.exs:879"]
     },
     %{
       name: "drain_oversized_ingress_batch_without_yield",

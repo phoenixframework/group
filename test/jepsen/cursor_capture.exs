@@ -45,7 +45,32 @@ try do
       end)
     end)
 
+  :ok =
+    await.(fn ->
+      Enum.all?(tl(nodes), fn target ->
+        state = rpc.(origin, :peer_head_state, [shard, target])
+        state.connected? and state.pending_heads == 0 and is_reference(state.send_token)
+      end)
+    end)
+
   healthy = capture.()
+  old_send_token = rpc.(origin, :peer_head_state, [shard, receiver]).send_token
+  :ok = :erpc.call(receiver, TestCluster, :expire_replica_lane, [:jepsen_group, shard, origin])
+
+  :ok =
+    await.(fn ->
+      state = rpc.(origin, :peer_head_state, [shard, receiver])
+
+      state.connected? and state.pending_heads == 0 and
+        state.send_token != old_send_token and
+        :erpc.call(receiver, Group.Replica.Data, :replica_cursor, [
+          :jepsen_group,
+          shard,
+          stream
+        ]) == 1
+    end)
+
+  lease_recovered = capture.()
   :ok = rpc.(receiver, :freeze, [])
 
   corruptions =
@@ -116,6 +141,7 @@ try do
     Group.Jepsen.EDN.encode(%{
       pristine: pristine,
       healthy: healthy,
+      lease_recovered: lease_recovered,
       zero: zero,
       closed: closed,
       restarted: restarted,

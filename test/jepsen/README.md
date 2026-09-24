@@ -15,7 +15,9 @@ prefix Jepsen:
 - creates a three-node registry conflict and requires every loser to die;
 - partitions the full Erlang mesh, or only selected directed replica lanes;
 - exercises isolation, all-way partition, and asymmetric one-way loss;
-- resets transport sessions and kills/restarts complete BEAM nodes; and
+- resets transport sessions and kills/restarts complete BEAM nodes;
+- expires one receiver's replica lease while its sender remains connected,
+  requiring rediscovery of already acknowledged streams; and
 - uses a 16-entry oplog and 1 KiB snapshot target so repair crosses pruning
   and multi-chunk exact-snapshot paths.
 
@@ -43,9 +45,11 @@ terminal snapshots. The independent checker requires:
   indexes inside every shard;
 - every admitted receiver stream at its independently captured origin head,
   including streams with no writes;
-- no staged partial snapshot and no retained data for a retired origin;
+- no staged partial snapshot, unacknowledged head, or retained data for a
+  retired origin;
 - coverage of delta batches, snapshot fallback, multi-chunk assembly, and
-  registry conflict termination;
+  registry conflict termination, plus an injected one-sided replica lease
+  expiry;
 - two identical quiescent observations per node; and
 - every acknowledged Group operation below the configured latency ceiling.
 

@@ -4410,12 +4410,10 @@ defmodule Group.DistributedTest do
           ["authority-new"]
         ])
 
-      remote_clusters = TestCluster.rpc!(node_b, Group.Replica.Data, :my_clusters, [name])
-
       Enum.each(b_lanes, fn {shard, b_pid} ->
         TestCluster.rpc!(node_a, :erlang, :send, [
           shard_name(name, shard),
-          {:peer_connect_ack, b_pid, shard, shards, remote_clusters}
+          {:peer_connect_ack, b_pid, shard, shards}
         ])
       end)
 
@@ -4615,6 +4613,92 @@ defmodule Group.DistributedTest do
     end
 
     @tag timeout: 60_000
+    test "authority requests from multiple lanes do not repeat the full catalog" do
+      peers = TestCluster.start_peers(2)
+      on_exit(fn -> TestCluster.stop_peers(peers) end)
+
+      [{_, node_a}, {_, node_b}] = peers
+      name = :"anti_entropy_lane_requests_#{System.unique_integer([:positive])}"
+      shards = 3
+
+      opts = [
+        name: name,
+        shards: shards,
+        replica_transport: Group.TestReplicaTransport,
+        replicated_anti_entropy_interval: 600_000,
+        replicated_peer_lease_timeout: 1_200_000
+      ]
+
+      start_group_on_peers(peers, opts)
+
+      TestCluster.assert_eventually(fn ->
+        node_a in TestCluster.rpc!(node_b, Group, :nodes, [name])
+      end)
+
+      b_control = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 0)])
+      a_control = TestCluster.rpc!(node_a, Process, :whereis, [shard_name(name, 0)])
+      :ok = TestCluster.rpc!(node_b, :sys, :suspend, [b_control])
+
+      on_exit(fn ->
+        TestCluster.rpc!(node_b, TestCluster, :resume_if_alive, [b_control])
+      end)
+
+      :ok =
+        TestCluster.rpc!(node_b, Group.Replica.Data, :delete_remote_replica_info, [
+          name,
+          0,
+          node_a
+        ])
+
+      {generation, revision, epochs} =
+        TestCluster.rpc!(node_a, Group.Replica.Data, :local_replica_authority, [name])
+
+      for shard <- 1..(shards - 1) do
+        b_lane = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, shard)])
+        marker = make_ref()
+
+        send(
+          b_lane,
+          {:replica_hello, a_control, Group.Replica.WireProtocol.version(), generation, revision,
+           epochs, Group.TestReplicaTransport.id(),
+           Group.TestReplicaTransport.descriptor(name, [])}
+        )
+
+        send(
+          b_lane,
+          {:group_dispatch, [a_control], {:group_dispatch, [self()], {:lane_processed, marker}}}
+        )
+
+        assert_receive {:lane_processed, ^marker}, 5_000
+      end
+
+      {:messages, messages} = TestCluster.rpc!(node_b, Process, :info, [b_control, :messages])
+
+      full_hellos =
+        Enum.count(messages, fn
+          {:replica_hello, ^a_control, _, _, _, _, _, _} -> true
+          _ -> false
+        end)
+
+      assert full_hellos == 0
+
+      :ok = TestCluster.rpc!(node_b, :sys, :resume, [b_control])
+
+      TestCluster.assert_eventually(fn ->
+        source_revision =
+          TestCluster.rpc!(node_a, Group.Replica.Data, :local_cluster_epoch_revision, [name])
+
+        TestCluster.rpc!(node_b, Group.Replica.Data, :remote_cluster_epoch_exact_revision, [
+          name,
+          node_a
+        ]) == source_revision
+      end)
+
+      source_state = TestCluster.rpc!(node_a, :sys, :get_state, [a_control])
+      assert {^b_control, _token} = Map.get(source_state.remote_authority_request_tokens, node_b)
+    end
+
+    @tag timeout: 60_000
     test "a backlogged authority shard cannot block independent replica lanes" do
       peers = TestCluster.start_peers(2)
       on_exit(fn -> TestCluster.stop_peers(peers) end)
@@ -4642,17 +4726,47 @@ defmodule Group.DistributedTest do
       Enum.each([1, 2], fn shard_index ->
         b_lane = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, shard_index)])
 
-        TestCluster.assert_eventually(fn ->
-          b_lane_state = TestCluster.rpc!(node_b, :sys, :get_state, [b_lane])
+        TestCluster.assert_eventually(
+          fn ->
+            b_lane_state = TestCluster.rpc!(node_b, :sys, :get_state, [b_lane])
 
-          Map.has_key?(b_lane_state.peer_last_seen, node_a) and
-            TestCluster.rpc!(
-              node_b,
-              Group.Replica.Data,
-              :remote_view_generation,
-              [name, shard_index, node_a]
-            ) == a_generation
-        end)
+            Map.has_key?(b_lane_state.peer_last_seen, node_a) and
+              TestCluster.rpc!(
+                node_b,
+                Group.Replica.Data,
+                :remote_view_generation,
+                [name, shard_index, node_a]
+              ) == a_generation
+          end,
+          diagnostic: fn ->
+            lane_state = TestCluster.rpc!(node_b, :sys, :get_state, [b_lane])
+
+            %{
+              shard: shard_index,
+              seen: Map.keys(lane_state.peer_last_seen),
+              remote_shards: Map.keys(lane_state.remote_shards),
+              requests: lane_state.authority_request_tokens,
+              view:
+                TestCluster.rpc!(node_b, Group.Replica.Data, :remote_view_generation, [
+                  name,
+                  shard_index,
+                  node_a
+                ]),
+              generation:
+                TestCluster.rpc!(node_b, Group.Replica.Data, :remote_generation, [name, node_a]),
+              exact:
+                TestCluster.rpc!(
+                  node_b,
+                  Group.Replica.Data,
+                  :remote_cluster_epoch_exact_revision,
+                  [
+                    name,
+                    node_a
+                  ]
+                )
+            }
+          end
+        )
       end)
 
       b_control = TestCluster.rpc!(node_b, Process, :whereis, [shard_name(name, 0)])
@@ -4661,7 +4775,7 @@ defmodule Group.DistributedTest do
 
       TestCluster.rpc!(node_a, :erlang, :send, [
         shard_name(name, 0),
-        {:peer_connect_ack, b_control, 0, shards, [nil]}
+        {:replica_hello_request, b_control, make_ref()}
       ])
 
       TestCluster.assert_eventually(fn ->
@@ -5499,7 +5613,7 @@ defmodule Group.DistributedTest do
       {:messages, sender_messages} = TestCluster.rpc!(node_a, Process, :info, [sender, :messages])
 
       refute Enum.any?(sender_messages, fn
-               {:replica_hello_request, remote_pid} -> node(remote_pid) == node_b
+               {:replica_hello_request, remote_pid, _token} -> node(remote_pid) == node_b
                _ -> false
              end)
     end
@@ -5579,7 +5693,7 @@ defmodule Group.DistributedTest do
       {:messages, sender_messages} = TestCluster.rpc!(node_a, Process, :info, [sender, :messages])
 
       refute Enum.any?(sender_messages, fn
-               {:replica_hello_request, remote_pid} -> node(remote_pid) == node_b
+               {:replica_hello_request, remote_pid, _token} -> node(remote_pid) == node_b
                _ -> false
              end)
 
@@ -5625,7 +5739,7 @@ defmodule Group.DistributedTest do
       {:messages, sender_messages} = TestCluster.rpc!(node_a, Process, :info, [sender, :messages])
 
       refute Enum.any?(sender_messages, fn
-               {:replica_hello_request, remote_pid} -> node(remote_pid) == node_b
+               {:replica_hello_request, remote_pid, _token} -> node(remote_pid) == node_b
                _ -> false
              end)
 
@@ -5699,6 +5813,19 @@ defmodule Group.DistributedTest do
               name,
               entries
             ])
+          end)
+        end,
+        timeout: 30_000,
+        interval: 100
+      )
+
+      TestCluster.assert_eventually(
+        fn ->
+          Enum.all?(0..3, fn shard ->
+            node_a
+            |> TestCluster.rpc!(:sys, :get_state, [Group.Replica.shard_name(name, shard)])
+            |> Map.get(:pending_replica_heads)
+            |> map_size() == 0
           end)
         end,
         timeout: 30_000,

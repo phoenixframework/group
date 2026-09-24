@@ -17,6 +17,8 @@ defmodule Group.TestReplicaTransport do
                   :drop_types,
                   :duplicate_types,
                   :capture_drop,
+                  :capture_drop_types,
+                  :capture_busy_types,
                   :capture_pass,
                   :busy_delta_above
                 ]) or
@@ -105,6 +107,22 @@ defmodule Group.TestReplicaTransport do
       {:capture_drop, types} ->
         if message_type(message) in types, do: capture(group, target_node, shard, message)
         :ok
+
+      {:capture_drop_types, types} ->
+        if message_type(message) in types do
+          capture(group, target_node, shard, message)
+          :ok
+        else
+          forward(group, target_node, shard, message)
+        end
+
+      {:capture_busy_types, types} ->
+        if message_type(message) in types do
+          capture(group, target_node, shard, message)
+          :busy
+        else
+          forward(group, target_node, shard, message)
+        end
 
       {:capture_pass, types} ->
         if message_type(message) in types, do: capture(group, target_node, shard, message)

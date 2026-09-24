@@ -13,7 +13,7 @@
         (is (= 0 (:exit run)) (str (:out run) (:err run)))
         (when (zero? (:exit run))
           (let [captures (edn/read-string (slurp output))]
-            (doseq [kind [:pristine :healthy :zero :closed :restarted :retired]]
+            (doseq [kind [:pristine :healthy :lease-recovered :zero :closed :restarted :retired]]
               (is (empty? (streams/errors (get captures kind))) (str kind))
               (is (every? #(true? (get-in % [:internal :healthy])) (vals (get captures kind)))))
             (doseq [snapshots (:corruptions captures)]

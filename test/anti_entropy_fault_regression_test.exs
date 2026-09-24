@@ -478,7 +478,7 @@ defmodule Group.AntiEntropyFaultRegressionTest do
     version = Group.Replica.WireProtocol.version()
 
     frames = [
-      {:heads, version, [:not_a_head]},
+      {:heads, version, make_ref(), [:not_a_head]},
       {:delta_batch, version, [:not_a_delta_run]},
       {:need, version, :not_a_stream, 1},
       {:needs, version, [:not_a_need]},
@@ -604,6 +604,16 @@ defmodule Group.AntiEntropyFaultRegressionTest do
 
     start_group_on_peers(context.peers, opts)
 
+    TestCluster.assert_eventually(fn ->
+      context.node_b in TestCluster.rpc!(context.node_a, Group, :nodes, [name])
+    end)
+
+    :ok =
+      TestCluster.rpc!(context.node_a, Group.TestReplicaTransport, :set_mode, [
+        name,
+        {:drop_types, [:heads, :delta_batch]}
+      ])
+
     for index <- 1..4 do
       owner = TestCluster.spawn_register(context.node_a, name, "snapshot/isolation/#{index}", %{})
       true = TestCluster.rpc!(context.node_a, Process, :exit, [owner, :kill])
@@ -614,7 +624,7 @@ defmodule Group.AntiEntropyFaultRegressionTest do
     stream_id =
       TestCluster.rpc!(context.node_a, Group.Replica.Data, :local_stream_id, [name, 0, nil])
 
-    {floor, _head, _applied} =
+    {floor, head, _applied} =
       TestCluster.rpc!(context.node_a, Group.Replica.Data, :replica_stream_head, [
         name,
         0,
@@ -622,6 +632,14 @@ defmodule Group.AntiEntropyFaultRegressionTest do
       ])
 
     assert floor > 1
+
+    source_state =
+      TestCluster.rpc!(context.node_a, :sys, :get_state, [Group.Replica.shard_name(name, 0)])
+
+    assert Map.has_key?(
+             Map.get(source_state.pending_replica_heads, context.node_b, %{}),
+             stream_id
+           )
 
     shard =
       TestCluster.rpc!(context.node_a, Process, :whereis, [Group.Replica.shard_name(name, 0)])
@@ -657,7 +675,7 @@ defmodule Group.AntiEntropyFaultRegressionTest do
                name,
                context.node_b,
                0,
-               {:needs, Group.Replica.WireProtocol.version(), [{stream_id, 1}]}
+               {:needs, Group.Replica.WireProtocol.version(), [{stream_id, 1, head}]}
              ])
 
     assert_receive {:forwarded_trace,
@@ -3263,7 +3281,7 @@ defmodule Group.AntiEntropyFaultRegressionTest do
         name,
         context.node_a,
         0,
-        {:heads, Group.Replica.WireProtocol.version(), [{stream_id, floor, head}]}
+        {:heads, Group.Replica.WireProtocol.version(), make_ref(), [{stream_id, floor, head}]}
       ])
 
     TestCluster.assert_eventually(
@@ -4005,9 +4023,6 @@ defmodule Group.AntiEntropyFaultRegressionTest do
 
     {:ok, _pid} = TestCluster.start_group(context.node_a, opts)
 
-    source_control =
-      TestCluster.rpc!(context.node_a, Process, :whereis, [Group.Replica.shard_name(name, 0)])
-
     source_lane =
       TestCluster.rpc!(context.node_a, Process, :whereis, [Group.Replica.shard_name(name, 1)])
 
@@ -4044,8 +4059,7 @@ defmodule Group.AntiEntropyFaultRegressionTest do
         TestCluster.rpc!(context.node_b, Process, :info, [target_control, :messages])
 
       Enum.any?(messages, fn
-        {:replica_hello, ^source_control, _version, ^generation, ^revision, _epochs, _transport,
-         _descriptor} ->
+        {:replica_authority_dirty_local, peer} when peer == context.node_a ->
           true
 
         _message ->
@@ -4101,7 +4115,7 @@ defmodule Group.AntiEntropyFaultRegressionTest do
         TestCluster.rpc!(context.node_a, Process, :info, [source_lane, :messages])
 
       Enum.any?(messages, fn
-        {:peer_connect, ^target_lane, 1, 2, _clusters} -> true
+        {:peer_connect, ^target_lane, 1, 2, probe_epoch} when probe_epoch > 0 -> true
         _message -> false
       end)
     end)

@@ -113,6 +113,71 @@ defmodule Group.TestCluster do
   end
 
   @doc false
+  def backdate_discovery_hello(name, shard, remote_node, milliseconds) do
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+
+    :sys.replace_state(replica, fn state ->
+      {last_sent, authority} = Map.fetch!(state.discovery_hello_last_sent, remote_node)
+
+      %{
+        state
+        | discovery_hello_last_sent:
+            Map.put(
+              state.discovery_hello_last_sent,
+              remote_node,
+              {last_sent - milliseconds, authority}
+            )
+      }
+    end)
+
+    :ok
+  end
+
+  @doc false
+  def backdate_completed_snapshot(name, shard, remote_node, stream_id, head, milliseconds) do
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+    key = {remote_node, stream_id, head}
+
+    :sys.replace_state(replica, fn state ->
+      {:sent, sent_at} = Map.fetch!(state.snapshot_send_offsets, key)
+
+      %{
+        state
+        | snapshot_send_offsets:
+            Map.put(state.snapshot_send_offsets, key, {:sent, sent_at - milliseconds})
+      }
+    end)
+
+    :ok
+  end
+
+  @doc false
+  def forget_replica_peer_route(name, shard, remote_node) do
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+
+    :sys.replace_state(replica, fn state ->
+      %{
+        state
+        | remote_shards: Map.delete(state.remote_shards, remote_node),
+          peer_last_seen: Map.delete(state.peer_last_seen, remote_node)
+      }
+    end)
+
+    :ok
+  end
+
+  @doc false
+  def forget_peer_connect_ack(name, shard, remote_node) do
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+
+    :sys.replace_state(replica, fn state ->
+      %{state | peer_connect_ack_seen: Map.delete(state.peer_connect_ack_seen, remote_node)}
+    end)
+
+    :ok
+  end
+
+  @doc false
   def put_pending_registry_reprojection(replica, remote_node, cluster, key) do
     :sys.replace_state(replica, fn state ->
       pending =

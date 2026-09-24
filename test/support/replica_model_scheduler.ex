@@ -214,7 +214,8 @@ defmodule Group.ReplicaModelScheduler do
         converged?(state)
       end,
       timeout: 15_000,
-      interval: 25
+      interval: 25,
+      diagnostic: fn -> convergence_diagnostic(state) end
     )
 
     Enum.each(state.nodes, fn {_id, node} ->
@@ -434,6 +435,70 @@ defmodule Group.ReplicaModelScheduler do
           pid_to_owner
         )
     end)
+  end
+
+  defp convergence_diagnostic(state) do
+    expected_regs = ReplicaLifecycleModel.expected_registrations(state.model)
+    expected_members = ReplicaLifecycleModel.expected_memberships(state.model)
+    pid_to_owner = Map.new(state.owners, fn {owner_id, %{pid: pid}} -> {pid, owner_id} end)
+
+    for {node_id, node} <- state.nodes do
+      regs =
+        for {cluster, key} = scope <- state.model.seen_registration_keys,
+            actual =
+              (case TestCluster.rpc!(node, Group, :lookup, [
+                      state.name,
+                      key,
+                      cluster_opts(cluster)
+                    ]) do
+                 nil -> nil
+                 {pid, meta} -> {Map.get(pid_to_owner, pid, {:unknown_pid, pid}), meta}
+               end),
+            actual != Map.get(expected_regs, scope) do
+          {scope, Map.get(expected_regs, scope), actual}
+        end
+
+      members =
+        for {cluster, key} = scope <- state.model.seen_membership_keys,
+            actual =
+              node
+              |> TestCluster.rpc!(Group, :members, [state.name, key, cluster_opts(cluster)])
+              |> Enum.map(fn {pid, meta} ->
+                {Map.get(pid_to_owner, pid, {:unknown_pid, pid}), meta}
+              end)
+              |> Enum.sort(),
+            actual != Map.get(expected_members, scope, []) do
+          {scope, Map.get(expected_members, scope, []), actual}
+        end
+
+      shards =
+        for shard <- 0..(Keyword.fetch!(state.group_opts, :shards) - 1) do
+          shard_state =
+            TestCluster.rpc!(node, :sys, :get_state, [Group.Replica.shard_name(state.name, shard)])
+
+          {shard,
+           %{
+             remote_shards: Map.keys(shard_state.remote_shards),
+             peer_last_seen: Map.keys(shard_state.peer_last_seen),
+             send_tokens: Map.keys(shard_state.replica_send_tokens),
+             pending:
+               Map.new(shard_state.pending_replica_heads, fn {peer, streams} ->
+                 {peer, map_size(streams)}
+               end),
+             heads:
+               TestCluster.rpc!(node, Group.Replica.Data, :replica_stream_heads, [
+                 state.name,
+                 shard
+               ]),
+             cursors:
+               TestCluster.rpc!(node, :ets, :tab2list, [
+                 Group.Replica.Data.replica_cursor_table(state.name, shard)
+               ])
+           }}
+        end
+
+      {node_id, %{registrations: regs, memberships: members, shards: shards}}
+    end
   end
 
   defp registrations_match?(node, name, keys, expected, pid_to_owner) do

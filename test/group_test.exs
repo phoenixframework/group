@@ -1574,7 +1574,8 @@ defmodule GroupTest.Fairness do
 
       send(
         shard,
-        {:group_replica_frame, remote_node, {:heads, Group.Replica.WireProtocol.version(), []}}
+        {:group_replica_frame, remote_node,
+         {:heads, Group.Replica.WireProtocol.version(), make_ref(), []}}
       )
 
       for _ <- 1..10_000 do

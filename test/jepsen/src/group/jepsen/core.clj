@@ -35,6 +35,8 @@
           (gen/sleep fault-interval)
           {:type :info, :f :replica-reset}
           (gen/sleep fault-interval)
+          {:type :info, :f :replica-lease-expire}
+          (gen/sleep fault-interval)
           {:type :info, :f :kill-node}
           (gen/sleep fault-interval)
           {:type :info, :f :restart-node}
@@ -72,6 +74,9 @@
    (gen/sleep 0.25)
    (gen/nemesis {:type :info, :f :replica-partition-stop})
    (gen/sleep 1)
+   (gen/log "Expiring n3 on n1 while n3 still considers n1 connected")
+   (gen/nemesis {:type :info, :f :replica-lease-expire,
+                 :value {:receiver :n1, :source :n3, :required true}})
    (gen/log "Restarting n2 after conflict resolution to prove durable qualification evidence")
    (gen/nemesis {:type :info, :f :kill-node, :value {:node :n2}})
    (gen/nemesis {:type :info, :f :restart-node})
@@ -158,7 +163,10 @@
         opts (assoc opts
                     :clusters clusters
                     :terminal-nodes terminal-nodes
-                    :retired-nodes retired-nodes)]
+                    :retired-nodes retired-nodes
+                    :required-transport-events
+                    (conj model/default-required-transport-events
+                          :replica-lease-expiry-injected))]
     (merge tests/noop-test
            opts
            {:name (str "group lifecycle convergence (" (:transport opts) "/"
