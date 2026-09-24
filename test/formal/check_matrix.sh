@@ -14,11 +14,16 @@ run_check() {
 }
 
 run_check GroupAntiEntropy GroupAntiEntropy
+run_check ReplicaAck ReplicaAck
+run_check ReplicaAck ReplicaAckReincarnation
+run_check ReplicaAck ReplicaAckEpoch
+elixir "${script_dir}/check_replica_ack_mutations.exs"
 elixir "${script_dir}/check_snapshot_commit.exs"
 run_check PeerEviction PeerEviction
 run_check AuthorityProjection AuthorityProjection
 run_check AuthorityHint AuthorityHint
 
 if [[ "${TLA_EXTENDED:-0}" == "1" ]]; then
+  run_check ReplicaAck ReplicaAckExtended
   run_check GroupAntiEntropy GroupAntiEntropyExtended
 fi

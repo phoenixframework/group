@@ -256,6 +256,7 @@ defmodule Group.Replica do
     remote_shards: %{},
     peer_last_seen: %{},
     peer_probe_epochs: %{},
+    pending_peer_probes: %{},
     remote_probe_epochs: %{},
     peer_connect_ack_seen: %{},
     authority_request_tokens: %{},
@@ -1143,11 +1144,13 @@ defmodule Group.Replica do
   # =====================================================================
 
   def handle_info(
-        {:peer_connect, remote_pid, remote_shard_index, remote_num_shards, probe_epoch},
+        {:peer_connect, remote_pid, remote_shard_index, remote_num_shards, probe_epoch,
+         remote_generation, remote_revision},
         state
       )
       when remote_shard_index == state.shard_index and is_pid(remote_pid) and
-             is_integer(probe_epoch) and probe_epoch >= 0 do
+             is_integer(probe_epoch) and probe_epoch >= 0 and
+             is_integer(remote_revision) and remote_revision >= 0 do
     state = flush_pending_replicated_message_barrier(state)
 
     if remote_num_shards != state.num_shards do
@@ -1177,12 +1180,6 @@ defmodule Group.Replica do
     else
       # A repeated probe is a retry of one receiver recovery, not a new loss
       # of its state. Only a newer epoch can invalidate an already-applied ACK.
-      send_to_peer(
-        state,
-        remote_node,
-        {:peer_connect_ack, self(), state.shard_index, state.num_shards}
-      )
-
       state =
         if probe_status == :new do
           %{
@@ -1194,16 +1191,36 @@ defmodule Group.Replica do
           state
         end
 
-      state = maybe_send_discovery_hello(state, remote_node, probe_status == :new)
+      route_ready? =
+        Map.get(state.remote_shards, remote_node) == remote_pid and
+          replica_authority_current?(state, remote_node, remote_generation, remote_revision) and
+          replica_view_current?(state, remote_node)
 
       state =
-        if probe_status == :new and Map.get(state.remote_shards, remote_node) == remote_pid do
+        if probe_status == :new or not route_ready? do
+          maybe_send_discovery_hello(state, remote_node, probe_status == :new)
+        else
+          state
+        end
+
+      state =
+        if probe_status == :new and route_ready? do
           state
           |> reset_replica_send_token(remote_node)
           |> send_replica_heads(remote_node)
         else
           state
         end
+
+      # A route for an older receiver PID cannot certify that this receiver's
+      # already-ACKed streams were requeued. Keep its probe obligation alive
+      # until the reverse hello installs the new PID and a later ACK is ready.
+      send_to_peer(
+        state,
+        remote_node,
+        {:peer_connect_ack, self(), state.shard_index, state.num_shards, probe_epoch,
+         route_ready?}
+      )
 
       log_once(state, fn ->
         "#{log_prefix(state)} peer_connect from #{remote_node}"
@@ -1213,17 +1230,23 @@ defmodule Group.Replica do
     end
   end
 
-  def handle_info({:peer_connect, _remote_pid, _other_shard, _num_shards, _probe_epoch}, state) do
+  def handle_info(
+        {:peer_connect, _remote_pid, _other_shard, _num_shards, _probe_epoch, _remote_generation,
+         _remote_revision},
+        state
+      ) do
     state = flush_pending_replicated_message_barrier(state)
     # Wrong shard index, ignore
     {:noreply, state}
   end
 
   def handle_info(
-        {:peer_connect_ack, remote_pid, remote_shard_index, remote_num_shards},
+        {:peer_connect_ack, remote_pid, remote_shard_index, remote_num_shards, probe_epoch,
+         route_ready?},
         state
       )
-      when remote_shard_index == state.shard_index do
+      when remote_shard_index == state.shard_index and is_integer(probe_epoch) and
+             probe_epoch >= 0 and is_boolean(route_ready?) do
     state = flush_pending_replicated_message_barrier(state)
 
     if remote_num_shards != state.num_shards do
@@ -1232,21 +1255,39 @@ defmodule Group.Replica do
 
     remote_node = node(remote_pid)
 
-    # Discovery acknowledgements are hints only; replica_hello is the sole
-    # generation-fenced authority for peer and cluster membership.
-    log_once(state, fn -> "#{log_prefix(state)} peer_connect_ack from #{remote_node}" end)
+    if probe_epoch != Map.get(state.peer_probe_epochs, remote_node, 0) do
+      {:noreply, state}
+    else
+      # The ACK proves the sender processed this recovery probe. Until then,
+      # keep retrying even if an older in-flight hello restores our route.
+      pending_peer_probes =
+        if route_ready? and Map.get(state.pending_peer_probes, remote_node) == probe_epoch and
+             Map.get(state.remote_shards, remote_node) == remote_pid do
+          Map.delete(state.pending_peer_probes, remote_node)
+        else
+          state.pending_peer_probes
+        end
 
-    first_ack? = Map.get(state.peer_connect_ack_seen, remote_node) != remote_pid
+      # Discovery acknowledgements are hints only; replica_hello is the sole
+      # generation-fenced authority for peer and cluster membership.
+      log_once(state, fn -> "#{log_prefix(state)} peer_connect_ack from #{remote_node}" end)
 
-    state = %{
-      state
-      | peer_connect_ack_seen: Map.put(state.peer_connect_ack_seen, remote_node, remote_pid)
-    }
+      first_ack? = Map.get(state.peer_connect_ack_seen, remote_node) != remote_pid
 
-    {:noreply, maybe_send_discovery_hello(state, remote_node, first_ack?)}
+      state = %{
+        state
+        | peer_connect_ack_seen: Map.put(state.peer_connect_ack_seen, remote_node, remote_pid),
+          pending_peer_probes: pending_peer_probes
+      }
+
+      {:noreply, maybe_send_discovery_hello(state, remote_node, first_ack?)}
+    end
   end
 
-  def handle_info({:peer_connect_ack, _remote_pid, _other_shard, _num_shards}, state) do
+  def handle_info(
+        {:peer_connect_ack, _remote_pid, _other_shard, _num_shards, _probe_epoch, _route_ready?},
+        state
+      ) do
     state = flush_pending_replicated_message_barrier(state)
     {:noreply, state}
   end
@@ -1308,6 +1349,7 @@ defmodule Group.Replica do
       | remote_shards: Map.delete(state.remote_shards, dead_node),
         peer_last_seen: Map.delete(state.peer_last_seen, dead_node),
         peer_probe_epochs: Map.delete(state.peer_probe_epochs, dead_node),
+        pending_peer_probes: Map.delete(state.pending_peer_probes, dead_node),
         remote_probe_epochs: Map.delete(state.remote_probe_epochs, dead_node),
         peer_connect_ack_seen: Map.delete(state.peer_connect_ack_seen, dead_node),
         authority_request_tokens: Map.delete(state.authority_request_tokens, dead_node),
@@ -2536,12 +2578,14 @@ defmodule Group.Replica do
 
   defp take_priority_control_turn(state, remaining) do
     receive do
-      {:peer_connect, _remote_pid, _remote_shard_index, _remote_num_shards, _probe_epoch} =
+      {:peer_connect, _remote_pid, _remote_shard_index, _remote_num_shards, _probe_epoch,
+       _remote_generation, _remote_revision} =
           msg ->
         state = process_inline_priority_message(state, msg)
         take_priority_control_turn(state, remaining - 1)
 
-      {:peer_connect_ack, _remote_pid, _remote_shard_index, _remote_num_shards} =
+      {:peer_connect_ack, _remote_pid, _remote_shard_index, _remote_num_shards, _probe_epoch,
+       _route_ready?} =
           msg ->
         state = process_inline_priority_message(state, msg)
         take_priority_control_turn(state, remaining - 1)
@@ -3269,13 +3313,17 @@ defmodule Group.Replica do
 
   defp peer_connect_message(state, target_node) do
     {:peer_connect, self(), state.shard_index, state.num_shards,
-     Map.get(state.peer_probe_epochs, target_node, 0)}
+     Map.get(state.peer_probe_epochs, target_node, 0), Data.generation(state.name),
+     Data.local_cluster_epoch_revision(state.name)}
   end
 
   defp advance_peer_probe_epoch(state, target_node) do
+    probe_epoch = Map.get(state.peer_probe_epochs, target_node, 0) + 1
+
     %{
       state
-      | peer_probe_epochs: Map.update(state.peer_probe_epochs, target_node, 1, &(&1 + 1))
+      | peer_probe_epochs: Map.put(state.peer_probe_epochs, target_node, probe_epoch),
+        pending_peer_probes: Map.put(state.pending_peer_probes, target_node, probe_epoch)
     }
   end
 
@@ -3607,7 +3655,8 @@ defmodule Group.Replica do
 
   defp probe_replica_peers(state) do
     Enum.each(Node.list(), fn remote_node ->
-      unless Map.has_key?(state.remote_shards, remote_node) do
+      if not Map.has_key?(state.remote_shards, remote_node) or
+           Map.has_key?(state.pending_peer_probes, remote_node) do
         send_remote_shard_message(
           state,
           remote_node,
@@ -3859,11 +3908,14 @@ defmodule Group.Replica do
         )
     end
 
+    probe_epoch = Map.get(state.peer_probe_epochs, remote_node, 0) + 1
+
     %{
       state
       | remote_shards: Map.delete(state.remote_shards, remote_node),
         peer_last_seen: Map.delete(state.peer_last_seen, remote_node),
-        peer_probe_epochs: Map.update(state.peer_probe_epochs, remote_node, 1, &(&1 + 1)),
+        peer_probe_epochs: Map.put(state.peer_probe_epochs, remote_node, probe_epoch),
+        pending_peer_probes: Map.put(state.pending_peer_probes, remote_node, probe_epoch),
         remote_probe_epochs: Map.delete(state.remote_probe_epochs, remote_node),
         peer_connect_ack_seen: Map.delete(state.peer_connect_ack_seen, remote_node),
         authority_request_tokens: Map.delete(state.authority_request_tokens, remote_node),

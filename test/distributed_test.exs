@@ -4413,7 +4413,7 @@ defmodule Group.DistributedTest do
       Enum.each(b_lanes, fn {shard, b_pid} ->
         TestCluster.rpc!(node_a, :erlang, :send, [
           shard_name(name, shard),
-          {:peer_connect_ack, b_pid, shard, shards}
+          {:peer_connect_ack, b_pid, shard, shards, 0, true}
         ])
       end)
 

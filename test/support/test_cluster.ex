@@ -167,6 +167,39 @@ defmodule Group.TestCluster do
   end
 
   @doc false
+  def expire_replica_lane_without_probe(name, shard, remote_node) do
+    # Reproduce the state immediately after lease expiry while withholding the
+    # peer_connect that the timer would normally send in the same callback.
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+
+    state =
+      :sys.replace_state(replica, fn state ->
+        probe_epoch = Map.get(state.peer_probe_epochs, remote_node, 0) + 1
+
+        %{
+          state
+          | remote_shards: Map.delete(state.remote_shards, remote_node),
+            peer_last_seen: Map.delete(state.peer_last_seen, remote_node),
+            peer_probe_epochs: Map.put(state.peer_probe_epochs, remote_node, probe_epoch),
+            pending_peer_probes: Map.put(state.pending_peer_probes, remote_node, probe_epoch),
+            replica_receive_tokens: Map.delete(state.replica_receive_tokens, remote_node),
+            pending_replica_acks: Map.delete(state.pending_replica_acks, remote_node),
+            anti_entropy_ref: make_ref()
+        }
+      end)
+
+    Group.Replica.Data.delete_replica_cursors_for_origin(name, shard, remote_node)
+    Group.Replica.Data.purge_node(name, shard, remote_node)
+    Group.Replica.Data.purge_registry_claims_for_origin(name, shard, remote_node)
+
+    if Group.Replica.Data.expire_remote_replica_lane(name, shard, remote_node) == :node_retired do
+      Group.Replica.Data.purge_cluster_node(name, remote_node)
+    end
+
+    {replica, Map.fetch!(state.peer_probe_epochs, remote_node), state.anti_entropy_ref}
+  end
+
+  @doc false
   def forget_peer_connect_ack(name, shard, remote_node) do
     replica = Process.whereis(Group.Replica.shard_name(name, shard))
 

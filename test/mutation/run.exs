@@ -55,7 +55,7 @@ defmodule Group.MutationCampaign do
                   advertised_head
                 )
       """,
-      test: ["test/replica_ack_test.exs:403"]
+      test: ["test/replica_ack_test.exs:483"]
     },
     %{
       name: "registry_snapshot_is_additive",

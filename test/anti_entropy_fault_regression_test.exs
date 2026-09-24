@@ -4115,8 +4115,12 @@ defmodule Group.AntiEntropyFaultRegressionTest do
         TestCluster.rpc!(context.node_a, Process, :info, [source_lane, :messages])
 
       Enum.any?(messages, fn
-        {:peer_connect, ^target_lane, 1, 2, probe_epoch} when probe_epoch > 0 -> true
-        _message -> false
+        {:peer_connect, ^target_lane, 1, 2, probe_epoch, _generation, _revision}
+        when probe_epoch > 0 ->
+          true
+
+        _message ->
+          false
       end)
     end)
 

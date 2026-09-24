@@ -7,7 +7,7 @@ if [[ -z "${TLA_JAR:-}" ]]; then
 fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-metadir="${repo_root}/tmp/tlc"
+metadir="${TLA_METADIR:-${repo_root}/tmp/tlc}"
 config="${TLA_CONFIG:-${repo_root}/test/formal/GroupAntiEntropy.cfg}"
 spec="${TLA_SPEC:-${repo_root}/test/formal/GroupAntiEntropy.tla}"
 mkdir -p "${metadir}"

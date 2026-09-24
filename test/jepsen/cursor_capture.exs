@@ -71,6 +71,60 @@ try do
     end)
 
   lease_recovered = capture.()
+
+  # Withhold the first recovery probe, then let an older exact hello restore
+  # the route. The receiver must keep probing until the sender ACKs that probe
+  # epoch; otherwise an already-ACKed stream can remain absent forever.
+  source_shard =
+    :erpc.call(origin, Process, :whereis, [Group.Replica.shard_name(:jepsen_group, shard)])
+
+  {receiver_shard, probe_epoch, tick_ref} =
+    :erpc.call(receiver, TestCluster, :expire_replica_lane_without_probe, [
+      :jepsen_group,
+      shard,
+      origin
+    ])
+
+  {generation, revision, epochs} =
+    :erpc.call(origin, Group.Replica.Data, :local_replica_authority, [:jepsen_group])
+
+  source_state = :erpc.call(origin, :sys, :get_state, [source_shard])
+  transport = source_state.replica_transport
+
+  descriptor =
+    :erpc.call(origin, transport, :descriptor, [
+      :jepsen_group,
+      source_state.replica_transport_opts
+    ])
+
+  send(
+    receiver_shard,
+    {:replica_hello, source_shard, Group.Replica.WireProtocol.version(), generation, revision,
+     epochs, :erpc.call(origin, transport, :id, []), descriptor}
+  )
+
+  receiver_state = :erpc.call(receiver, :sys, :get_state, [receiver_shard])
+  true = Map.get(receiver_state.remote_shards, origin) == source_shard
+  ^probe_epoch = Map.fetch!(receiver_state.pending_peer_probes, origin)
+  0 = :erpc.call(receiver, Group.Replica.Data, :replica_cursor, [:jepsen_group, shard, stream])
+
+  send(receiver_shard, {:group_replica_anti_entropy, tick_ref})
+
+  :ok =
+    await.(fn ->
+      state = rpc.(origin, :peer_head_state, [shard, receiver])
+      receiver_state = :erpc.call(receiver, :sys, :get_state, [receiver_shard])
+
+      state.connected? and state.pending_heads == 0 and
+        not Map.has_key?(receiver_state.pending_peer_probes, origin) and
+        :erpc.call(receiver, Group.Replica.Data, :replica_cursor, [
+          :jepsen_group,
+          shard,
+          stream
+        ]) == 1
+    end)
+
+  stale_hello_recovered = capture.()
   :ok = rpc.(receiver, :freeze, [])
 
   corruptions =
@@ -142,6 +196,7 @@ try do
       pristine: pristine,
       healthy: healthy,
       lease_recovered: lease_recovered,
+      stale_hello_recovered: stale_hello_recovered,
       zero: zero,
       closed: closed,
       restarted: restarted,

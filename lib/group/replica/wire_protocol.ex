@@ -1,7 +1,7 @@
 defmodule Group.Replica.WireProtocol do
   @moduledoc false
 
-  @version 6
+  @version 7
 
   def version, do: @version
 

@@ -17,7 +17,9 @@ prefix Jepsen:
 - exercises isolation, all-way partition, and asymmetric one-way loss;
 - resets transport sessions and kills/restarts complete BEAM nodes;
 - expires one receiver's replica lease while its sender remains connected,
-  requiring rediscovery of already acknowledged streams; and
+  requiring rediscovery of already acknowledged streams;
+- qualifies recovery when that first probe is lost and an older hello restores
+  the receiver route before the next anti-entropy tick; and
 - uses a 16-entry oplog and 1 KiB snapshot target so repair crosses pruning
   and multi-chunk exact-snapshot paths.
 

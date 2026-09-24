@@ -83,6 +83,7 @@ distributed scenarios always get fresh peers; there is no shared peer pool.
 | `diagnostics_test.exs` | Failure output, shard snapshots and unreachable-peer diagnostics |
 | `distributed_test.exs` | Multi-node: replication, peer discovery, node disconnect cleanup, partition healing, conflict resolution, event ordering, rolling restarts, and adversarial replica-transport loss/busy/snapshot recovery |
 | `anti_entropy_fault_regression_test.exs` | Three-node regressions for hidden-winner projection, receiver restart eviction, nodedown/lease lane retirement, authority gaps and cross-lane races, in-flight conflict fencing, crash-journal replay, cursorless/interrupted snapshot repair, malformed ingress, and sideband rediscovery |
+| `replica_ack_test.exs` | ACK-driven stream quiescence, lost ACK and need recovery, one-sided lease expiry, stale hello/probe races, PID and authority fencing, delta and snapshot repair, and absence of repeated full sends |
 | `replica_adversarial_test.exs` | Reproducible three-node mixed-operation state machines: drops, busy returns, duplication, reordering, bounded delay, oplog pruning, conflicts, owner death, and named-cluster epoch churn, followed by exact convergence/dead-owner/internal-index checks |
 | `replica_model_property_test.exs` | StreamData-generated and shrunk owner histories against an independent lifecycle oracle and scheduler-controlled replica transport |
 | `replica_snapshot_test.exs` | Pure single-pass byte-bounded streaming, suffix resume, receive staging, and event batching |
