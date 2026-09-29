@@ -42,7 +42,7 @@
                            {:node node, :last-response response}))))))))
 
 (defn wait-listening!
-  ([node] (wait-listening! node 15000))
+  ([node] (wait-listening! node 45000))
   ([node timeout-ms]
    (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
      (loop []

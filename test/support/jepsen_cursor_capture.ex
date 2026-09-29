@@ -72,6 +72,16 @@ defmodule Group.JepsenCursorCapture do
     :ok
   end
 
+  def peer_head_state(shard, remote_node) do
+    state = :sys.get_state(Group.Replica.shard_name(:jepsen_group, shard))
+
+    %{
+      connected?: Map.has_key?(state.remote_shards, remote_node),
+      pending_heads: state.pending_replica_heads |> Map.get(remote_node, %{}) |> map_size(),
+      send_token: Map.get(state.replica_send_tokens, remote_node)
+    }
+  end
+
   def freeze do
     for shard <- 0..1, do: :sys.suspend(Group.Replica.shard_name(:jepsen_group, shard))
     :ok

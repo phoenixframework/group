@@ -401,6 +401,38 @@ defmodule Group.Jepsen.Transport.Control do
     :ok
   end
 
+  def expire_peer(target_node) do
+    shards =
+      Group.get_config(:jepsen_group).num_shards
+      |> then(&Range.new(0, &1 - 1))
+      |> Enum.filter(fn shard ->
+        replica = Group.Replica.shard_name(:jepsen_group, shard)
+        state = :sys.get_state(replica)
+
+        if Map.has_key?(state.remote_shards, target_node) do
+          now = System.monotonic_time(:millisecond)
+
+          :sys.replace_state(replica, fn current ->
+            expired_at = now - current.replicated_peer_lease_timeout - 1
+            %{current | peer_last_seen: Map.put(current.peer_last_seen, target_node, expired_at)}
+          end)
+
+          state = :sys.get_state(replica)
+          send(Process.whereis(replica), {:group_replica_anti_entropy, state.anti_entropy_ref})
+          _state = :sys.get_state(replica)
+          true
+        else
+          false
+        end
+      end)
+
+    if shards != [] do
+      Stats.increment_persistent(:replica_lease_expiry_injected, length(shards))
+    end
+
+    shards
+  end
+
   defp maybe_disconnect(target_node) do
     if profile() == :tcp do
       Group.TestTCPTransport.disconnect_peer(:jepsen_group, target_node)
@@ -477,7 +509,10 @@ defmodule Group.Jepsen.ConflictEvidence do
   def handle_call({:record, event}, _from, state) do
     event = Map.put(event, :sequence, state.sequence + 1)
     encoded = event |> :erlang.term_to_binary() |> Base.encode64()
-    :ok = File.write(state.path, encoded <> "\n", [:append, :sync])
+    # Closing each append preserves evidence across BEAM/container restarts.
+    # A per-event fsync can stall the recorder long enough to kill an owner
+    # during a burst of cluster cleanup evidence.
+    :ok = File.write(state.path, encoded <> "\n", [:append])
     {:reply, event.sequence, %{state | events: [event | state.events], sequence: event.sequence}}
   end
 
@@ -517,18 +552,21 @@ defmodule Group.Jepsen.Owner do
         revision: revision
       })
 
-    case safe_group_call(state.token, fn ->
-           state.api.register(:jepsen_group, registry_key(key), meta, cluster_opts(cluster))
-         end) do
+    {result, latency_us} =
+      timed_group_call(state.token, fn ->
+        state.api.register(:jepsen_group, registry_key(key), meta, cluster_opts(cluster))
+      end)
+
+    case result do
       :ok ->
         registration_result(attempt, :ok)
         entry = %{cluster: cluster, key: key, revision: revision}
         state = put_in(state.registrations[{cluster, key}], entry)
-        {:reply, {:ok, snapshot(state)}, state}
+        {:reply, {:ok, snapshot(state), latency_us}, state}
 
       {:error, reason} ->
         registration_result(attempt, if(reason == :taken, do: :fail, else: :unknown))
-        {:reply, {:error, reason, snapshot(state)}, state}
+        {:reply, {:error, reason, snapshot(state), latency_us}, state}
     end
   end
 
@@ -536,9 +574,12 @@ defmodule Group.Jepsen.Owner do
     owner_key = {cluster, key}
 
     if Map.has_key?(state.registrations, owner_key) do
-      case safe_group_call(state.token, fn ->
-             state.api.unregister(:jepsen_group, registry_key(key), cluster_opts(cluster))
-           end) do
+      {result, latency_us} =
+        timed_group_call(state.token, fn ->
+          state.api.unregister(:jepsen_group, registry_key(key), cluster_opts(cluster))
+        end)
+
+      case result do
         :ok ->
           Group.Jepsen.ConflictEvidence.record(%{
             kind: :unregister,
@@ -548,29 +589,32 @@ defmodule Group.Jepsen.Owner do
           })
 
           state = %{state | registrations: Map.delete(state.registrations, owner_key)}
-          {:reply, {:ok, snapshot(state)}, state}
+          {:reply, {:ok, snapshot(state), latency_us}, state}
 
         {:error, reason} ->
-          {:reply, {:error, reason, snapshot(state)}, state}
+          {:reply, {:error, reason, snapshot(state), latency_us}, state}
       end
     else
-      {:reply, {:error, :not_owned, snapshot(state)}, state}
+      {:reply, {:error, :not_owned, snapshot(state), 0}, state}
     end
   end
 
   def handle_call({:mutate, :join, cluster, key, revision}, _from, state) do
     meta = %{token: state.token, revision: revision}
 
-    case safe_group_call(state.token, fn ->
-           state.api.join(:jepsen_group, pg_key(key), meta, cluster_opts(cluster))
-         end) do
+    {result, latency_us} =
+      timed_group_call(state.token, fn ->
+        state.api.join(:jepsen_group, pg_key(key), meta, cluster_opts(cluster))
+      end)
+
+    case result do
       :ok ->
         entry = %{cluster: cluster, key: key, revision: revision}
         state = put_in(state.memberships[{cluster, key}], entry)
-        {:reply, {:ok, snapshot(state)}, state}
+        {:reply, {:ok, snapshot(state), latency_us}, state}
 
       {:error, reason} ->
-        {:reply, {:error, reason, snapshot(state)}, state}
+        {:reply, {:error, reason, snapshot(state), latency_us}, state}
     end
   end
 
@@ -578,18 +622,21 @@ defmodule Group.Jepsen.Owner do
     owner_key = {cluster, key}
 
     if Map.has_key?(state.memberships, owner_key) do
-      case safe_group_call(state.token, fn ->
-             state.api.leave(:jepsen_group, pg_key(key), cluster_opts(cluster))
-           end) do
+      {result, latency_us} =
+        timed_group_call(state.token, fn ->
+          state.api.leave(:jepsen_group, pg_key(key), cluster_opts(cluster))
+        end)
+
+      case result do
         :ok ->
           state = %{state | memberships: Map.delete(state.memberships, owner_key)}
-          {:reply, {:ok, snapshot(state)}, state}
+          {:reply, {:ok, snapshot(state), latency_us}, state}
 
         {:error, reason} ->
-          {:reply, {:error, reason, snapshot(state)}, state}
+          {:reply, {:error, reason, snapshot(state), latency_us}, state}
       end
     else
-      {:reply, {:error, :not_owned, snapshot(state)}, state}
+      {:reply, {:error, :not_owned, snapshot(state), 0}, state}
     end
   end
 
@@ -627,6 +674,12 @@ defmodule Group.Jepsen.Owner do
   end
 
   defp sort_entries(entries), do: Enum.sort_by(entries, &{&1.cluster || "", &1.key})
+
+  defp timed_group_call(token, fun) do
+    started_at = System.monotonic_time(:microsecond)
+    result = safe_group_call(token, fun)
+    {result, System.monotonic_time(:microsecond) - started_at}
+  end
 
   defp safe_group_call(token, fun) do
     case fun.() do
@@ -701,16 +754,11 @@ defmodule Group.Jepsen.Driver do
   end
 
   def mutate(operation, logical_owner, cluster, key, revision) do
-    started_at = System.monotonic_time(:microsecond)
-
-    response =
-      GenServer.call(
-        driver(logical_owner),
-        {:mutate, operation, logical_owner, cluster, key, revision},
-        10_000
-      )
-
-    Map.put(response, :latency_us, System.monotonic_time(:microsecond) - started_at)
+    GenServer.call(
+      driver(logical_owner),
+      {:mutate, operation, logical_owner, cluster, key, revision},
+      10_000
+    )
   end
 
   def kill(logical_owner), do: GenServer.call(driver(logical_owner), {:kill, logical_owner})
@@ -765,12 +813,14 @@ defmodule Group.Jepsen.Driver do
 
     try do
       case GenServer.call(pid, {:mutate, operation, cluster, key, revision}, 8_000) do
-        {:ok, owner_state} ->
-          {:reply, %{status: :ok, owner: owner_state},
+        {:ok, owner_state, latency_us} ->
+          {:reply, %{status: :ok, owner: owner_state, latency_us: latency_us},
            put_owner_state(state, logical_owner, pid, owner_state)}
 
-        {:error, reason, owner_state} ->
-          response = Map.merge(failure_response(reason), %{owner: owner_state})
+        {:error, reason, owner_state, latency_us} ->
+          response =
+            Map.merge(failure_response(reason), %{owner: owner_state, latency_us: latency_us})
+
           {:reply, response, put_owner_state(state, logical_owner, pid, owner_state)}
       end
     catch
@@ -1048,17 +1098,33 @@ defmodule Group.Jepsen.Invariant do
         total + map_size(state.snapshot_transfers)
       end)
 
+    pending_head_count =
+      Enum.reduce(shards, 0, fn shard, total ->
+        state = :sys.get_state(Group.Replica.shard_name(:jepsen_group, shard))
+
+        total +
+          Enum.reduce(state.pending_replica_heads, 0, fn {_peer, streams}, count ->
+            count + map_size(streams)
+          end)
+      end)
+
     oplog_entries =
       Enum.reduce(shards, 0, fn shard, total ->
         total + :ets.info(Data.replica_oplog_order_table(:jepsen_group, shard), :size)
       end)
 
     %{
-      healthy: failures == [] and staging_count == 0,
-      errors: Enum.map(failures, & &1.message),
+      healthy: failures == [] and staging_count == 0 and pending_head_count == 0,
+      errors:
+        Enum.map(failures, & &1.message) ++
+          if(pending_head_count > 0,
+            do: ["#{pending_head_count} unacknowledged replica heads"],
+            else: []
+          ),
       failed_invariants: Enum.flat_map(failures, &List.wrap(&1.invariant)),
       injected_corruptions: injected_corruptions,
       snapshot_staging_count: staging_count,
+      pending_head_count: pending_head_count,
       oplog_entries: oplog_entries,
       oplog_max_entries_per_shard: config.replicated_oplog_max_entries,
       shard_mailbox_max:
@@ -1653,6 +1719,10 @@ defmodule Group.Jepsen.Wire do
       ["transport", "reset", target] ->
         :ok = Group.Jepsen.Transport.Control.reset(String.to_atom(target))
         %{status: :ok}
+
+      ["transport", "expire-peer", target] ->
+        shards = Group.Jepsen.Transport.Control.expire_peer(String.to_atom(target))
+        %{status: :ok, expired_shards: shards}
 
       ["snapshot", key_count, clusters, retired] ->
         Group.Jepsen.Snapshot.capture(

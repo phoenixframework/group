@@ -313,8 +313,9 @@ All operations are **eventually consistent**:
   sent alone. Receivers stage provisional chunks in shard-owned private ETS and
   replace visible state only after the complete slice and its terminal manifest
   are present.
-- **`replicated_anti_entropy_interval`** — interval in milliseconds for stream
-  head advertisements and nonblocking control heartbeats. Defaults to 1,000.
+- **`replicated_anti_entropy_interval`** — interval in milliseconds for retrying
+  unacknowledged stream heads and sending nonblocking control heartbeats.
+  Acknowledged streams do not advertise unchanged heads. Defaults to 1,000.
 - **`replicated_peer_lease_timeout`** — time without a dist-Erlang control
   heartbeat before state owned by that Group peer is purged. Defaults to 15,000
   and must exceed the anti-entropy interval. Probes continue after expiry so a
@@ -409,9 +410,10 @@ When Group starts (or a new Erlang node connects), shards exchange
 nodes. This handshake:
 
 1. Validates that shard counts match (raises on mismatch).
-2. Exchanges cluster membership lists.
-3. Shard 0 exchanges protocol version, origin generation, and one complete
-   active named-cluster epoch snapshot per node. Matching data shards exchange
+2. Uses constant-size discovery probes, regardless of the cluster count.
+3. Shard 0 exchanges protocol version, origin generation, and a complete
+   active named-cluster epoch snapshot on discovery or authority repair.
+   Matching data shards exchange
    only constant-size lane/transport descriptors tied to that authority
    revision.
 
@@ -419,6 +421,14 @@ Constant-size heartbeats renew the peer lease. If an origin generation or
 cluster-epoch revision changes, the receiver requests a fresh authoritative
 hello; if heartbeats stop, lease expiry purges that origin's complete local
 view and discovery probes allow it to rejoin later.
+Each lease expiry advances a discovery probe epoch, so the sender can replay
+previously acknowledged heads when the receiver has lost its view. Retries of
+that same probe epoch leave acknowledged streams quiet. An authority repair
+request carries one token per recovery attempt: its first reply is immediate,
+while repeated replies for the same token and unchanged authority are limited
+to one every five seconds. A new authority revision is sent immediately. A
+heartbeat that first restores a lane route also advertises the heads of writes
+made while that route was absent.
 
 Incremental cluster open/close controls are generation fenced, processed in
 revision order, and installed by shard 0 into one node-wide authority table.
@@ -481,10 +491,21 @@ ETS view and batched into one delta message per target. Process-death registry
 and PG removals can share one record and retain their one-event-batch behavior.
 
 Receivers advance a cursor only across a contiguous sequence prefix. A gap
-requests the missing suffix. Repeated head advertisements recover a dropped
-tail even when no later write occurs. If the requested sequence is older than
-the bounded oplog floor, the origin sends an exact snapshot of only its own
-registry claims and PG memberships; absence from that snapshot is a delete.
+requests the missing suffix. The sender retries only unacknowledged stream
+heads, so a dropped tail repairs even when no later write occurs; an applied
+cursor acknowledgement stops those retries. Discovery after a receiver lease
+expiry re-advertises the sender's current heads, including previously
+acknowledged streams whose receiver state may have been lost. If the requested
+sequence is older than the bounded oplog floor, the origin sends an exact
+snapshot of only its own registry claims and PG memberships; absence from that
+snapshot is a delete.
+Gap requests identify the advertised head. The sender ignores requests for an
+already acknowledged stream or an older head, then advertises its current head
+on the next retry. After a complete snapshot send, repeated gap requests for
+the same head wait up to five seconds before retrying the full snapshot. The
+wait is at most half the peer lease so provisional chunks can survive between
+attempts; a fresh peer recovery probe clears the hold. An interrupted chunk or
+commit resumes from its recorded offset.
 
 There are no leaders, quorum acknowledgements, per-entry replicated tombstones,
 or known-membership retention barriers. Oplog memory is bounded locally and

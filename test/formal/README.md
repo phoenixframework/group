@@ -10,6 +10,57 @@ contract. It covers:
 - exact per-origin snapshot fallback; and
 - fair convergence after healing.
 
+`ReplicaAck.tla` checks the ACK-driven stream protocol against the guards in
+`Group.Replica`. Its state maps to `pending_replica_heads`,
+`replica_send_tokens`, `replica_receive_tokens`, queued `:applied` cursors,
+`remote_probe_epochs`, the receiver's cursor and materialized row, the peer
+PID/generation, and the named-cluster epoch. It explores receiver lease expiry,
+process restart, and rejoin after an epoch change with old heads, needs, ACKs,
+and repairs still in flight. The exact source guards are represented:
+
+- a new `peer_connect` probe for the same PID rotates the sender token and
+  requeues heads; a duplicate probe preserves both and elicits no full hello
+  when the sender already has the exact receiver view;
+- `peer_connect_ack` echoes the probe epoch and certifies that the sender's
+  route and exact authority matched the receiver PID, generation, and revision
+  after any required reseed; an ACK for an uninstalled route or stale authority
+  keeps the recovery probe pending;
+- `:applied` clears a pending head only for the current PID, generation, token,
+  epoch, stream target, and a cursor at least as high as the pending head;
+- `:needs` can cause repair only while its advertised head is still pending;
+- a retained prefix uses delta, while a pruned prefix uses a snapshot; a
+  separate prune step reflects the shard-wide oplog cap, which can advance
+  this stream's floor even when this stream has no new writes; a sent
+  snapshot is held until its retry timer or a newer head; and
+- no head is sent for a quiet stream, while a full hello needs discovery or
+  authority work.
+
+The model deliberately does **not** add a PID/token/epoch guard to `:needs`:
+the Elixir wire message does not carry those fields. `:delta_batch` is modeled
+as one contiguous run and `:snapshot_chunk` plus `:snapshot_commit` as one
+committed exact state. `SnapshotAssembly.tla` checks the latter's partial wire
+delivery and staging; `GroupAntiEntropy.tla` checks broader authority and
+multi-receiver data convergence. The finite ACK model checks that a quiet head
+has current ACK evidence, visible state is an exact committed prefix, stale
+needs cannot justify a full send, and every healed run eventually converges.
+The explicit wire actions check safety under loss and reordering. For liveness,
+a weakly fair `Repair` action represents a successful probe/hello/head/repair/
+ACK round after transport healing, using the same pending obligations. This
+assumes a healthy transport eventually completes such rounds; it does not prove
+independent fairness of every packet queue.
+The default configuration checks liveness through a one-sided lease expiry
+with one in-flight frame. `ReplicaAckReincarnation.cfg` and `ReplicaAckEpoch.cfg`
+also check liveness when the receiver PID or named-cluster authority changes.
+`ReplicaAckExtended.cfg` keeps two frames and crosses both changes for safety.
+The extended instance omits the
+temporal property to keep the much larger interleaving space practical.
+The matrix also removes the ACK token fence, the stale-need pending guard,
+the full-hello discovery guard, the route-independent recovery probe, and the
+ready bit on a probe ACK, and the receiver authority revision in
+isolated copies. TLC must reject each mutant using only its corresponding
+invariant or convergence property; a parser failure or unrelated check cannot
+count as detection.
+
 `SnapshotAssembly.tla` separately models the non-atomic wire delivery of an
 exact snapshot. It explores independent provisional-chunk and terminal-commit
 loss, duplication, and reordering, source invalidation before commit emission,
@@ -67,6 +118,12 @@ Run it with Java 17 or later and a current `tla2tools.jar`:
 ```bash
 TLA_JAR=/path/to/tla2tools.jar test/formal/check.sh
 
+# Run the ACK stream model alone (a converged terminal state is allowed)
+TLA_JAR=/path/to/tla2tools.jar \
+  TLA_SPEC="$PWD/test/formal/ReplicaAck.tla" \
+  TLA_CONFIG="$PWD/test/formal/ReplicaAck.cfg" \
+  test/formal/check.sh
+
 TLA_JAR=/path/to/tla2tools.jar \
   TLA_SPEC="$PWD/test/formal/SnapshotAssembly.tla" \
   TLA_CONFIG="$PWD/test/formal/SnapshotAssembly.cfg" \
@@ -83,13 +140,15 @@ TLA_JAR=/path/to/tla2tools.jar TLA_EXTENDED=1 test/formal/check_matrix.sh
 ```
 
 `TLC_WORKERS` controls worker concurrency and defaults to 4. `TLA_CONFIG` can
-point at an alternate finite configuration.
+point at an alternate finite configuration. `TLA_METADIR` can move TLC's
+working files outside the checkout. `ReplicaAck.cfg` allows the healthy
+terminal state, where there is no work left to send.
 
 TLC proves the listed invariants and liveness property for the configured
 finite instance, not for arbitrary unbounded node and key sets. Larger models
 should be run periodically by increasing `Nodes`, `Origins`, `Keys`, `MaxSeq`,
-`OplogBound`, and `MaxMessages`. `check_matrix.sh` runs the protocol, snapshot
-assembly, peer-eviction, authority-projection, and authority-hint models; set
+`OplogBound`, and `MaxMessages`. `check_matrix.sh` runs the protocol, ACK stream,
+snapshot assembly, peer-eviction, authority-projection, and authority-hint models; set
 `TLA_EXTENDED=1` for the larger anti-entropy configuration.
 
 The checked three-node default explores 1,835,826 states, finds 490,236

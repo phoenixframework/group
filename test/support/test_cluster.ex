@@ -113,6 +113,104 @@ defmodule Group.TestCluster do
   end
 
   @doc false
+  def backdate_discovery_hello(name, shard, remote_node, milliseconds) do
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+
+    :sys.replace_state(replica, fn state ->
+      {last_sent, authority} = Map.fetch!(state.discovery_hello_last_sent, remote_node)
+
+      %{
+        state
+        | discovery_hello_last_sent:
+            Map.put(
+              state.discovery_hello_last_sent,
+              remote_node,
+              {last_sent - milliseconds, authority}
+            )
+      }
+    end)
+
+    :ok
+  end
+
+  @doc false
+  def backdate_completed_snapshot(name, shard, remote_node, stream_id, head, milliseconds) do
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+    key = {remote_node, stream_id, head}
+
+    :sys.replace_state(replica, fn state ->
+      {:sent, sent_at} = Map.fetch!(state.snapshot_send_offsets, key)
+
+      %{
+        state
+        | snapshot_send_offsets:
+            Map.put(state.snapshot_send_offsets, key, {:sent, sent_at - milliseconds})
+      }
+    end)
+
+    :ok
+  end
+
+  @doc false
+  def forget_replica_peer_route(name, shard, remote_node) do
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+
+    :sys.replace_state(replica, fn state ->
+      %{
+        state
+        | remote_shards: Map.delete(state.remote_shards, remote_node),
+          peer_last_seen: Map.delete(state.peer_last_seen, remote_node)
+      }
+    end)
+
+    :ok
+  end
+
+  @doc false
+  def expire_replica_lane_without_probe(name, shard, remote_node) do
+    # Reproduce the state immediately after lease expiry while withholding the
+    # peer_connect that the timer would normally send in the same callback.
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+
+    state =
+      :sys.replace_state(replica, fn state ->
+        probe_epoch = Map.get(state.peer_probe_epochs, remote_node, 0) + 1
+
+        %{
+          state
+          | remote_shards: Map.delete(state.remote_shards, remote_node),
+            peer_last_seen: Map.delete(state.peer_last_seen, remote_node),
+            peer_probe_epochs: Map.put(state.peer_probe_epochs, remote_node, probe_epoch),
+            pending_peer_probes: Map.put(state.pending_peer_probes, remote_node, probe_epoch),
+            replica_receive_tokens: Map.delete(state.replica_receive_tokens, remote_node),
+            pending_replica_acks: Map.delete(state.pending_replica_acks, remote_node),
+            anti_entropy_ref: make_ref()
+        }
+      end)
+
+    Group.Replica.Data.delete_replica_cursors_for_origin(name, shard, remote_node)
+    Group.Replica.Data.purge_node(name, shard, remote_node)
+    Group.Replica.Data.purge_registry_claims_for_origin(name, shard, remote_node)
+
+    if Group.Replica.Data.expire_remote_replica_lane(name, shard, remote_node) == :node_retired do
+      Group.Replica.Data.purge_cluster_node(name, remote_node)
+    end
+
+    {replica, Map.fetch!(state.peer_probe_epochs, remote_node), state.anti_entropy_ref}
+  end
+
+  @doc false
+  def forget_peer_connect_ack(name, shard, remote_node) do
+    replica = Process.whereis(Group.Replica.shard_name(name, shard))
+
+    :sys.replace_state(replica, fn state ->
+      %{state | peer_connect_ack_seen: Map.delete(state.peer_connect_ack_seen, remote_node)}
+    end)
+
+    :ok
+  end
+
+  @doc false
   def put_pending_registry_reprojection(replica, remote_node, cluster, key) do
     :sys.replace_state(replica, fn state ->
       pending =

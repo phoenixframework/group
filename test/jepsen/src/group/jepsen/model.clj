@@ -85,7 +85,7 @@
 
 (defn stable-internal [snapshot]
   (select-keys (:internal snapshot)
-               [:healthy :errors :snapshot-staging-count :oplog-entries]))
+               [:healthy :errors :snapshot-staging-count :pending-head-count :oplog-entries]))
 
 (defn snapshot-fingerprint [test snapshot]
   {:owners (set (:owners snapshot))

@@ -99,7 +99,25 @@
           (group-client/request!
             source
             ["transport" "reset" (str "group@" (name target))]))
-        (assoc op :type :info, :value {:source source, :target target}))))
+        (assoc op :type :info, :value {:source source, :target target}))
+
+      :expire-peer
+      (let [nodes (vec (filter docker/running? (:nodes test)))
+            receiver (or (get-in op [:value :receiver])
+                         (when (seq nodes) (rand-nth nodes)))
+            sources (when receiver (vec (remove #(= receiver %) nodes)))
+            source (or (get-in op [:value :source])
+                       (when (seq sources) (rand-nth sources)))
+            result (when (and receiver source)
+                     (group-client/request!
+                       receiver
+                       ["transport" "expire-peer" (str "group@" (name source))]))]
+        (when (and (get-in op [:value :required])
+                   (empty? (:expired-shards result)))
+          (throw (ex-info "required one-sided replica lease expiry was not injected"
+                          {:receiver receiver, :source source, :result result})))
+        (assoc op :type :info, :value {:receiver receiver, :source source,
+                                      :expired-shards (:expired-shards result)}))))
 
   (teardown! [_this test]
     (docker/heal-replica! (:nodes test))
@@ -165,7 +183,8 @@
 
      {:replica-partition-start :start,
       :replica-partition-stop :stop,
-      :replica-reset :reset}
+      :replica-reset :reset,
+      :replica-lease-expire :expire-peer}
      (ReplicaNemesis. (atom nil))
 
      {:kill-node :start, :restart-node :stop}
