@@ -1,5 +1,4 @@
-## Unreleased
-
+## 0.3.1 (2026-10-10)
 - Fix a replica lane that never recovered after its lease expired and the
   peer's `replica_hello` was dropped by a busy link. The peer answered every
   repeated probe with a constant-size ACK because its own route was ready,
@@ -8,6 +7,9 @@
   ACK that finds no route now requests the peer's authority
   (`replica_hello_request`), and a hello refused by a busy link is no longer
   recorded as sent.
+
+## 0.3.0 (2026-09-29)
+- Optimize subcluster replication
 - Materialize per-shard exact and slash-prefix process-group cardinalities so
   `Group.member_count/3` and `Group.local_member_count/3` no longer scan
   memberships. Counts follow resident-row diffs across local writes,
