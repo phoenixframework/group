@@ -549,6 +549,103 @@ defmodule Group.ReplicaAckTest do
     assert view_current?(context.source, name, context.receiver)
   end
 
+  test "a ready ACK without a route rebuilds a data lane from the shared authority", context do
+    # Same wedge on a data lane (shard 1). Its repair differs from shard zero's:
+    # the ACK makes the lane rebuild its view from the authority shard zero
+    # still holds, and the peer's next heartbeat reinstalls the route.
+    name = :"replica_ack_data_lane_#{System.unique_integer([:positive])}"
+
+    opts = [
+      name: name,
+      shards: 2,
+      replica_transport: Group.TestReplicaTransport,
+      replicated_anti_entropy_interval: 25,
+      replicated_peer_lease_timeout: 5_000
+    ]
+
+    for node <- [context.source, context.receiver] do
+      {:ok, _pid} = TestCluster.start_group(node, opts)
+      :ok = TestCluster.rpc!(node, Group, :connect, [name, "org"])
+    end
+
+    on_exit(fn ->
+      for node <- [context.source, context.receiver] do
+        TestCluster.rpc!(node, Group.TestReplicaTransport, :clear, [name])
+      end
+    end)
+
+    shard_name = Group.Replica.shard_name(name, 1)
+    source_lane = TestCluster.rpc!(context.source, Process, :whereis, [shard_name])
+    receiver_lane = TestCluster.rpc!(context.receiver, Process, :whereis, [shard_name])
+
+    TestCluster.assert_eventually(fn ->
+      source_state = TestCluster.rpc!(context.source, :sys, :get_state, [source_lane])
+      receiver_state = TestCluster.rpc!(context.receiver, :sys, :get_state, [receiver_lane])
+
+      Map.get(source_state.remote_shards, context.receiver) == receiver_lane and
+        Map.get(receiver_state.remote_shards, context.source) == source_lane and
+        view_current?(context.receiver, name, context.source, 1) and
+        view_current?(context.source, name, context.receiver, 1)
+    end)
+
+    _ =
+      TestCluster.rpc!(context.source, TestCluster, :expire_replica_lane_without_probe, [
+        name,
+        1,
+        context.receiver
+      ])
+
+    source_state = TestCluster.rpc!(context.source, :sys, :get_state, [source_lane])
+    probe_epoch = Map.fetch!(source_state.pending_peer_probes, context.receiver)
+    refute Map.has_key?(source_state.remote_shards, context.receiver)
+
+    # Shard zero's lane survived, so the receiver's authority is still exact
+    # here; only this lane's view and route are gone.
+    assert view_current?(context.source, name, context.receiver, 0)
+    refute view_current?(context.source, name, context.receiver, 1)
+
+    {generation, revision, _epochs} =
+      TestCluster.rpc!(context.source, Group.Replica.Data, :local_replica_authority, [name])
+
+    probe = {:peer_connect, source_lane, 1, 2, probe_epoch, generation, revision}
+
+    true = TestCluster.rpc!(context.source, Process, :unregister, [shard_name])
+
+    try do
+      send(receiver_lane, probe)
+      _state = TestCluster.rpc!(context.receiver, :sys, :get_state, [receiver_lane])
+      Process.sleep(200)
+    after
+      true = TestCluster.rpc!(context.source, Process, :register, [source_lane, shard_name])
+    end
+
+    receiver_state = TestCluster.rpc!(context.receiver, :sys, :get_state, [receiver_lane])
+
+    assert {^source_lane, ^probe_epoch} =
+             Map.fetch!(receiver_state.remote_probe_epochs, context.source)
+
+    assert Map.get(receiver_state.remote_shards, context.source) == source_lane
+
+    source_state = TestCluster.rpc!(context.source, :sys, :get_state, [source_lane])
+    refute Map.has_key?(source_state.remote_shards, context.receiver)
+    assert Map.fetch!(source_state.pending_peer_probes, context.receiver) == probe_epoch
+
+    TestCluster.assert_eventually(
+      fn ->
+        send(receiver_lane, probe)
+        _state = TestCluster.rpc!(context.receiver, :sys, :get_state, [receiver_lane])
+        _state = TestCluster.rpc!(context.source, :sys, :get_state, [source_lane])
+        state = TestCluster.rpc!(context.source, :sys, :get_state, [source_lane])
+
+        Map.get(state.remote_shards, context.receiver) == receiver_lane and
+          not Map.has_key?(state.pending_peer_probes, context.receiver)
+      end,
+      timeout: 4_000
+    )
+
+    assert view_current?(context.source, name, context.receiver, 1)
+  end
+
   test "a heartbeat that restores a lane advertises writes missed without a route", context do
     source_shard = Group.Replica.shard_name(context.name, 0)
 
@@ -1116,7 +1213,7 @@ defmodule Group.ReplicaAckTest do
 
   # A node's shard-0 view of a peer is current when its stored authority and
   # the shard's view agree: the conditions behind route_ready? in the replica.
-  defp view_current?(node, name, peer) do
+  defp view_current?(node, name, peer, shard \\ 0) do
     read = fn fun, args -> TestCluster.rpc!(node, Group.Replica.Data, fun, args) end
 
     generation = read.(:remote_generation, [name, peer])
@@ -1125,10 +1222,10 @@ defmodule Group.ReplicaAckTest do
     not is_nil(generation) and
       read.(:remote_replica_authority_hint, [name, peer]) == {generation, observed} and
       read.(:remote_cluster_epoch_revision, [name, peer]) == observed and
-      read.(:remote_view_generation, [name, 0, peer]) == generation and
-      read.(:remote_view_cluster_epoch_revision, [name, 0, peer]) ==
+      read.(:remote_view_generation, [name, shard, peer]) == generation and
+      read.(:remote_view_cluster_epoch_revision, [name, shard, peer]) ==
         read.(:remote_cluster_epoch_exact_revision, [name, peer]) and
-      read.(:remote_view_observed_revision, [name, 0, peer]) == observed
+      read.(:remote_view_observed_revision, [name, shard, peer]) == observed
   end
 
   defp queued_replica_hellos(node, receiver_shard) do
