@@ -427,6 +427,128 @@ defmodule Group.ReplicaAckTest do
     assert 6 == queued_replica_hellos(context.receiver, receiver_shard)
   end
 
+  test "a ready ACK without a route asks the receiver for its hello", context do
+    # Two shards: expiring one lane then retires only that lane and keeps the
+    # node's authority, so the remaining repair paths (heartbeats, heads) all
+    # see "authority known, view missing" and stay quiet, as in production.
+    name = :"replica_ack_lanes_#{System.unique_integer([:positive])}"
+
+    opts = [
+      name: name,
+      shards: 2,
+      replica_transport: Group.TestReplicaTransport,
+      replicated_anti_entropy_interval: 25,
+      replicated_peer_lease_timeout: 5_000
+    ]
+
+    for node <- [context.source, context.receiver] do
+      {:ok, _pid} = TestCluster.start_group(node, opts)
+      :ok = TestCluster.rpc!(node, Group, :connect, [name, "org"])
+    end
+
+    on_exit(fn ->
+      for node <- [context.source, context.receiver] do
+        TestCluster.rpc!(node, Group.TestReplicaTransport, :clear, [name])
+      end
+    end)
+
+    source_shard =
+      TestCluster.rpc!(context.source, Process, :whereis, [Group.Replica.shard_name(name, 0)])
+
+    receiver_shard =
+      TestCluster.rpc!(context.receiver, Process, :whereis, [Group.Replica.shard_name(name, 0)])
+
+    shard_name = Group.Replica.shard_name(name, 0)
+
+    # Both control lanes are routed and current before the fault.
+    TestCluster.assert_eventually(fn ->
+      source_state = TestCluster.rpc!(context.source, :sys, :get_state, [source_shard])
+      receiver_state = TestCluster.rpc!(context.receiver, :sys, :get_state, [receiver_shard])
+
+      Map.get(source_state.remote_shards, context.receiver) == receiver_shard and
+        Map.get(receiver_state.remote_shards, context.source) == source_shard and
+        view_current?(context.receiver, name, context.source) and
+        view_current?(context.source, name, context.receiver)
+    end)
+
+    # The source's lease on the receiver's control lane runs out, as it does
+    # when a busy link drops heartbeats. The helper withholds the probe the
+    # timer would send, so the loss below is deterministic.
+    _ =
+      TestCluster.rpc!(context.source, TestCluster, :expire_replica_lane_without_probe, [
+        name,
+        0,
+        context.receiver
+      ])
+
+    source_state = TestCluster.rpc!(context.source, :sys, :get_state, [source_shard])
+    probe_epoch = Map.fetch!(source_state.pending_peer_probes, context.receiver)
+    refute Map.has_key?(source_state.remote_shards, context.receiver)
+
+    # The lane is gone but the receiver's authority is still known here.
+    refute is_nil(
+             TestCluster.rpc!(context.source, Group.Replica.Data, :remote_generation, [
+               name,
+               context.receiver
+             ])
+           )
+
+    {generation, revision, _epochs} =
+      TestCluster.rpc!(context.source, Group.Replica.Data, :local_replica_authority, [name])
+
+    probe = {:peer_connect, source_shard, 0, 2, probe_epoch, generation, revision}
+
+    # The receiver processes that probe epoch, but its hello and ACK are lost
+    # on the way back: nothing is registered under the source shard's name
+    # while they arrive, so the node drops them as a busy link would.
+    true = TestCluster.rpc!(context.source, Process, :unregister, [shard_name])
+
+    try do
+      send(receiver_shard, probe)
+      _state = TestCluster.rpc!(context.receiver, :sys, :get_state, [receiver_shard])
+      Process.sleep(200)
+    after
+      true = TestCluster.rpc!(context.source, Process, :register, [source_shard, shard_name])
+    end
+
+    # The receiver now treats this epoch as seen and still has its own route,
+    # so it answers every repeat with an ACK alone; the source has no route and
+    # the probe pending. This is the wedge observed in production.
+    receiver_state = TestCluster.rpc!(context.receiver, :sys, :get_state, [receiver_shard])
+
+    assert {^source_shard, ^probe_epoch} =
+             Map.fetch!(receiver_state.remote_probe_epochs, context.source)
+
+    assert Map.get(receiver_state.remote_shards, context.source) == source_shard
+    assert view_current?(context.receiver, name, context.source)
+
+    source_state = TestCluster.rpc!(context.source, :sys, :get_state, [source_shard])
+    refute Map.has_key?(source_state.remote_shards, context.receiver)
+    assert Map.fetch!(source_state.pending_peer_probes, context.receiver) == probe_epoch
+
+    # The source re-sends the same probe epoch (by hand here: the expiry helper
+    # stopped its anti-entropy timer). The lane must come back: an ACK that
+    # finds no route requests the missed hello, and the next ACK settles the
+    # probe against the installed route.
+    TestCluster.assert_eventually(
+      fn ->
+        send(receiver_shard, probe)
+        _state = TestCluster.rpc!(context.receiver, :sys, :get_state, [receiver_shard])
+        _state = TestCluster.rpc!(context.source, :sys, :get_state, [source_shard])
+        state = TestCluster.rpc!(context.source, :sys, :get_state, [source_shard])
+
+        Map.get(state.remote_shards, context.receiver) == receiver_shard and
+          not Map.has_key?(state.pending_peer_probes, context.receiver)
+      end,
+      timeout: 4_000
+    )
+
+    source_state = TestCluster.rpc!(context.source, :sys, :get_state, [source_shard])
+    assert Map.has_key?(source_state.peer_last_seen, context.receiver)
+    assert source_state.authority_request_tokens == %{}
+    assert view_current?(context.source, name, context.receiver)
+  end
+
   test "a heartbeat that restores a lane advertises writes missed without a route", context do
     source_shard = Group.Replica.shard_name(context.name, 0)
 
@@ -990,6 +1112,23 @@ defmodule Group.ReplicaAckTest do
         ])
       )
     end)
+  end
+
+  # A node's shard-0 view of a peer is current when its stored authority and
+  # the shard's view agree: the conditions behind route_ready? in the replica.
+  defp view_current?(node, name, peer) do
+    read = fn fun, args -> TestCluster.rpc!(node, Group.Replica.Data, fun, args) end
+
+    generation = read.(:remote_generation, [name, peer])
+    observed = read.(:remote_cluster_epoch_observed_revision, [name, peer])
+
+    not is_nil(generation) and
+      read.(:remote_replica_authority_hint, [name, peer]) == {generation, observed} and
+      read.(:remote_cluster_epoch_revision, [name, peer]) == observed and
+      read.(:remote_view_generation, [name, 0, peer]) == generation and
+      read.(:remote_view_cluster_epoch_revision, [name, 0, peer]) ==
+        read.(:remote_cluster_epoch_exact_revision, [name, peer]) and
+      read.(:remote_view_observed_revision, [name, 0, peer]) == observed
   end
 
   defp queued_replica_hellos(node, receiver_shard) do

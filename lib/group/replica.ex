@@ -75,6 +75,10 @@ defmodule Group.Replica do
   - constant-size periodic heartbeats provide a bounded peer lease without
     creating remote process monitors. A generation/epoch-revision mismatch
     requests a fresh authoritative hello.
+  - every message above is a nonblocking send that a busy link drops. A probe
+    answered as ready while this side still holds no route asks the peer for
+    its hello again (replica_hello_request), so one lost hello cannot leave a
+    lane unrouted for the life of the connection.
 
   Data installs an exact remote authority and its shared-cluster dual-index
   projection in one serialized operation. A concurrent local cluster connect
@@ -1274,13 +1278,24 @@ defmodule Group.Replica do
 
       first_ack? = Map.get(state.peer_connect_ack_seen, remote_node) != remote_pid
 
+      # The receiver certifies its own route and answers a repeated probe with
+      # this ACK alone, so a lost hello leaves this side without a route while
+      # every later ACK says the receiver is ready. Ask for the hello
+      # explicitly: the request is constant-size and the receiver rate-limits
+      # the catalog it answers with.
+      route_missing? =
+        route_ready? and Map.get(state.remote_shards, remote_node) != remote_pid
+
       state = %{
         state
         | peer_connect_ack_seen: Map.put(state.peer_connect_ack_seen, remote_node, remote_pid),
           pending_peer_probes: pending_peer_probes
       }
 
-      {:noreply, maybe_send_discovery_hello(state, remote_node, first_ack?)}
+      state = maybe_send_discovery_hello(state, remote_node, first_ack?)
+
+      {:noreply,
+       if(route_missing?, do: request_replica_authority(state, remote_node), else: state)}
     end
   end
 
@@ -3307,8 +3322,6 @@ defmodule Group.Replica do
          Data.local_cluster_epoch_revision(state.name), state.replica_transport.id(), descriptor}
       )
     end
-
-    state
   end
 
   defp peer_connect_message(state, target_node) do
@@ -3335,13 +3348,19 @@ defmodule Group.Replica do
 
     if force? or is_nil(last_sent) or elem(last_sent, 1) != authority or
          now - elem(last_sent, 0) >= retry_interval do
-      state = send_replica_hello(state, target_node)
+      # A hello refused by a busy link was never sent; recording it would
+      # silence the next request for a whole retry interval.
+      case send_replica_hello(state, target_node) do
+        :ok ->
+          %{
+            state
+            | discovery_hello_last_sent:
+                Map.put(state.discovery_hello_last_sent, target_node, {now, authority})
+          }
 
-      %{
-        state
-        | discovery_hello_last_sent:
-            Map.put(state.discovery_hello_last_sent, target_node, {now, authority})
-      }
+        :busy ->
+          state
+      end
     else
       state
     end
