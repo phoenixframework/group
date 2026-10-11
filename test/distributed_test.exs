@@ -4410,10 +4410,16 @@ defmodule Group.DistributedTest do
           ["authority-new"]
         ])
 
+      # A lane whose hello outran shard zero's exact authority has already
+      # re-probed once; an ACK is only honored for the lane's current epoch.
       Enum.each(b_lanes, fn {shard, b_pid} ->
+        a_pid = TestCluster.rpc!(node_a, Process, :whereis, [shard_name(name, shard)])
+        a_state = TestCluster.rpc!(node_a, :sys, :get_state, [a_pid])
+        probe_epoch = Map.get(a_state.peer_probe_epochs, node_b, 0)
+
         TestCluster.rpc!(node_a, :erlang, :send, [
           shard_name(name, shard),
-          {:peer_connect_ack, b_pid, shard, shards, 0, true}
+          {:peer_connect_ack, b_pid, shard, shards, probe_epoch, true}
         ])
       end)
 
