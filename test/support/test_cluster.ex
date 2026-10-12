@@ -99,16 +99,20 @@ defmodule Group.TestCluster do
   @doc false
   def expire_replica_lane(name, shard, remote_node) do
     replica = Process.whereis(Group.Replica.shard_name(name, shard))
-    now = System.monotonic_time(:millisecond)
 
     :sys.replace_state(replica, fn state ->
-      expired_at = now - state.replicated_peer_lease_timeout - 1
-      %{state | peer_last_seen: Map.put(state.peer_last_seen, remote_node, expired_at)}
+      expired_at = System.monotonic_time(:millisecond) - state.replicated_peer_lease_timeout - 1
+      state = %{state | peer_last_seen: Map.put(state.peer_last_seen, remote_node, expired_at)}
+
+      # Run the real timer callback in the shard's process in the same system
+      # turn as backdating. A heartbeat or a timer already in the mailbox must
+      # not refresh the lease or invalidate the tick between those two steps.
+      {:noreply, state} =
+        Group.Replica.handle_info({:group_replica_anti_entropy, state.anti_entropy_ref}, state)
+
+      state
     end)
 
-    state = :sys.get_state(replica)
-    send(replica, {:group_replica_anti_entropy, state.anti_entropy_ref})
-    _state = :sys.get_state(replica)
     :ok
   end
 

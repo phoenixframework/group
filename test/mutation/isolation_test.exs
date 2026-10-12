@@ -8,6 +8,7 @@ defmodule Group.MutationIsolationTest do
 
   @repo Path.expand("../..", __DIR__)
   @mutation "drain_oversized_ingress_batch_without_yield"
+  @target "an oversized incoming batch yields to an already queued local write"
 
   setup do
     work = Path.join(@repo, "tmp/mutation-isolation-#{System.unique_integer([:positive])}")
@@ -71,7 +72,7 @@ defmodule Group.MutationIsolationTest do
     assert output =~ "#{@mutation}: SURVIVED"
     refute File.exists?(Path.join(work, "checker-invocations"))
 
-    {output, status} = command(work, ["mix", "test", "test/group_test.exs:34"])
+    {output, status} = command(work, ["mix", "test", "test/group_test.exs"])
     assert status != 0, output
     assert File.read!(Path.join(work, "checker-invocations")) == "invoked\n"
   end
@@ -108,13 +109,49 @@ defmodule Group.MutationIsolationTest do
     refute output =~ "#{@mutation}: killed"
   end
 
+  test "selectors follow a moved declaration without running adjacent tests", %{work: work} do
+    target(work, "assert Isolation.Target.split([1, 2]) == {[1], [2]}")
+    path = Path.join(work, "test/group_test.exs")
+
+    File.write!(
+      path,
+      String.replace(
+        File.read!(path),
+        "  use ExUnit.Case\n",
+        "  use ExUnit.Case\n\n  test \"not the target\", do: flunk(\"must not be selected\")\n\n"
+      )
+    )
+
+    {output, status} = campaign(work)
+    assert status == 0, output
+    assert output =~ "#{@mutation}: killed"
+  end
+
+  test "missing and ambiguous names fail before running a baseline", %{work: work} do
+    for {name, copies, count} <- [{"renamed target", 1, 0}, {@target, 2, 2}] do
+      declarations = String.duplicate("  test #{inspect(name)}, do: assert(true)\n", copies)
+      write(work, "test/group_test.exs", "defmodule TargetTest do\n#{declarations}end\n")
+
+      {output, status} = campaign(work)
+      assert status != 0, output
+      assert output =~ "must match exactly one test/property declaration"
+      assert output =~ "(found #{count})"
+      refute output =~ "baseline "
+    end
+  end
+
   defp target(work, assertion) do
     write(
       work,
       "test/group_test.exs",
-      "defmodule Isolation.TargetTest do\n  use ExUnit.Case\n" <>
-        String.duplicate("\n", 31) <>
-        "  test \"target\" do\n    #{assertion}\n  end\nend\n"
+      """
+      defmodule Isolation.TargetTest do
+        use ExUnit.Case
+        test #{inspect(@target)} do
+          #{assertion}
+        end
+      end
+      """
     )
   end
 

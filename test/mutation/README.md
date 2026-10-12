@@ -35,9 +35,11 @@ and runs the designated real multi-node regression. A compiling mutant is
 `killed` only when the regression fails. Any surviving or non-compiling mutant
 makes the campaign fail.
 Before either listing or running mutants, it also requires every production
-replacement to match exactly once and every test selector to point at the test
-declaration itself. Source edits therefore fail loudly instead of turning a
-stale mutation into a placebo run of an adjacent test.
+replacement to match exactly once. Test selectors pair a file with a literal
+test/property name, resolved to its current declaration line before execution.
+Moving a test requires no selector update; missing or ambiguous names fail
+instead of turning a stale mutation into a placebo run of an adjacent test.
+The local PR gate validates all definitions without running the campaign.
 
 ```bash
 mix run --no-start test/mutation/run.exs

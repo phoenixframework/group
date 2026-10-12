@@ -5717,16 +5717,21 @@ defmodule Group.DistributedTest do
       :ok = TestCluster.rpc!(node_a, Group, :disconnect, [name, "tenant/transient"])
       :ok = TestCluster.rpc!(node_a, Group, :connect, [name, "tenant/after-close"])
 
-      {:messages, queued_messages} =
-        TestCluster.rpc!(node_b, Process, :info, [receiver, :messages])
+      queued_controls = fn ->
+        {:messages, queued_messages} =
+          TestCluster.rpc!(node_b, Process, :info, [receiver, :messages])
 
-      queued_controls =
         for {kind, remote_pid, _generation, revision, _epochs} <- queued_messages,
             kind in [:replica_cluster_open, :replica_cluster_close],
             node(remote_pid) == node_a,
             do: {kind, revision}
+      end
 
-      assert queued_controls == [
+      # Local connect completion does not order a separate RPC to the receiver
+      # after delivery of the sender's distribution messages.
+      TestCluster.assert_eventually(fn -> length(queued_controls.()) == 3 end)
+
+      assert queued_controls.() == [
                {:replica_cluster_open, 33},
                {:replica_cluster_close, 34},
                {:replica_cluster_open, 35}
