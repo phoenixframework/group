@@ -1112,6 +1112,53 @@ defmodule Group.ReplicaAckTest do
     end)
   end
 
+  test "forced expiry runs before queued heartbeats can renew the lease", context do
+    shard = Group.Replica.shard_name(context.name, 0)
+    source_pid = TestCluster.rpc!(context.source, Process, :whereis, [shard])
+    receiver_pid = TestCluster.rpc!(context.receiver, Process, :whereis, [shard])
+
+    {generation, revision, _epochs} =
+      TestCluster.rpc!(context.source, Group.Replica.Data, :local_replica_authority, [
+        context.name
+      ])
+
+    heartbeat =
+      {:replica_heartbeat, source_pid, Group.Replica.WireProtocol.version(), generation, revision,
+       Group.TestReplicaTransport.id(), Group.TestReplicaTransport.descriptor(context.name, [])}
+
+    :ok = TestCluster.rpc!(context.receiver, :sys, :suspend, [receiver_pid])
+
+    on_exit(fn ->
+      TestCluster.rpc!(context.receiver, TestCluster, :resume_if_alive, [receiver_pid])
+    end)
+
+    send(receiver_pid, heartbeat)
+
+    TestCluster.assert_eventually(fn ->
+      {:messages, messages} =
+        TestCluster.rpc!(context.receiver, Process, :info, [receiver_pid, :messages])
+
+      heartbeat in messages
+    end)
+
+    before_expiry = TestCluster.rpc!(context.receiver, :sys, :get_state, [receiver_pid])
+
+    :ok =
+      TestCluster.rpc!(context.receiver, TestCluster, :expire_replica_lane, [
+        context.name,
+        0,
+        context.source
+      ])
+
+    after_expiry = TestCluster.rpc!(context.receiver, :sys, :get_state, [receiver_pid])
+
+    assert Map.fetch!(after_expiry.peer_probe_epochs, context.source) ==
+             Map.get(before_expiry.peer_probe_epochs, context.source, 0) + 1
+
+    refute Map.has_key?(after_expiry.remote_shards, context.source)
+    :ok = TestCluster.rpc!(context.receiver, :sys, :resume, [receiver_pid])
+  end
+
   test "a second one-sided expiry advances the recovery epoch and rejects the first ACK",
        context do
     owner =
