@@ -20,6 +20,8 @@ defmodule Group.Replica do
   @protocol_version Group.Replica.WireProtocol.version()
   @priority_control_quota 64
   @incoming_batch_quota 64
+  @incoming_defer_threshold 64
+  @incoming_turn :group_replica_incoming_turn
   @snapshot_event_batch_size 512
 
   _archdoc = ~S"""
@@ -214,6 +216,16 @@ defmodule Group.Replica do
   within the local request lane, while protocol and cluster barriers flush
   earlier buffered state first.
 
+  That priority turn is a selective receive, which skips every queued message
+  it does not match. Its cost is the mailbox length, so it runs only while the
+  mailbox is short. Once more than 64 messages are queued behind a replica
+  frame or batch, the shard defers: frames and batches move from the mailbox to
+  an in-state FIFO queue as they are reached and every other message is handled
+  in arrival order. One deferred frame or batch is handled per pass over the
+  mailbox and after each local request turn, so neither lane starves the other.
+  A deferred frame is indistinguishable from one the transport delivered later,
+  which the protocol already tolerates. Deferring ends when the queue is empty.
+
   Snapshot staging is owned by the receiving shard, expires after a peer lease
   without progress, and disappears automatically if the shard crashes. Commit
   first replaces the numeric receive cursor with a durable
@@ -278,7 +290,9 @@ defmodule Group.Replica do
     snapshot_transfers: %{},
     snapshot_staging_pool: [],
     snapshot_send: nil,
-    snapshot_send_offsets: %{}
+    snapshot_send_offsets: %{},
+    incoming: :queue.new(),
+    incoming_turn_ref: nil
   ]
 
   def start_link(opts) do
@@ -504,11 +518,37 @@ defmodule Group.Replica do
     {:reply, reply, state}
   end
 
+  @impl true
+  def code_change(_old_vsn, state, _extra) do
+    # A state built by an older release lacks the fields added since.
+    {:ok, struct(__MODULE__, Map.from_struct(state))}
+  end
+
   # =====================================================================
   # Replication receive (handle_info)
   # =====================================================================
 
+  # Replica frames and batches are the messages the priority turn overtakes.
+  # While a backlog of them is deferred they are moved off the mailbox here, in
+  # constant time, and every other message is handled in arrival order.
   @impl true
+  def handle_info({:group_replica_frame, source, _message} = incoming, state)
+      when is_pid(source) or is_atom(source) do
+    {:noreply, receive_incoming(state, incoming)}
+  end
+
+  def handle_info({:group_replica_batch, remote_node, messages} = incoming, state)
+      when is_atom(remote_node) and is_list(messages) do
+    {:noreply, receive_incoming(state, incoming)}
+  end
+
+  def handle_info({@incoming_turn, ref}, %{incoming_turn_ref: ref} = state) do
+    state = take_incoming_turn(%{state | incoming_turn_ref: nil})
+    {:noreply, defer_incoming(state, not :queue.is_empty(state.incoming))}
+  end
+
+  def handle_info({@incoming_turn, _stale_ref}, state), do: {:noreply, state}
+
   def handle_info(
         {:replica_hello, remote_pid, version, generation, epoch_revision, cluster_epochs,
          transport_id, transport_descriptor},
@@ -1032,30 +1072,6 @@ defmodule Group.Replica do
     end
   end
 
-  def handle_info({:group_replica_frame, remote_pid, message}, state) when is_pid(remote_pid) do
-    remote_node = node(remote_pid)
-    state = handle_replica_message(state, remote_node, message)
-    {:noreply, take_priority_turn(state)}
-  end
-
-  def handle_info({:group_replica_frame, remote_node, message}, state)
-      when is_atom(remote_node) do
-    state = handle_replica_message(state, remote_node, message)
-    {:noreply, take_priority_turn(state)}
-  end
-
-  def handle_info({:group_replica_batch, remote_node, messages}, state)
-      when is_atom(remote_node) and is_list(messages) do
-    {turn, remaining} = Enum.split(messages, @incoming_batch_quota)
-    state = Enum.reduce(turn, state, &handle_replica_message(&2, remote_node, &1))
-
-    if remaining != [] do
-      send(self(), {:group_replica_batch, remote_node, remaining})
-    end
-
-    {:noreply, take_priority_turn(state)}
-  end
-
   def handle_info(
         {:replica_snapshot_send_complete, token, worker, snapshot_key, result},
         %{snapshot_send: {worker, token, snapshot_key}} = state
@@ -1130,17 +1146,23 @@ defmodule Group.Replica do
     end
   end
 
+  # Callers can keep the mailbox full of local requests, so while replica
+  # frames are deferred one of them follows each local request turn rather
+  # than waiting for the mailbox to empty.
   def handle_info({@local_request_tag, caller_pid, ref, request}, state)
       when is_pid(caller_pid) and is_reference(ref) do
-    {:noreply, process_local_request_turn(state, [{{:send, caller_pid, ref}, request}])}
+    state = process_local_request_turn(state, [{{:send, caller_pid, ref}, request}])
+    {:noreply, take_incoming_turn(state)}
   end
 
   def handle_info({@local_request_tag, alias_ref, request}, state) when is_reference(alias_ref) do
-    {:noreply, process_local_request_turn(state, [{{:alias, alias_ref}, request}])}
+    state = process_local_request_turn(state, [{{:alias, alias_ref}, request}])
+    {:noreply, take_incoming_turn(state)}
   end
 
   def handle_info({@local_request_tag, :noreply, request}, state) do
-    {:noreply, process_local_request_turn(state, [{:noreply, request}])}
+    state = process_local_request_turn(state, [{:noreply, request}])
+    {:noreply, take_incoming_turn(state)}
   end
 
   # =====================================================================
@@ -2579,6 +2601,73 @@ defmodule Group.Replica do
         next_state
     end
   end
+
+  # A shard that is not deferring handles each frame or batch as it arrives,
+  # followed by the priority turn. The priority receives skip every queued
+  # message that is not theirs, so once more than @incoming_defer_threshold
+  # messages are queued behind such a turn the shard starts deferring instead.
+  defp receive_incoming(%{incoming_turn_ref: ref} = state, incoming) when is_reference(ref) do
+    %{state | incoming: :queue.in(incoming, state.incoming)}
+  end
+
+  defp receive_incoming(state, incoming) do
+    state =
+      state
+      |> handle_incoming(incoming)
+      |> take_priority_turn()
+
+    {:message_queue_len, queued} = Process.info(self(), :message_queue_len)
+
+    defer_incoming(
+      state,
+      queued > @incoming_defer_threshold or not :queue.is_empty(state.incoming)
+    )
+  end
+
+  # The turn message lands behind everything already in the mailbox. By the
+  # time it is handled, every frame and batch ahead of it has been moved to the
+  # deferred queue and every other message ahead of it has been handled, so
+  # deferring ends as soon as a turn leaves the queue empty.
+  defp defer_incoming(state, false), do: state
+
+  defp defer_incoming(state, true) do
+    ref = make_ref()
+    send(self(), {@incoming_turn, ref})
+    %{state | incoming_turn_ref: ref}
+  end
+
+  defp take_incoming_turn(state) do
+    case :queue.out(state.incoming) do
+      {{:value, incoming}, rest} -> handle_incoming(%{state | incoming: rest}, incoming)
+      {:empty, _queue} -> state
+    end
+  end
+
+  defp handle_incoming(state, {:group_replica_frame, source, message}) when is_pid(source) do
+    handle_replica_message(state, node(source), message)
+  end
+
+  defp handle_incoming(state, {:group_replica_frame, source, message}) do
+    handle_replica_message(state, source, message)
+  end
+
+  defp handle_incoming(state, {:group_replica_batch, remote_node, messages}) do
+    {turn, remaining} = Enum.split(messages, @incoming_batch_quota)
+    state = Enum.reduce(turn, state, &handle_replica_message(&2, remote_node, &1))
+
+    # The rest of an oversized batch stays ahead of whatever its sender sent
+    # next; re-sending it to the mailbox would put it behind.
+    if remaining == [] do
+      state
+    else
+      rest = {:group_replica_batch, remote_node, remaining}
+      %{state | incoming: :queue.in_r(rest, state.incoming)}
+    end
+  end
+
+  # While deferring, the mailbox holds no backlog to overtake: it is handled
+  # in arrival order.
+  defp take_priority_turn(%{incoming_turn_ref: ref} = state) when is_reference(ref), do: state
 
   defp take_priority_turn(state) do
     state
