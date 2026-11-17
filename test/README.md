@@ -88,6 +88,8 @@ distributed scenarios always get fresh peers; there is no shared peer pool.
 | `replica_model_property_test.exs` | StreamData-generated and shrunk owner histories against an independent lifecycle oracle and scheduler-controlled replica transport |
 | `replica_snapshot_test.exs` | Pure single-pass byte-bounded streaming, suffix resume, receive staging, and event batching |
 | `replica_snapshot_distributed_test.exs` | Real-node provisional-chunk/terminal-commit loss, reorder, duplicate, conflicting retransmission/manifest, concurrent-source invalidation, supersession, authority fencing, expiry, pooled staging, and shard-crash recovery |
+| `replica_backlog_test.exs` | A shard behind on replicated batches: constant cost per batch at any depth, arrival order including oversized batches, local writes served ahead of the backlog and batches not starved by them, peer leases kept while draining, and state upgrade across a code change |
+| `shard_backlog_bench_test.exs` | Prints cost per batch against backlog depth, with call-time attribution; skipped unless `GROUP_BACKLOG_BENCH=1` |
 
 ## Model-based and formal checks
 
