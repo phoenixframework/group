@@ -1560,6 +1560,30 @@ defmodule GroupTest.Requests do
       assert :ok = Group.TestCluster.assert_replica_consistent(name)
     end
   end
+
+  describe "caller mailbox" do
+    test "local requests skip a caller's existing backlog" do
+      name = start_single_shard_group()
+      key = "caller-backlog/#{System.unique_integer([:positive])}"
+      backlog = 100_000
+
+      for i <- 1..backlog, do: send(self(), {:unrelated, i})
+
+      {:reductions, before} = Process.info(self(), :reductions)
+
+      for timeout <- [5_000, :infinity], _ <- 1..3 do
+        assert :ok = Group.register(name, key, %{}, timeout: timeout)
+        assert :ok = Group.unregister(name, key, timeout: timeout)
+      end
+
+      {:reductions, after_calls} = Process.info(self(), :reductions)
+
+      # Twelve calls that each scanned the backlog would cost over a million
+      # reductions.
+      assert after_calls - before < 100_000
+      assert Process.info(self(), :message_queue_len) == {:message_queue_len, backlog}
+    end
+  end
 end
 
 defmodule GroupTest.Fairness do

@@ -1,3 +1,9 @@
+## Unreleased
+- Stop local writes such as `Group.register/4` and `Group.unregister/3` from
+  scanning the caller's whole mailbox on every call. The reply and the shard's
+  `:DOWN` now match one monitor alias, as `GenServer.call/3` does, so the
+  receive skips messages queued before the request.
+
 ## 0.3.1 (2026-10-10)
 - Fix a replica lane that never recovered after its lease expired and the
   peer's `replica_hello` was dropped by a busy link. The peer answered every
