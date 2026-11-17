@@ -1,3 +1,20 @@
+## Unreleased
+- Keep a replica shard's cost per replicated batch constant however many
+  batches are queued behind it. After every batch the shard looked for queued
+  control messages and local requests with selective receives, which skip every
+  message they do not match, so each batch cost two passes over the mailbox and
+  a shard that fell behind got slower the further behind it was. Once more than
+  64 messages are queued behind a batch, the shard now moves replica frames and
+  batches into an in-state queue as it reaches them and handles everything else
+  in arrival order, taking one queued batch per pass over the mailbox and after
+  each local request turn.
+- Keep a shard that is working through a backlog sending heartbeats and
+  acknowledgements. Its timers used to wait behind the backlog, so a shard more
+  than `:replicated_peer_lease_timeout` behind lost its peer leases.
+- Keep the rest of a batch larger than 64 messages ahead of the batches its
+  sender sent next. It used to be re-sent to the back of the mailbox, which
+  made the later batches arrive as gaps.
+
 ## 0.3.1 (2026-10-10)
 - Fix a replica lane that never recovered after its lease expired and the
   peer's `replica_hello` was dropped by a busy link. The peer answered every
