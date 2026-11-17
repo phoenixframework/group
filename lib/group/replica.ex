@@ -1574,45 +1574,42 @@ defmodule Group.Replica do
     end
   end
 
+  # The monitor reference is also the reply alias, as in `GenServer.call/3`.
+  # Matching both receive clauses on the one reference created just before the
+  # send lets the compiler skip messages already queued in the caller's mailbox.
+  # Matching an alias and a separate monitor scans the whole mailbox per call.
   defp do_local_request(pid, shard_name, request, :infinity) when is_pid(pid) do
-    alias_ref = Process.alias()
-    mref = Process.monitor(pid)
-    send(pid, {@local_request_tag, alias_ref, request})
+    mref = Process.monitor(pid, alias: :demonitor)
+    send(pid, {@local_request_tag, mref, request})
 
     receive do
-      {@local_reply_tag, ^alias_ref, reply} ->
+      {@local_reply_tag, ^mref, reply} ->
         Process.demonitor(mref, [:flush])
-        Process.unalias(alias_ref)
         reply
 
       {:DOWN, ^mref, :process, ^pid, reason} ->
-        Process.unalias(alias_ref)
         exit({reason, {GenServer, :call, [shard_name, request, :infinity]}})
     end
   end
 
   defp do_local_request(pid, shard_name, request, timeout)
        when is_pid(pid) and is_integer(timeout) do
-    alias_ref = Process.alias()
-    mref = Process.monitor(pid)
-    send(pid, {@local_request_tag, alias_ref, request})
+    mref = Process.monitor(pid, alias: :demonitor)
+    send(pid, {@local_request_tag, mref, request})
 
     receive do
-      {@local_reply_tag, ^alias_ref, reply} ->
+      {@local_reply_tag, ^mref, reply} ->
         Process.demonitor(mref, [:flush])
-        Process.unalias(alias_ref)
         reply
 
       {:DOWN, ^mref, :process, ^pid, reason} ->
-        Process.unalias(alias_ref)
         exit({reason, {GenServer, :call, [shard_name, request, timeout]}})
     after
       timeout ->
         Process.demonitor(mref, [:flush])
-        Process.unalias(alias_ref)
 
         receive do
-          {@local_reply_tag, ^alias_ref, _reply} -> :ok
+          {@local_reply_tag, ^mref, _reply} -> :ok
         after
           0 -> :ok
         end
