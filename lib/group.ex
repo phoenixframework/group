@@ -818,6 +818,120 @@ defmodule Group do
   end
 
   @doc """
+  Choose up to `count` distinct members of a group uniformly at random.
+
+  Returns the chosen members in random order, as `{pid, meta}` tuples exactly
+  as `members/3` returns them. When the group has `count` members or fewer,
+  all of them are returned, shuffled. Process-group entries only; registry
+  entries are not included.
+
+  Use this instead of `members/3` followed by `Enum.shuffle/1` when a group is
+  large and only a few members are needed, such as picking candidates to load
+  balance across. The query reads only pids from the replicated ETS view and
+  copies the metadata of the chosen members alone; it still visits every pid
+  in the group, up to `:scan_limit`. A member that leaves between the scan and
+  its metadata lookup is skipped, so fewer than `count` members can be
+  returned.
+
+  Supports prefix matching: if `group` ends with `"/"`, samples among all
+  members whose group key starts with that prefix. Prefix queries scan all
+  shards. Exact queries hit a single shard.
+
+  ## Parameters
+
+  - `name` - The Group name
+  - `group` - The group to sample (string). Append `"/"` for prefix matching.
+  - `count` - The maximum number of members to return (non-negative integer)
+  - `opts` - Keyword list of options
+
+  ## Options
+
+  - `:cluster` - Query a named cluster instead of the default cluster
+  - `:extract_meta` - Override the configured extract_meta callback for this call
+  - `:scope` - Which members to choose from, by the node that owns them:
+    `:all` (default), `:local` (owned by this node, as `local_members/3`), or
+    `:remote` (owned by other nodes)
+  - `:scan_limit` - Choose among at most this many members, taken in table
+    order as `members/3` takes its `:limit`. Must be a non-negative integer.
+    Defaults to all members.
+
+  ## Returns
+
+  - List of at most `count` `{pid, meta}` tuples
+
+  ## Examples
+
+      # Three random workers in the pool
+      Group.sample_members(:my_app, "workers/pool", 3)
+
+      # One random member owned by another node
+      Group.sample_members(:my_app, "workers/pool", 1, scope: :remote)
+  """
+  def sample_members(name, group, count, opts \\ [])
+
+  def sample_members(name, group, count, opts)
+      when is_atom(name) and is_binary(group) and is_integer(count) and count >= 0 and
+             is_list(opts) do
+    cluster = Keyword.get(opts, :cluster)
+    extract_meta_fn = resolve_extract_meta(name, opts)
+    num_shards = get_config(name).num_shards
+    scope = member_scope!(opts)
+    scan_limit = member_limit!(opts, :scan_limit)
+
+    members =
+      cond do
+        count == 0 ->
+          []
+
+        String.ends_with?(group, "/") ->
+          sample_by_prefix(name, num_shards, cluster, group, count, scope, scan_limit)
+
+        true ->
+          shard = Replica.shard_index_for(cluster, group, num_shards)
+
+          pids =
+            name
+            |> Data.pg_member_pids(shard, cluster, group, scope, scan_limit)
+            |> take_random(count)
+
+          Data.pg_members_meta(name, shard, cluster, group, pids)
+      end
+
+    Enum.map(members, fn {pid, meta} -> {pid, extract_meta_fn.(meta)} end)
+  end
+
+  defp sample_by_prefix(name, num_shards, cluster, prefix, count, scope, scan_limit) do
+    num_shards
+    |> members_across_shards(scan_limit, fn shard, shard_limit ->
+      name
+      |> Data.pg_member_keys_by_prefix(shard, cluster, prefix, scope, shard_limit)
+      |> Enum.map(fn {key, pid} -> {shard, key, pid} end)
+    end)
+    |> take_random(count)
+    |> Enum.flat_map(fn {shard, key, pid} ->
+      Data.pg_members_meta(name, shard, cluster, key, [pid])
+    end)
+  end
+
+  # A partial Fisher-Yates shuffle: `count` draws, each swapping a random
+  # unchosen slot into the chosen prefix. Swapped slots are kept in a map so
+  # the tuple is never copied.
+  defp take_random(list, count) do
+    tuple = List.to_tuple(list)
+    size = tuple_size(tuple)
+    draw_random(tuple, size, min(count, size), 0, %{}, [])
+  end
+
+  defp draw_random(_tuple, _size, count, count, _swaps, acc), do: acc
+
+  defp draw_random(tuple, size, count, index, swaps, acc) do
+    pick = index + :rand.uniform(size - index) - 1
+    chosen = Map.get_lazy(swaps, pick, fn -> elem(tuple, pick) end)
+    current = Map.get_lazy(swaps, index, fn -> elem(tuple, index) end)
+    draw_random(tuple, size, count, index + 1, Map.put(swaps, pick, current), [chosen | acc])
+  end
+
+  @doc """
   Count processes registered in this node's local replicated ETS view.
 
   This returns the caller node's current view of the cluster registry.
@@ -1196,8 +1310,8 @@ defmodule Group do
   defp cluster_call_timeout(opts), do: Keyword.get(opts, :timeout, @default_cluster_call_timeout)
   defp cluster_ttl(opts), do: Keyword.get(opts, :ttl) |> validate_cluster_ttl!()
 
-  defp member_limit!(opts) do
-    case Keyword.fetch(opts, :limit) do
+  defp member_limit!(opts, option \\ :limit) do
+    case Keyword.fetch(opts, option) do
       :error ->
         :infinity
 
@@ -1206,7 +1320,18 @@ defmodule Group do
 
       {:ok, limit} ->
         raise ArgumentError,
-              "expected :limit to be a non-negative integer, got: #{inspect(limit)}"
+              "expected #{inspect(option)} to be a non-negative integer, got: #{inspect(limit)}"
+    end
+  end
+
+  defp member_scope!(opts) do
+    case Keyword.get(opts, :scope, :all) do
+      scope when scope in [:all, :local, :remote] ->
+        scope
+
+      scope ->
+        raise ArgumentError,
+              "expected :scope to be :all, :local, or :remote, got: #{inspect(scope)}"
     end
   end
 

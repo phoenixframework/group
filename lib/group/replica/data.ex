@@ -1719,6 +1719,55 @@ defmodule Group.Replica.Data do
     select(table, match_spec, limit)
   end
 
+  @doc """
+  Pids of the members of `key`, without their metadata. `scope` filters by
+  owner node: `:all`, `:local`, or `:remote`.
+  """
+  def pg_member_pids(name, shard, cluster, key, scope, limit \\ :infinity) do
+    table = pg_by_key_table(name, shard)
+    match_spec = [{{{cluster, key, :"$1"}, :_, :_, :"$2"}, owner_guard(scope, :"$2"), [:"$1"]}]
+
+    select(table, match_spec, limit)
+  end
+
+  @doc """
+  `{key, pid}` of the members under `prefix`, without their metadata. `scope`
+  filters by owner node as in `pg_member_pids/6`.
+  """
+  def pg_member_keys_by_prefix(name, shard, cluster, prefix, scope, limit \\ :infinity) do
+    table = pg_by_key_table(name, shard)
+    prefix_end = next_binary_prefix(prefix)
+
+    select(
+      table,
+      [
+        {{{cluster, :"$1", :"$2"}, :_, :_, :"$3"},
+         [{:andalso, {:>=, :"$1", prefix}, {:<, :"$1", prefix_end}} | owner_guard(scope, :"$3")],
+         [{{:"$1", :"$2"}}]}
+      ],
+      limit
+    )
+  end
+
+  @doc """
+  `{pid, meta}` for each of `pids` that is still a member of `key`, in the
+  order given.
+  """
+  def pg_members_meta(name, shard, cluster, key, pids) do
+    table = pg_by_key_table(name, shard)
+
+    Enum.flat_map(pids, fn pid ->
+      case :ets.lookup(table, {cluster, key, pid}) do
+        [{_member, meta, _time, _node}] -> [{pid, meta}]
+        [] -> []
+      end
+    end)
+  end
+
+  defp owner_guard(:all, _node_var), do: []
+  defp owner_guard(:local, node_var), do: [{:==, node_var, node()}]
+  defp owner_guard(:remote, node_var), do: [{:"/=", node_var, node()}]
+
   def pg_members_with_node(name, shard, cluster, key) do
     table = pg_by_key_table(name, shard)
 

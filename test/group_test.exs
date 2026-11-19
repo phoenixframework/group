@@ -2144,6 +2144,190 @@ defmodule GroupTest.Queries do
     end
   end
 
+  describe "sample_members/4" do
+    test "returns at most count distinct members with the same meta as members/3", %{
+      name: name
+    } do
+      key = "sample/#{System.unique_integer([:positive])}"
+      _other = join_sample_members(name, key <> "-other", 5)
+      joined = join_sample_members(name, key, 20)
+      members = Map.new(Group.members(name, key))
+
+      assert members == joined
+
+      for count <- [0, 1, 7, 20, 50] do
+        sample = Group.sample_members(name, key, count)
+        pids = Enum.map(sample, &elem(&1, 0))
+
+        assert length(sample) == min(count, 20)
+        assert pids == Enum.uniq(pids)
+        assert Enum.all?(sample, fn {pid, meta} -> Map.fetch!(members, pid) == meta end)
+      end
+    end
+
+    test "passes meta through extract_meta like members/3", %{name: name} do
+      key = "sample/extract/#{System.unique_integer([:positive])}"
+
+      for id <- 1..3 do
+        pid = spawn_forever()
+        on_exit(fn -> kill_if_alive(pid) end)
+        now = System.system_time()
+        shard = Group.Replica.shard_index_for(nil, key, Group.get_config(name).num_shards)
+        meta = %{public: id, private: :drop}
+        :ok = Group.Replica.Data.pg_insert(name, shard, nil, key, pid, meta, now, node())
+      end
+
+      opts = [extract_meta: {GroupTest.ExtractMeta, :strip, []}]
+      expected = name |> Group.members(key, opts) |> Enum.sort()
+
+      assert Enum.all?(expected, fn {_pid, meta} -> Map.keys(meta) == [:public] end)
+      assert name |> Group.sample_members(key, 10, opts) |> Enum.sort() == expected
+    end
+
+    test "returns all members, shuffled, when count exceeds them", %{name: name} do
+      key = "sample/all/#{System.unique_integer([:positive])}"
+      members = join_sample_members(name, key, 30)
+      expected = members |> Map.to_list() |> Enum.sort()
+
+      orders =
+        for _call <- 1..20 do
+          sample = Group.sample_members(name, key, 100)
+          assert Enum.sort(sample) == expected
+          Enum.map(sample, &elem(&1, 0))
+        end
+
+      assert length(Enum.uniq(orders)) > 1
+    end
+
+    test "returns an empty list for a missing group", %{name: name} do
+      assert Group.sample_members(name, "sample/missing", 8) == []
+      assert Group.sample_members(name, "sample/missing/", 8) == []
+    end
+
+    test "scope selects members by owner node", %{name: name} do
+      key = "sample/scope/#{System.unique_integer([:positive])}"
+      local = join_sample_members(name, key, 6)
+      remote = insert_remote_sample_members(name, key, 9)
+
+      local_sample = Group.sample_members(name, key, 32, scope: :local)
+      remote_sample = Group.sample_members(name, key, 32, scope: :remote)
+      all_sample = Group.sample_members(name, key, 32, scope: :all)
+
+      assert Map.new(local_sample) == local
+      assert Map.new(remote_sample) == remote
+      assert Map.new(all_sample) == Map.merge(local, remote)
+      assert Map.new(Group.sample_members(name, key, 32)) == Map.merge(local, remote)
+      assert Map.new(Group.local_members(name, key)) == local
+    end
+
+    test "scan_limit bounds the members considered", %{name: name} do
+      key = "sample/scan/#{System.unique_integer([:positive])}"
+      members = join_sample_members(name, key, 20)
+      sample = Group.sample_members(name, key, 32, scan_limit: 5)
+
+      assert length(sample) == 5
+      assert Enum.all?(sample, fn {pid, meta} -> Map.fetch!(members, pid) == meta end)
+      assert Group.sample_members(name, key, 32, scan_limit: 0) == []
+    end
+
+    test "supports prefix groups across shards", %{name: name} do
+      prefix = "sample/prefix/#{System.unique_integer([:positive])}/"
+
+      joined =
+        Enum.reduce(1..12, %{}, fn id, acc ->
+          Map.merge(acc, join_sample_members(name, prefix <> Integer.to_string(id), 2))
+        end)
+
+      _outside = join_sample_members(name, String.trim_trailing(prefix, "/"), 3)
+
+      assert Map.new(Group.members(name, prefix)) == joined
+      assert Map.new(Group.sample_members(name, prefix, 100)) == joined
+
+      sample = Group.sample_members(name, prefix, 5)
+      assert length(sample) == 5
+      assert Enum.all?(sample, fn {pid, meta} -> Map.fetch!(joined, pid) == meta end)
+      assert length(Group.sample_members(name, prefix, 100, scan_limit: 7)) == 7
+    end
+
+    test "chooses members uniformly across calls", %{name: name} do
+      key = "sample/uniform/#{System.unique_integer([:positive])}"
+      members = join_sample_members(name, key, 100)
+      calls = 4_000
+      count = 8
+
+      counts =
+        Enum.reduce(1..calls, %{}, fn _call, counts ->
+          name
+          |> Group.sample_members(key, count)
+          |> Enum.reduce(counts, fn {pid, _meta}, counts ->
+            Map.update(counts, pid, 1, &(&1 + 1))
+          end)
+        end)
+
+      # Each member is chosen with probability 8/100 per call: 320 expected,
+      # standard deviation ~17, so +-30% sits far outside chance.
+      expected = calls * count / map_size(members)
+      assert map_size(counts) == map_size(members)
+      assert Enum.all?(Map.values(counts), &(&1 > expected * 0.7 and &1 < expected * 1.3))
+
+      # The first pick is random too, not the table's first member.
+      firsts =
+        for _call <- 1..200 do
+          [{pid, _meta} | _rest] = Group.sample_members(name, key, count)
+          pid
+        end
+
+      assert length(Enum.uniq(firsts)) > 50
+    end
+
+    test "rejects invalid options", %{name: name} do
+      assert_raise ArgumentError, ~r/expected :scope to be :all, :local, or :remote/, fn ->
+        Group.sample_members(name, "sample", 1, scope: :nearby)
+      end
+
+      assert_raise ArgumentError, ~r/expected :scan_limit to be a non-negative integer/, fn ->
+        Group.sample_members(name, "sample", 1, scan_limit: -1)
+      end
+
+      assert_raise FunctionClauseError, fn ->
+        Group.sample_members(name, "sample", -1)
+      end
+    end
+  end
+
+  defp join_sample_members(name, key, count) do
+    test_pid = self()
+
+    Map.new(1..count, fn id ->
+      meta = %{key: key, id: id}
+
+      pid =
+        spawn(fn ->
+          :ok = Group.join(name, key, meta)
+          send(test_pid, {:joined, self()})
+          Process.sleep(:infinity)
+        end)
+
+      on_exit(fn -> kill_if_alive(pid) end)
+      assert_receive {:joined, ^pid}, 1000
+      {pid, meta}
+    end)
+  end
+
+  # Replicated rows owned by another node, as a replica applies them.
+  defp insert_remote_sample_members(name, key, count) do
+    remote_node = :"sample_remote_#{System.unique_integer([:positive])}@127.0.0.1"
+    shard = Group.Replica.shard_index_for(nil, key, Group.get_config(name).num_shards)
+
+    Map.new(1..count, fn id ->
+      pid = spawn_forever()
+      on_exit(fn -> kill_if_alive(pid) end)
+      meta = %{key: key, remote: id}
+      :ok = Group.Replica.Data.pg_insert(name, shard, nil, key, pid, meta, id, remote_node)
+      {pid, meta}
+    end)
+  end
+
   describe "local_entries/1" do
     test "returns local registry and pg entries across clusters", %{name: name} do
       :ok = Group.connect(name, "game")

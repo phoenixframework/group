@@ -1,4 +1,9 @@
 ## Unreleased
+- Add `Group.sample_members/4`, which chooses up to `count` members of a group
+  uniformly at random. It scans only pids and copies the metadata of the chosen
+  members alone, where `members/3` followed by `Enum.shuffle/1` copies every
+  member's metadata. Options: `:cluster`, `:extract_meta`, `:scope` (`:all`,
+  `:local`, or `:remote` by owner node), and `:scan_limit`.
 - Keep a replica shard's cost per replicated batch constant however many
   batches are queued behind it. After every batch the shard looked for queued
   control messages and local requests with selective receives, which skip every
