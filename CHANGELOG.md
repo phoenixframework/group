@@ -1,4 +1,4 @@
-## Unreleased
+## 0.3.2 (2026-11-19)
 - Add `Group.sample_members/4`, which chooses up to `count` members of a group
   uniformly at random. It scans only pids and copies the metadata of the chosen
   members alone, where `members/3` followed by `Enum.shuffle/1` copies every
